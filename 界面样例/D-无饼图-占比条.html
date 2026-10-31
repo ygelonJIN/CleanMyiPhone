@@ -1,0 +1,136 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>方案 D · 无饼图：占比条 + 卡片</title>
+<style>
+  :root{
+    --bg:#eceff3;--chrome:#f6f7f9;--card:#fff;--line:#dfe3e8;
+    --text:#1d1d1f;--sub:#6e6e73;--faint:#a1a1a6;
+    --photo:#4a90e2;--video:#8b5cf6;--system:#8e97a3;--free:#c8ced6;--trash:#f59e0b;
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{background:#c9ced6;font:13px -apple-system,"SF Pro Text","PingFang SC",sans-serif;color:var(--text);
+       display:flex;align-items:center;justify-content:center;height:100vh}
+  .win{width:1120px;height:700px;background:var(--bg);border-radius:11px;overflow:hidden;display:flex;
+       box-shadow:0 18px 60px rgba(0,0,0,.28);border:1px solid rgba(0,0,0,.15)}
+  .side{width:214px;background:var(--chrome);border-right:1px solid var(--line);padding:40px 10px 10px}
+  .side h6{font-size:11px;font-weight:600;color:var(--faint);padding:12px 8px 4px}
+  .item{display:flex;gap:7px;padding:4px 8px;border-radius:6px;color:#3a3a3c}
+  .item .n{margin-left:auto;color:var(--faint);font-size:11px}
+  .item.sel{background:#3b82f6;color:#fff}.item.sel .n{color:rgba(255,255,255,.8)}
+  .main{flex:1;display:flex;flex-direction:column;min-width:0;overflow:auto}
+  .head{padding:14px 18px 10px;display:flex;align-items:flex-end}
+  .head h1{font-size:16px;font-weight:600}
+  .head .sub{font-size:11px;color:var(--sub)}
+  .head .right{margin-left:auto;color:var(--sub)}
+  .hero{padding:4px 18px 16px}
+  .hero .big{font-size:30px;font-weight:600;letter-spacing:-.5px}
+  .hero .big small{font-size:13px;font-weight:400;color:var(--sub);margin-left:6px}
+  .bar{display:flex;height:16px;border-radius:8px;overflow:hidden;margin:12px 0 8px;background:#e3e6ea}
+  .bar i{display:block;height:100%}
+  .bar i+ i{box-shadow:inset 1px 0 0 rgba(255,255,255,.85)}
+  .kis{display:flex;gap:16px;flex-wrap:wrap;font-size:11px;color:var(--sub)}
+  .kis span{display:flex;align-items:center;gap:5px}
+  .kis i{width:8px;height:8px;border-radius:2px;display:inline-block}
+  .grid{display:grid;grid-template-columns:repeat(3,1fr);gap:10px;padding:0 18px 16px}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:11px 13px}
+  .card .k{font-size:11px;color:var(--sub);display:flex;align-items:center;gap:5px}
+  .card .k i{width:8px;height:8px;border-radius:2px;display:inline-block}
+  .card .v{font-size:19px;font-weight:600;font-variant-numeric:tabular-nums;margin-top:3px}
+  .card .d{font-size:11px;color:var(--faint);margin-top:1px}
+  .cards2{display:flex;gap:12px;padding:0 18px 18px}
+  .sbox{flex:1;background:var(--card);border:1px solid var(--line);border-radius:10px;padding:11px 13px}
+  .sbox h5{font-size:12px;font-weight:600;margin-bottom:8px}
+  .r{display:flex;align-items:center;gap:6px;font-size:11px;color:var(--sub);margin-bottom:3px}
+  .r i{width:8px;height:8px;border-radius:2px;display:inline-block}
+  .r b{margin-left:auto;color:var(--text);font-weight:500;font-variant-numeric:tabular-nums}
+  .insp{width:232px;background:var(--chrome);border-left:1px solid var(--line);padding:38px 0 10px;overflow:auto}
+  .insp h6{font-size:11px;font-weight:600;color:var(--faint);padding:10px 12px 3px}
+  .ir{display:flex;justify-content:space-between;padding:1px 12px;line-height:19px;font-size:12px}
+  .ir .k{color:var(--sub)}.ir .v{font-variant-numeric:tabular-nums}
+</style>
+</head>
+<body>
+<div class="win">
+  <div class="side">
+    <div class="item sel"><span>◔</span>概览</div>
+    <h6>照片</h6>
+    <div class="item"><span>▤</span>全部照片<span class="n">4,622</span></div>
+    <div class="item"><span>▣</span>照片<span class="n">4,253</span></div>
+    <div class="item"><span>▶</span>视频<span class="n">369</span></div>
+    <div class="item"><span>♡</span>收藏<span class="n">44</span></div>
+    <div class="item"><span>⌗</span>截图<span class="n">451</span></div>
+    <h6>设备</h6>
+    <div class="item"><span>▦</span>应用<span class="n">61</span></div>
+    <div class="item"><span>▭</span>文件</div>
+    <div class="item"><span>⌫</span>回收站</div>
+  </div>
+
+  <div class="main">
+    <div class="head"><div><h1>概览</h1><div class="sub">金费清的 iPhone</div></div>
+      <div class="right">⌄ ⟳</div></div>
+
+    <div class="hero">
+      <div class="big">229.1 GB <small>已用 · 共 256 GB</small></div>
+      <div class="bar">
+        <i style="width:3.1%;background:var(--photo)"></i>
+        <i style="width:3.6%;background:var(--video)"></i>
+        <i style="width:82.8%;background:var(--system)"></i>
+        <i style="width:10.5%;background:var(--free)"></i>
+      </div>
+      <div class="kis">
+        <span><i style="background:var(--photo)"></i>照片 7.9 GB</span>
+        <span><i style="background:var(--video)"></i>视频 9.2 GB</span>
+        <span><i style="background:var(--system)"></i>系统与应用 212 GB</span>
+        <span><i style="background:var(--free)"></i>可用 26.9 GB</span>
+      </div>
+    </div>
+
+    <div class="grid">
+      <div class="card"><div class="k"><i style="background:var(--photo)"></i>照片</div>
+        <div class="v">7.9 GB</div><div class="d">4,253 项</div></div>
+      <div class="card"><div class="k"><i style="background:var(--video)"></i>视频</div>
+        <div class="v">9.2 GB</div><div class="d">369 项</div></div>
+      <div class="card"><div class="k"><i style="background:var(--system)"></i>系统与应用</div>
+        <div class="v">212 GB</div><div class="d">含 iOS 本体与系统数据</div></div>
+      <div class="card"><div class="k"><i style="background:var(--free)"></i>可用</div>
+        <div class="v">26.9 GB</div><div class="d">还有 10.5%</div></div>
+      <div class="card"><div class="k"><i style="background:var(--trash)"></i>回收站</div>
+        <div class="v">0 KB</div><div class="d">0 项 · 清空才真删</div></div>
+      <div class="card"><div class="k">应用</div>
+        <div class="v">61 个</div><div class="d">体积系统不提供</div></div>
+    </div>
+
+    <div class="cards2">
+      <div class="sbox">
+        <h5>照片类型</h5>
+        <div class="r"><i style="background:#4a90e2"></i>相机拍摄<b>62%</b></div>
+        <div class="r"><i style="background:#2fb3c0"></i>截屏<b>12%</b></div>
+        <div class="r"><i style="background:#8b5cf6"></i>视频<b>24%</b></div>
+      </div>
+      <div class="sbox">
+        <h5>应用程序 · 按个数</h5>
+        <div class="r"><i style="background:#4a90e2"></i>微信<b>22%</b></div>
+        <div class="r"><i style="background:#8b5cf6"></i>抖音<b>17%</b></div>
+        <div class="r"><i style="background:#2fb3c0"></i>QQ<b>11%</b></div>
+      </div>
+    </div>
+  </div>
+
+  <div class="insp">
+    <h6>设备</h6>
+    <div class="ir"><span class="k">名称</span><span class="v">金费清的 iPhone</span></div>
+    <div class="ir"><span class="k">机型</span><span class="v">iPhone 14 Pro</span></div>
+    <div class="ir"><span class="k">型号号码</span><span class="v">MQ0W3</span></div>
+    <div class="ir"><span class="k">系统版本</span><span class="v">26.7</span></div>
+    <div class="ir"><span class="k">序列号</span><span class="v">JKPH4H6M2V</span></div>
+    <h6>电池</h6>
+    <div class="ir"><span class="k">当前电量</span><span class="v">100%</span></div>
+    <div class="ir"><span class="k">设计最大电量</span><span class="v">3181 mAh</span></div>
+    <div class="ir"><span class="k">循环次数</span><span class="v">1516 次</span></div>
+    <div class="ir"><span class="k">电池温度</span><span class="v" style="color:#a1a1a6">不可读</span></div>
+  </div>
+</div>
+</body>
+</html>

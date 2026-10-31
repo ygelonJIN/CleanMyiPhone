@@ -1,0 +1,8 @@
+.build/
+.buildnative/
+.buildtmp/
+.cachetest/
+build/
+*.xcuserstate
+.DS_Store
+不推送/

@@ -1,0 +1,85 @@
+# SwiftUI 版式与崩溃
+
+**什么时候读**：动界面、加图表、改侧栏、遇到闪退或界面乱跳时。
+
+**包含什么**：本机（macOS 27 / Xcode 27 / Swift 6.2 运行时）上踩到的 SwiftUI 崩溃与版式坑，以及"加载中布局乱跳"的根治办法。
+
+**不用读**：只调数据层时不用看。
+
+---
+
+## 一、四个会直接崩溃的坑
+
+1. **`@State` + `@MainActor @Observable` 放在 `App` 上**
+   崩溃栈：`swift_getCanonicalPrespecializedGenericMetadata` → `StatePropertyBox.update`。
+   改法：`private let store = AppStore()`，不要 `@State`。
+
+2. **`.focusable()` 套在整个页面容器上**
+   崩溃栈：`rips_f_BlurRingRoundedDilation` / `__drawnFocusRingBitmapForTime` —— 焦点环绘制时越界。
+   改法：`.focusable()` 后面补 `.focusEffectDisabled()`。
+
+3. **`VideoPlayer`（SwiftUI）播放本地视频**
+   日志：`failed to demangle superclass of VideoPlayerView from mangled name 'So12AVPlayerViewC'` → `abort()`。
+   改法：自己包 `NSViewRepresentable` + AppKit 的 `AVPlayerView`，不要用 `VideoPlayer`。
+
+4. **网格列数在布局期间回写 observable**
+   导致约束递归 / 反复重排。改法：`onChange(of: cols)` 里判等后再写，`onAppear` 同理。
+
+## 二、加载中布局乱跳（"无规则移动"）
+
+症状：读取设备时环形卡片和底部卡片不停横竖位移。
+
+原因：**两套高度不同的布局在切换**——有数据时环形占满，无数据时是 240pt 载入卡；而目录是分批回调的，`isScanning`/`hasStats` 在真假间反复翻转，每次切换都触发一次重排；再叠加 `animation(value: assets.count)`，就变成连续抖动。
+
+根治三条：
+
+1. 主区**几何固定**：外层 `GeometryReader` 尺寸不参与切换，只切换里面的内容（载入指示 ↔ 环形）。
+2. 底部卡片行给**固定高度**（如 86pt），未就绪时数值显示 `—`，不隐藏组件。
+3. 去掉按数据量触发的动画，只在明确的状态切换上加 `animation`。
+
+判断"真实数据到了没有"要用单独的门禁（如 `hasStats = totalCapacity > 0`），不要让 UI 直接读可能为 0 的字段去算百分比。
+
+## 三、环形的画法与手感
+
+- 用 `Circle().trim(from:to:).stroke(...)` 自绘，`.rotationEffect(.degrees(-90))` 从 12 点开始。
+- **`lineCap: .butt` + 每段两端各留 ~0.8° 间隙**。用 `.round` 时小分段的圆帽会盖住邻居，看起来就是"重叠"。
+- 悬停：`.onContinuousHover` 拿坐标，算 `atan2` 角度 + 半径区间判定落在哪段；命中段 `lineWidth + 3`，其它段 `opacity 0.28`。
+- 入场动画：`@State progress` 从 0 到 1，`trim` 的终点乘 `progress`，`withAnimation(.easeOut(duration: 0.7))`。
+
+## 四、版式对齐与自适应的几条习惯
+
+- 页面左右内边距统一成一个值（本项目 18），标题、筛选条、网格左边缘才在同一条线上。
+- 缩略图格子用 `Rectangle().aspectRatio(1).overlay { Image.resizable().scaledToFill() }.clipShape(...)`；**图片放在 overlay 里**，它就不参与布局，不会把格子撑破或重叠。
+- 侧栏信息面板给**固定高度 + `.clipped()`**，否则截图出现/消失、序列号从空变有值都会推动整个栏。
+- 预览覆盖整窗时用 `ZStack { 主界面; if preview { 浮层 } }` 放在 `NavigationSplitView` 外层，并 `.toolbar(visibility, for: .windowToolbar)` 收起窗口工具栏。
+
+## 五、悬停联动（图 ↔ 卡片）
+
+把一个 `hoveredSliceTitle: String?` 放在 store 里：环形 `onHoverTitle` 写入、卡片 `onHover` 写入；两侧都按这个值判断高亮。指向线用卡片的 `overlay(alignment: .top)` 画一条 12pt 竖线 + 5pt 圆点、`offset(y: -17)`，不动布局。
+
+## 六、窗口与主框架（2026-10 重做后）
+
+**不要顶部栏。** 用 `.windowStyle(.hiddenTitleBar)` + 运行期把窗口设成 `fullSizeContentView`、`titleVisibility = .hidden`、`toolbar?.isVisible = false`。红绿灯直接浮在侧栏左上角，侧栏 `List` 用 `.contentMargins(.top, 28, for: .scrollContent)` 让开。
+
+标题和页面按钮放在**内容列自己的浮动标题行**里（`DetailHeader`）：左右内边距和下面卡片一致（18pt），不要放 `NavigationSplitView` 的 toolbar——那会把标题抬到侧栏上方，左右边缘跟内容对不齐。`NavigationSplitView` 自带的侧栏按钮要用 `.toolbar(removing: .sidebarToggle)` 去掉，用自己的 `sidebar.leading` 按钮（走 `NavigationSplitViewVisibility` 绑定）。
+
+侧栏用原生 `List(selection:)` + `Section` + `.badge`，选中项只存一个 `enum SidebarItem`（section / 相簿 / 筛选都从它推出来），不要再同时维护 `section` 和 `filter` 两份状态。
+
+## 七、预览与选择
+
+- 点选只负责「选中」，不碰预览；空格预览的是**鼠标悬停**的那一项（`hoveredID`），没悬停才退回已选。
+- 鼠标离开格子时不要立刻清 `hoveredID`：预览层盖上来会触发 leave，清了空格就失效。只在新格子 hover 时覆盖。
+- 预览层放在 `NavigationSplitView` 外层（`ZStack` 或 `.overlay`），不要在页面内部再放一份，否则会渲染两层。
+- 预览里 ←→ 切项、空格关，删完自动跳下一张；预览不改选中集合。
+
+## 八、环形图悬停与指向线
+
+- 命中判定必须三层都满足：在环带半径内（`outer - lineWidth - 1 … outer + 1`）、角度落在某一段的弧内（扣掉段间 0.45° 的缝）、否则返回 nil。圆环内侧、段缝、圆外、下方卡片都不算悬停。
+- 指向线从该段弧中点画到对应卡片的顶部中心：`overlay` 放在最顶层，`.allowsHitTesting(false)`；线 2.5pt + 起点圆点 + 终点箭头 + 白描边阴影。
+- 起点坐标：`x = cx + r·sin(θ)`、`y = cy − r·cos(θ)`，θ 从 12 点顺时针；卡片位置用 `GeometryReader` + `PreferenceKey` 收集到同一个命名坐标系里再画。
+- 卡片不要自己写 `onHover` 去反写高亮，只由环形的悬停驱动，否则永远有两套状态。
+
+## 九、读取态
+
+- 只显示系统转圈 + 「正在读取…」，不要进度条、不要百分比：之前「条走了大半、字才 80%」就是两个进度各算各的。
+- 读取一定要有收尾路径（`maybeFinishScan` 由目录/相册两个完成条件驱动），再加超时看门狗，避免永远停在「正在读取」。
