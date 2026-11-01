@@ -261,7 +261,7 @@ struct PreviewOverlay: View {
             } else if let image = store.previewImage {
                 framed(Image(nsImage: image).resizable().aspectRatio(contentMode: .fit))
                     // 实况：视频分量直接盖在静态图上，静态图永远是打底的
-                    // （视频没到、解析失败、循环卡住时，看到的还是这张照片本身）
+                    // （视频没到、解析失败时，看到的还是这张照片本身）
                     .overlay { liveLayer }
                     .overlay(alignment: .topLeading) {
                         if let asset, store.isLivePhoto(asset) {
@@ -269,14 +269,19 @@ struct PreviewOverlay: View {
                         }
                     }
                     .overlay(alignment: .bottom) {
-                        // 原图没取到时界面里只剩缩略图，必须说清楚，别让人以为看到的就是原图
                         if let error = store.previewError {
+                            // 原图没取到时界面里只剩缩略图，必须说清楚，
+                            // 别让人以为看到的就是原图
                             Text("\(error) · 当前显示的是缩略图")
                                 .font(.caption)
                                 .padding(.horizontal, 8)
                                 .padding(.vertical, 4)
                                 .background(.regularMaterial, in: Capsule())
                                 .padding(.bottom, 10)
+                        } else if store.previewLoading {
+                            // 糊图已经在了，原图还在取：把「在等什么、还有多久」摆出来。
+                            // 没有这一条，20 MB 的原图就是干晾着一张糊图。
+                            photoProgressBadge
                         }
                     }
             } else {
@@ -297,6 +302,32 @@ struct PreviewOverlay: View {
                 .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
                 .allowsHitTesting(false)
         }
+    }
+
+    /// 大图取回中：糊图打底，底下报字节。
+    /// 和视频那张卡片同一套口径（阶段文案 + 字节），只是缩小到不挡内容。
+    private var photoProgressBadge: some View {
+        VStack(spacing: 6) {
+            HStack(spacing: 7) {
+                ProgressView().controlSize(.mini)
+                Text(store.previewLoadingHint)
+                    .font(.system(size: 11.5, weight: .medium))
+                if !store.previewProgressText.isEmpty {
+                    Text(store.previewProgressText)
+                        .font(.system(size: 11.5, weight: .semibold).monospacedDigit())
+                        .foregroundStyle(.secondary)
+                }
+            }
+            if store.previewBytesTotal > 0 {
+                ProgressView(value: store.previewBytesFraction)
+                    .progressViewStyle(.linear)
+                    .frame(width: 200)
+            }
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 8)
+        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+        .padding(.bottom, 14)
     }
 
     /// 左上角「实况」角标，**同时是重播按钮**。
