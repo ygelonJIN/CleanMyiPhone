@@ -11,9 +11,12 @@ struct PreviewOverlay: View {
 
     var body: some View {
         ZStack {
+            // 全屏预览要盖死底下的界面：ultraThin 是半透明的，
+            // 侧栏的勾选框会透上来（用户看到的"勾选框浮在预览上"就是它）。
             Rectangle()
-                .fill(.ultraThinMaterial)
+                .fill(.thickMaterial)
                 .ignoresSafeArea()
+                .contentShape(Rectangle())
                 .onTapGesture { store.closePreview() }
 
             VStack(spacing: 0) {
@@ -25,6 +28,8 @@ struct PreviewOverlay: View {
             .padding(.vertical, 20)
         }
         .onChange(of: store.previewVideoURL) { _, url in
+            // 流式播放优先（url 为空、但给了 remoteAsset 时走下面那个 onChange）
+            guard url != nil else { return }
             player?.pause()
             player = url.map { AVPlayer(url: $0) }
             player?.play()
@@ -54,6 +59,7 @@ struct PreviewOverlay: View {
                     Text(asset.fileName)
                         .font(.headline)
                         .lineLimit(1)
+                    // 取回进度只在中间那张卡片里显示，标题下面保持干净
                     Text("\(indexText) · \(asset.kind.label)")
                         .font(.caption.monospacedDigit())
                         .foregroundStyle(.secondary)
@@ -89,6 +95,12 @@ struct PreviewOverlay: View {
                         .aspectRatio(contentMode: .fit)
                         .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
                         .overlay { videoOverlay }
+                } else {
+                    // 还没缩略图、也还没起播：这一格以前是**全空**，
+                    // 看着像预览坏了。现在至少给个进度/错误提示。
+                    Color.clear
+                        .frame(width: 420, height: 240)
+                        .overlay { videoOverlay }
                 }
             } else if let image = store.previewImage {
                 Image(nsImage: image)
@@ -96,8 +108,22 @@ struct PreviewOverlay: View {
                     .aspectRatio(contentMode: .fit)
                     .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
                     .shadow(color: .black.opacity(0.28), radius: 24, y: 8)
+                    .overlay(alignment: .bottom) {
+                        // 原图没取到时界面里只剩缩略图，必须说清楚，别让人以为看到的就是原图
+                        if let error = store.previewError {
+                            Text("\(error) · 当前显示的是缩略图")
+                                .font(.caption)
+                                .padding(.horizontal, 8)
+                                .padding(.vertical, 4)
+                                .background(.regularMaterial, in: Capsule())
+                                .padding(.bottom, 10)
+                        }
+                    }
             } else {
-                ProgressView().controlSize(.large)
+                // 照片还没解出来（常见于正在等库索引）：给同一张卡片，别只给个转圈
+                Color.clear
+                    .frame(width: 420, height: 240)
+                    .overlay { videoOverlay }
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -107,10 +133,28 @@ struct PreviewOverlay: View {
         VStack(spacing: 10) {
             if store.previewError == nil {
                 ProgressView().controlSize(.large)
-                Text(store.previewProgressText.isEmpty ? "正在从 iPhone 取回视频…" : store.previewProgressText)
-                    .font(.callout.weight(.medium))
-                    .monospacedDigit()
-                Text("大视频需要一点时间，取回后会直接播放")
+                // 两行分开：「正在取回视频」是固定文案，不随数字宽度变；
+                // 数字单独一行、等宽字体、固定宽度，1 MB → 100 MB 时只有数字在变。
+                VStack(spacing: 2) {
+                    Text(store.previewLoadingHint)
+                        .font(.system(size: 13, weight: .medium))
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                    if !store.previewProgressText.isEmpty {
+                        Text(store.previewProgressText)
+                            .font(.system(size: 15, weight: .semibold, design: .rounded))
+                            .monospacedDigit()
+                            .lineLimit(1)
+                            .frame(width: 300)
+                    }
+                }
+                // 确定性进度条：知道总量就画比例，不知道就只留转圈
+                if store.previewBytesTotal > 0 {
+                    ProgressView(value: store.previewBytesFraction)
+                        .progressViewStyle(.linear)
+                        .frame(width: 300)
+                }
+                Text("取回期间可以按 Esc 关掉，不影响继续浏览")
                     .font(.caption2)
                     .foregroundStyle(.secondary)
             } else {
@@ -127,6 +171,7 @@ struct PreviewOverlay: View {
             }
         }
         .padding(16)
+        .frame(width: 340)
         .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
         .padding(.bottom, 12)
     }

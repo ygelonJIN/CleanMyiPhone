@@ -86,6 +86,16 @@ struct PhotoCell: View {
                     Image(nsImage: image)
                         .resizable()
                         .scaledToFill()
+                } else if asset.kind == .video {
+                    // 视频没有缩略图（要出图得整份下几十上百 MB），
+                    // 给一个「一看就知道是视频、不是没加载」的占位，
+                    // 别让它跟「加载失败」长得一样。
+                    ZStack {
+                        Rectangle().fill(Color.black.opacity(0.18))
+                        Image(systemName: "play.fill")
+                            .font(.system(size: 22, weight: .semibold))
+                            .foregroundStyle(.white.opacity(0.85))
+                    }
                 } else {
                     Image(systemName: asset.kind.symbol)
                         .font(.system(size: 20, weight: .light))
@@ -127,14 +137,21 @@ struct PhotoCell: View {
             }
             .shadow(color: .black.opacity(hovering && !isSelected ? 0.22 : 0),
                     radius: hovering ? 5 : 0, y: hovering ? 2 : 0)
-            .scaleEffect(hovering && !isSelected ? 1.015 : 1)
+            // 不做 scaleEffect：格子被放大后会从鼠标下面"长走"，
+            // 触发 leave→shrink→enter 的循环，手感就是"悬停不灵敏、忽明忽暗"。
+            .contentShape(Rectangle())
             .zIndex(hovering ? 1 : 0)
             .animation(.easeOut(duration: 0.1), value: hovering)
             .onHover { inside in
                 hovering = inside
                 store.setHover(asset.id, active: inside)
             }
+            // 两个入口都要：
+            // `.task` 管首次出现；`onAppear` 管「切排序/换筛选后被复用回来的格子」——
+            // 复用的视图 id 没变，`.task(id:)` 不会重跑，内存缓存又被 LRU 淘汰掉了，
+            // 于是一整屏都是空块、还永远不加载。
             .task(id: store.thumbEpoch) { store.requestThumbnail(asset) }
+            .onAppear { store.requestThumbnail(asset) }
             .onTapGesture {
                 // 单击就是勾选 / 取消勾选，选了第一个再点第二个会累积，
                 // 不需要按住 ⌘；⇧ 仍然是连选。

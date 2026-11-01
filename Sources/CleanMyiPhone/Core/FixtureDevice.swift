@@ -2,13 +2,16 @@ import AppKit
 import Foundation
 
 /// 没有 iPhone 也能开发：生成一批稳定、可复现的假资产。
-final class FixtureDevice: DeviceSource {
+final class FixtureDevice: DeviceSource, @unchecked Sendable {
 
     let displayName = "iPhone（模拟）"
     let supportsDeletion = false
 
     private var assets: [Asset] = []
+    /// 缩略图请求是从多个格子并发进来的，字典必须加锁：
+    /// 并发写字典会把堆写坏（EXC_CRASH / BUG_IN_CLIENT_OF_LIBMALLOC）。
     private var thumbnailCache: [String: NSImage] = [:]
+    private let cacheLock = NSLock()
 
     init(count: Int = 900) {
         var rng = SeededGenerator(seed: 0xC1EA_0001)
@@ -65,9 +68,13 @@ final class FixtureDevice: DeviceSource {
     }
 
     func thumbnail(for asset: Asset, maxPixel: Int) async -> NSImage? {
-        if let cached = thumbnailCache[asset.id] { return cached }
+        cacheLock.lock()
+        if let cached = thumbnailCache[asset.id] { cacheLock.unlock(); return cached }
+        cacheLock.unlock()
         let image = Self.makeThumbnail(for: asset, maxPixel: maxPixel)
+        cacheLock.lock()
         thumbnailCache[asset.id] = image
+        cacheLock.unlock()
         return image
     }
 

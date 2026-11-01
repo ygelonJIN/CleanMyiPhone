@@ -80,10 +80,6 @@ final class SQLiteDB {
         return first.string("quick_check") == "ok"
     }
 
-    func tableExists(_ name: String) -> Bool {
-        !rows("SELECT name FROM sqlite_master WHERE type='table' AND name='\(name)'").isEmpty
-    }
-
     func columns(of table: String) -> [String] {
         rows("PRAGMA table_info('\(table)')").compactMap { $0.string("name") }
     }

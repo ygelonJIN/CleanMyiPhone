@@ -56,9 +56,14 @@ enum Probe {
             }
 
             var copied: [Int64] = []
-            for item in paths {
+            for (index, item) in paths.enumerated() {
                 let base = done
-                let bytes = (try? api.downloadFile(afc, path: item.0, to: item.1) { received in
+                let name = (item.0 as NSString).lastPathComponent
+                // 让界面知道现在在读哪个文件：卡住时能看到"卡在 Photos.sqlite-wal"
+                print("FILE \(index + 1)/\(paths.count) \(name)")
+                fflush(stdout)
+                let bytes = (try? api.downloadFile(afc, path: item.0, to: item.1,
+                                                   expected: api.entrySize(afc, path: item.0)) { received in
                     report(base + received)
                 }) ?? 0
                 done = base + bytes

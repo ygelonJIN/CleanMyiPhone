@@ -59,6 +59,9 @@ struct PhotoLibraryIndex {
     var albums: [Album] = []
     var members: [Int: Set<String>] = [:]
     var generatedAt = Date()
+    /// 库里有、但 PTP 没枚举出来的资产（已隐藏 / 最近删除 / iCloud 优化项 / App 存的随机名）。
+    /// 这些页面只能靠它，否则侧栏说有 124 张、点进去却是空的。
+    var shadowAssets: [Asset] = []
 
     var isEmpty: Bool { metaByFile.isEmpty }
 
@@ -110,6 +113,23 @@ struct PhotoLibraryIndex {
                 index.metaBySizeDate[Self.sizeDateKey(bytes: meta.byteSize, date: meta.createdAt)] = meta
             }
         }
+
+        // 影子资产：库里有、PTP 不一定枚举得到的那些（已隐藏 / 最近删除 / 云端项）
+        index.shadowAssets = index.metaByFile.map { key, meta in
+            Asset(
+                id: "lib|\(key)",
+                fileName: meta.fileName,
+                folder: meta.directory,
+                byteSize: meta.byteSize > 0 ? meta.byteSize : meta.resourceBytes,
+                createdAt: meta.createdAt,
+                kind: meta.isVideo ? .video : .photo,
+                tags: [],
+                pixelWidth: meta.width,
+                pixelHeight: meta.height,
+                duration: meta.duration
+            )
+        }
+        index.shadowAssets.sort { $0.createdAt < $1.createdAt }
 
         // 相簿
         let albumRows = db.rows("""

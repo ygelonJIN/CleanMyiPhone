@@ -41,6 +41,8 @@ struct CleanMyiPhoneApp: App {
                     NotificationCenter.default.post(name: .toggleInspector, object: nil)
                 }
                 .keyboardShortcut("i", modifiers: [.command, .option])
+                Divider()
+                Button("清空本机数据") { store.purgeLocalData() }
             }
             CommandGroup(after: .toolbar) {
                 Button("缩略图") { store.viewMode = .grid }.keyboardShortcut("1")
@@ -55,6 +57,11 @@ struct CleanMyiPhoneApp: App {
 final class ApplicationDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         CrashTracer.install()
+    }
+
+    /// 退出前清场：不留痕模式开着就连缩略图和相册库快照一起删
+    func applicationWillTerminate(_ notification: Notification) {
+        AppStore.purgeOnTerminate()
     }
 
     func applicationSupportsSecureRestorableState(_ app: NSApplication) -> Bool { true }
@@ -87,7 +94,7 @@ struct RootView: View {
         // 自己排三列：NavigationSplitView 的折叠状态不可控，
         // 出现过"点了按钮不收"的情况，干脆不用它。
         HStack(spacing: 0) {
-            if showSidebar {
+            if showSidebar && store.previewID == nil {
                 MainSidebarView()
                     .frame(width: 236)
                     .transition(.move(edge: .leading))
@@ -97,7 +104,7 @@ struct RootView: View {
             page
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
 
-            if showInspector {
+            if showInspector && store.previewID == nil {
                 Divider()
                 DeviceInspector()
                     .frame(width: 180)
@@ -118,6 +125,10 @@ struct RootView: View {
         .onKeyPress(keys: AppStore.handledKeys) { press in
             store.handleKey(press)
         }
+        // 点过格子之后焦点可能跑到滚动视图上，空格就失效了。
+        // 选择一变就把键盘焦点抢回来。
+        .onChange(of: store.selection) { _, _ in keyFocus = true }
+        .onChange(of: store.previewID) { _, _ in keyFocus = true }
         .onReceive(NotificationCenter.default.publisher(for: .toggleInspector)) { _ in
             toggleInspector()
         }
@@ -128,15 +139,17 @@ struct RootView: View {
             ConfirmSheet().environment(store)
         }
         .overlay {
-            if store.isScanning {
+            // 只在「一张都还没有」时盖全屏；目录一到就撤，
+            // 剩下的相册库（296 MB）在后台继续读，侧栏照常用「加载中」表示还没好。
+            if store.isScanning && store.assets.isEmpty {
                 ZStack {
                     Rectangle()
-                        .fill(.ultraThinMaterial)
+                        .fill(.thickMaterial)
                         .ignoresSafeArea()
                     VStack(spacing: 10) {
                         ProgressView().controlSize(.large)
-                        Text("加载中")
-                            .font(.callout)
+                        Text(store.progressText)
+                            .font(.callout.monospacedDigit())
                             .foregroundStyle(.secondary)
                     }
                 }

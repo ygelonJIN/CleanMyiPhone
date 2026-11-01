@@ -21,6 +21,8 @@ final class PTPBridge: NSObject, DeviceSource {
 
     private let lock = NSLock()
     private var filesByID: [String: ICCameraFile] = [:]
+    /// 设备端推过来的缩略图（照片 + 视频都有）
+    private var receivedThumbs: [String: NSImage] = [:]
     private var assetsByID: [String: Asset] = [:]
     private var started = false
     private var catalogFinishSent = false
@@ -43,19 +45,159 @@ final class PTPBridge: NSObject, DeviceSource {
         return snapshot()
     }
 
-    /// 哪条路真的能出图：0 = 还没试，1 = 内置缩略图，2 = 默认参数，3 = 指定分辨率
-    private var workingStrategy = 0
     private var reenumerateAt: Date = .distantPast
 
+    /// 正在等设备回缩略图的请求（id → 一次性回填）
+    private var thumbWaiters: [String: ResumeOnce] = [:]
+    /// 设备端缩略图连续失败几次就关掉这条捷径，别让每张图都陪跑超时
+    private var thumbTimeouts = 0
+    private var thumbCircuitOpen = false
+
     func thumbnail(for asset: Asset, maxPixel: Int) async -> NSImage? {
-        // 这台设备上 requestThumbnailData 一律不回数据（要等超时），
-        // 所以只取框架已经缓存好的那张 CGImage，拿不到就立刻交给 AFC 兜底。
+        // 1) 已经收到过的
+        if let image = lock.withLock({ receivedThumbs[asset.id] }) { return image }
         guard let file = lock.withLock({ filesByID[asset.id] }) else {
             reenumerateIfNeeded()
             return nil
         }
-        guard let cg = file.thumbnail else { return nil }
-        return NSImage(cgImage: cg, size: NSSize(width: cg.width, height: cg.height))
+        // 2) 框架自己缓存的那张
+        if let cg = file.thumbnail {
+            return NSImage(cgImage: cg, size: NSSize(width: cg.width, height: cg.height))
+        }
+
+        // 设备端缩略图这条路试了几次都不回，就关掉，直接走 AFC
+        if lock.withLock({ thumbCircuitOpen }) { return nil }
+
+        // 3) **主动向设备要**。iMazing 就是这么做的：
+        //    `-[ICCameraItem requestThumbnail]` 没有 completion，
+        //    结果通过 `cameraDevice:didReceiveThumbnail:forItem:error:` 回来，
+        //    所以这里挂一个等待者 + 超时。
+        let image: NSImage? = await withCheckedContinuation { (continuation: CheckedContinuation<NSImage?, Never>) in
+            let once = ResumeOnce(continuation)
+            lock.lock()
+            thumbWaiters[asset.id] = once
+            lock.unlock()
+
+            let started = Date()
+            // 先要**大尺寸**缩略图：ICImageSourceThumbnailMaxPixelSize 会请求比
+            // EXIF 内嵌图更大的版本（内嵌的往往只有 160×120，拿到网格里就是糊的）。
+            // 注意它不能和 imageSourceShouldCache 同时用，后者会把这个键直接忽略。
+            file.requestThumbnailData(
+                options: [ICCameraItemThumbnailOption.imageSourceThumbnailMaxPixelSize: 800]
+            ) { [weak self] data, error in
+                guard let self else { return }
+                if let data, let img = NSImage(data: data) {
+                    self.finishThumbnail(id: asset.id, image: img)
+                    return
+                }
+                Self.debugThumbLog("大图缩略图失败 \(asset.fileName) \(error?.localizedDescription ?? "-")，退回内嵌图")
+                // 退一步：要内嵌的 EXIF 小图（快，但会糊），同时触发 delegate 那条路
+                file.requestThumbnail()
+                file.requestThumbnailData(options: nil) { [weak self] data2, _ in
+                    guard let self else { return }
+                    if let data2, let img = NSImage(data: data2) {
+                        self.finishThumbnail(id: asset.id, image: img)
+                    }
+                }
+            }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
+                guard let self else { return }
+                if !once.claimed {
+                    Self.debugThumbLog("超时 \(asset.fileName) \(Int(Date().timeIntervalSince(started) * 1000))ms")
+                    self.noteThumbFailure()
+                }
+                self.finishThumbnail(id: asset.id, image: nil)
+            }
+        }
+        return image
+    }
+
+    /// 连续失败 3 次就把设备端缩略图这条捷径关掉
+    private func noteThumbFailure() {
+        lock.lock()
+        thumbTimeouts += 1
+        if thumbTimeouts >= 3 {
+            thumbCircuitOpen = true
+            Self.debugThumbLog("设备端缩略图连续失败 3 次，本次会话不再尝试")
+        }
+        lock.unlock()
+    }
+
+    private func noteThumbSuccess() {
+        lock.lock()
+        thumbTimeouts = 0
+        lock.unlock()
+    }
+
+    /// 回填等待者（只回一次）并清掉等待表
+    private func finishThumbnail(id: String, image: NSImage?) {
+        lock.lock()
+        let waiter = thumbWaiters.removeValue(forKey: id)
+        if let image { receivedThumbs[id] = image }
+        lock.unlock()
+        guard let waiter else { return }
+        if let image {
+            waiter.resume(image)
+        } else {
+            waiter.resume(nil)
+        }
+    }
+
+    /// 用 ImageCaptureCore 自己的下载接口取**原始文件**。
+    /// 它按设备端的对象句柄取，不需要我们把文件名猜对 ——
+    /// 之前「DCIM 里找不到」就是因为拿 PTP 的名字去 AFC 的目录索引里匹配，注定要错。
+    func downloadOriginal(for asset: Asset,
+                          to directory: URL,
+                          onProgress: ((Int64, Int64) -> Void)? = nil) async -> URL? {
+        guard let file = lock.withLock({ filesByID[asset.id] }) else {
+            reenumerateIfNeeded()
+            return nil
+        }
+        let name = asset.fileName
+        return await withCheckedContinuation { (continuation: CheckedContinuation<URL?, Never>) in
+            var finished = false
+            let finish: (URL?) -> Void = { url in
+                guard !finished else { return }
+                finished = true
+                continuation.resume(returning: url)
+            }
+            // 覆盖选项在这个 SDK 里只出现在文档注释里，没有对外常量；自己先删旧文件
+            try? FileManager.default.removeItem(at: directory.appendingPathComponent(name))
+            let options: [ICDownloadOption: Any] = [
+                ICDownloadOption.downloadsDirectoryURL: directory,
+                ICDownloadOption.saveAsFilename: name
+            ]
+            var timer: Timer?
+            let progressRef = file.requestDownload(options: options) { filename, error in
+                timer?.invalidate()
+                if let error {
+                    Self.debugThumbLog("IC 下载失败 \(name)：\(error.localizedDescription)")
+                    finish(nil)
+                    return
+                }
+                if let filename, !filename.isEmpty {
+                    let url = URL(fileURLWithPath: filename)
+                    if FileManager.default.fileExists(atPath: url.path) {
+                        finish(url)
+                        return
+                    }
+                }
+                let fallback = directory.appendingPathComponent(name)
+                finish(FileManager.default.fileExists(atPath: fallback.path) ? fallback : nil)
+            }
+            // 有进度就报给界面：让用户看到"已取回 40%"，而不是一句干等的提示
+            if let progressRef, let onProgress {
+                timer = Timer.scheduledTimer(withTimeInterval: 0.2, repeats: true) { t in
+                    onProgress(progressRef.completedUnitCount, progressRef.totalUnitCount)
+                    if progressRef.isFinished || progressRef.isCancelled { t.invalidate() }
+                }
+            }
+            // 60 秒兜底：首屏刚打开时设备可能在忙枚举，给足时间；超过就报错
+            DispatchQueue.main.asyncAfter(deadline: .now() + 60) {
+                timer?.invalidate()
+                finish(nil)
+            }
+        }
     }
 
     /// 内容目录映射空了就请设备重发一次（10 秒内只发一次，避免刷屏）
@@ -339,6 +481,23 @@ extension PTPBridge: ICCameraDeviceDelegate {
         publish()
     }
 
+    /// 设备端缩略图这条路的诊断（写同一个 thumb-log.txt）
+    static func debugThumbLog(_ line: String) {
+        let base = FileManager.default
+            .urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("cleanmyiphone", isDirectory: true)
+        DeviceFiles.makePrivateDirectory(base)
+        let url = base.appendingPathComponent("thumb-log.txt")
+        let text = "ic-thumb " + line + "\n"
+        if let handle = try? FileHandle(forWritingTo: url) {
+            handle.seekToEndOfFile()
+            handle.write(Data(text.utf8))
+            try? handle.close()
+        } else {
+            try? Data(text.utf8).write(to: url)
+        }
+    }
+
     func deviceDidBecomeReady(withCompleteContentCatalog device: ICCameraDevice) {
         ingest(device.mediaFiles ?? [])
         publish()
@@ -371,8 +530,35 @@ extension PTPBridge: ICCameraDeviceDelegate {
 
     func cameraDevice(_ camera: ICCameraDevice, didReceivePTPEvent eventData: Data) {}
 
+    /// 告诉框架「这个文件的缩略图我需要」。
+    /// iMazing 就实现了这一条（`cameraDevice:shouldGetThumbnailOfItem:`），
+    /// 框架会在枚举时顺手把设备端缩略图（照片和视频都有，几百 KB）取回来，
+    /// 比我们自己下几十 MB 的视频去抽帧快两个数量级。
+    func cameraDevice(_ camera: ICCameraDevice,
+                      shouldGetThumbnailOf item: ICCameraItem) -> Bool {
+        return true
+    }
+
     func cameraDevice(_ camera: ICCameraDevice, didReceiveThumbnail thumbnail: CGImage?,
-                      for item: ICCameraItem, error: (any Error)?) {}
+                      for item: ICCameraItem, error: (any Error)?) {
+        if thumbnail == nil, let error {
+            Self.debugThumbLog("didReceiveThumbnail 空：\(error.localizedDescription)")
+        }
+        guard let file = item as? ICCameraFile, let cg = thumbnail else { return }
+        let id = Self.assetID(for: file)
+        let image = NSImage(cgImage: cg, size: NSSize(width: cg.width, height: cg.height))
+        lock.lock()
+        receivedThumbs[id] = image
+        let waiter = thumbWaiters.removeValue(forKey: id)
+        lock.unlock()
+        noteThumbSuccess()
+        waiter?.resume(image)
+        // 顺手落一份 480px JPEG，下次直接命中磁盘缓存
+        if let name = file.name, !name.isEmpty {
+            _ = DeviceFiles.writeThumbnailCache(cg, fileName: name, maxPixel: 480)
+            Self.debugThumbLog("ok \(name) \(cg.width)x\(cg.height)")
+        }
+    }
 
     func cameraDevice(_ camera: ICCameraDevice, didReceiveMetadata metadata: [AnyHashable: Any]?,
                       for item: ICCameraItem, error: (any Error)?) {}
@@ -404,13 +590,18 @@ private final class VoidOnce {
 
 // MARK: - 只 resume 一次的续体
 
-private final class ResumeOnce {
+final class ResumeOnce: @unchecked Sendable {
     private let lock = NSLock()
     private var done = false
     private let continuation: CheckedContinuation<NSImage?, Never>
 
     init(_ continuation: CheckedContinuation<NSImage?, Never>) {
         self.continuation = continuation
+    }
+
+    var claimed: Bool {
+        lock.lock(); defer { lock.unlock() }
+        return done
     }
 
     func claim() -> Bool {
@@ -421,7 +612,9 @@ private final class ResumeOnce {
         return true
     }
 
+    /// 只有一个调用者会真正回填，重入/超时都安全
     func resume(_ image: NSImage?) {
+        guard claim() else { return }
         continuation.resume(returning: image)
     }
 }

@@ -99,6 +99,56 @@ struct PhotosView: View {
             Divider()
             bottomBar
         }
+        // 换排序 / 换升降序 / 换相簿：让所有格子重新走一遍取图流程。
+        // 光靠 ForEach 复用不会重发 `.task(id:)`，而且上一屏排队的请求要立刻作废。
+        .onChange(of: store.sortKey) { _, _ in store.bumpThumbEpoch() }
+        .onChange(of: store.ascending) { _, _ in store.bumpThumbEpoch() }
+        .onChange(of: store.sidebarItem) { _, _ in store.bumpThumbEpoch() }
+        // 相册库还没读完：整页盖一层进度，读完自动撤。
+        // 这段时间预览也开不了（没有库就拿不到设备上的真实路径）。
+        .overlay {
+            // 只要库索引还没有，就盖一层——不管扫描是在跑还是被清空暂停了
+            if store.libraryIndex == nil, !store.usingFixture {
+                Color.black.opacity(0.001)
+                    .ignoresSafeArea()
+                libraryGate
+            }
+        }
+    }
+
+    /// 库索引读取中的硬提示：和预览卡片同一套样式
+    private var libraryGate: some View {
+        VStack(spacing: 10) {
+            if store.dataPaused {
+                Image(systemName: "trash.slash")
+                    .font(.system(size: 22, weight: .light))
+                    .foregroundStyle(.secondary)
+            } else {
+                ProgressView().controlSize(.large)
+            }
+            VStack(spacing: 2) {
+                Text(store.dataPaused ? "本机数据已清空" : "正在读取相册索引")
+                    .font(.system(size: 13, weight: .medium))
+                    .foregroundStyle(.secondary)
+                if store.libraryBytesTotal > 0 {
+                    Text("\(AppStore.sizeText(store.libraryBytesDone)) / \(AppStore.sizeText(store.libraryBytesTotal))")
+                        .font(.system(size: 15, weight: .semibold, design: .rounded))
+                        .monospacedDigit()
+                        .frame(width: 300)
+                }
+            }
+            if store.libraryBytesTotal > 0, !store.dataPaused {
+                ProgressView(value: min(1, Double(store.libraryBytesDone) / Double(max(store.libraryBytesTotal, 1))))
+                    .progressViewStyle(.linear)
+                    .frame(width: 300)
+            }
+            Text(store.dataPaused ? "点左下角「重新读取」重新建立" : "读完就能浏览与预览（约 8 秒）")
+                .font(.caption2)
+                .foregroundStyle(.tertiary)
+        }
+        .padding(16)
+        .frame(width: 340)
+        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
     }
 
     private var subtitle: String {

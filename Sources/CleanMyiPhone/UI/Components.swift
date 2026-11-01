@@ -86,6 +86,18 @@ struct LoadingState: View {
     }
 }
 
+/// 行内「加载中…」：侧栏计数、页面副标题这些窄位置统一用它。
+/// 字体/颜色/省略号都一致，不要各处各写一句。
+struct LoadingText: View {
+    var text = "加载中…"
+    var body: some View {
+        Text(text)
+            .font(.caption.monospacedDigit())
+            .foregroundStyle(.tertiary)
+            .lineLimit(1)
+    }
+}
+
 /// 圆角搜索框（无原生工具栏时用）
 struct SearchField: View {
     let prompt: String

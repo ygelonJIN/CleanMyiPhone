@@ -268,13 +268,6 @@ final class MobileDeviceAPI {
         return nil
     }
 
-    /// 读整数值（电量等）
-    func deviceInt(_ device: UnsafeMutableRawPointer, domain: String?, key: String) -> Int {
-        apiLock.lock(); defer { apiLock.unlock() }
-        guard let value = copyValue(device, domain as CFString?, key as CFString)?.takeRetainedValue() else { return 0 }
-        if let number = value as? NSNumber { return number.intValue }
-        return 0
-    }
 
     /// 读字符串值（机型、系统版本、设备名）
     func deviceString(_ device: UnsafeMutableRawPointer, key: String) -> String? {
@@ -319,6 +312,98 @@ final class MobileDeviceAPI {
             if let gauge = diagnostics["GasGauge"] as? [String: Any], !gauge.isEmpty { return gauge }
         }
         return [:]
+    }
+
+    /// IORegistry 里的电池节点（`AppleSmartBattery` / `pmu` 之类）。
+    ///
+    /// diagnostics_relay 回的是一棵**树**：`Diagnostics.<名字>.{regEntry, children:[...]}`，
+    /// 只取根的一层会什么都看不到（之前的结论「IORegistry 只有一层」就是这么来的）。
+    /// 这里按 children 递归，找到同时带 capacity 和 cycle 的那一层就返回它的属性。
+    func batteryNodeProps(_ device: UnsafeMutableRawPointer) -> [String: Any] {
+        var log: [String] = []
+        defer { Self.writeBatteryDump(log) }
+        guard let service = try? openService(device, name: "com.apple.mobile.diagnostics_relay") else {
+            log.append("diagnostics_relay 服务打不开")
+            return [:]
+        }
+        // 设备只回**一层** children，所以必须按名字/类名逐个点名请求，
+        // 光递归是走不到深处的。名字在不同 SoC 上不一样，全都试一遍。
+        var requests: [[String: Any]] = [
+            ["Request": "IORegistry", "CurrentPlane": "IOService"],
+            ["Request": "IORegistry"]
+        ]
+        for name in ["AppleSmartBattery", "AppleARMPMUCharger", "pmu", "battery", "AppleSmartBatteryManager"] {
+            requests.append(["Request": "IORegistry", "CurrentPlane": "IOService", "EntryName": name])
+            requests.append(["Request": "IORegistry", "CurrentPlane": "IOService", "EntryClass": name])
+        }
+        requests.append(["Request": "All"])
+
+        for request in requests {
+            let response = serviceRequest(service, request)
+            let diagnostics = response["Diagnostics"] as? [String: Any]
+            let keyList = response.keys.sorted().joined(separator: ",")
+            let diagList = (diagnostics?.keys.sorted() ?? []).joined(separator: ",")
+            log.append("请求 \(Self.describe(request)) → 顶层[\(keyList)] Diagnostics[\(diagList)]")
+            if let diagnostics {
+                for (name, value) in diagnostics {
+                    guard let node = value as? [String: Any] else { continue }
+                    let props = (node["regEntry"] as? [String: Any])?.keys.sorted().joined(separator: ",") ?? "-"
+                    let kids = (node["children"] as? [Any])?.count ?? 0
+                    log.append("  \(name): children=\(kids) regEntry[\(props)]")
+                }
+            }
+            guard !response.isEmpty else { continue }
+            if let hit = Self.findBatteryNode(response) {
+                log.append("命中电池节点：\(hit.keys.sorted().joined(separator: ","))")
+                return hit
+            }
+        }
+        log.append("没有命中电池节点")
+        return [:]
+    }
+
+    /// 现场写到能确定有权限的地方（App Support 下），顺便打一份到 stderr
+    private static func writeBatteryDump(_ lines: [String]) {
+        guard !lines.isEmpty else { return }
+        let text = lines.joined(separator: "\n") + "\n"
+        FileHandle.standardError.write(Data("[battery]\n".utf8))
+        FileHandle.standardError.write(Data(text.utf8))
+        let base = FileManager.default
+            .urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("cleanmyiphone", isDirectory: true)
+        DeviceFiles.makePrivateDirectory(base)
+        try? text.write(to: base.appendingPathComponent("battery-dump.txt"), atomically: true, encoding: .utf8)
+    }
+
+    private static func describe(_ request: [String: Any]) -> String {
+        request.keys.sorted().map { "\($0)=\(request[$0] ?? "")" }.joined(separator: " ")
+    }
+
+    /// 在一棵任意嵌套的 plist 结构里找「像电池」的那层字典
+    static func findBatteryNode(_ value: Any, depth: Int = 0) -> [String: Any]? {
+        guard depth < 8 else { return nil }
+        if let dict = value as? [String: Any] {
+            let keys = dict.keys.map { $0.lowercased() }
+            let hasCapacity = keys.contains { $0.contains("capacity") }
+            let hasCycle = keys.contains { $0.contains("cycle") }
+            if hasCapacity, hasCycle {
+                return dict
+            }
+            // children 优先，避免先在 Summary 那类浅层字典上浪费
+            if let children = dict["children"] as? [Any] {
+                for child in children {
+                    if let hit = findBatteryNode(child, depth: depth + 1) { return hit }
+                }
+            }
+            for (key, child) in dict where key != "children" {
+                if let hit = findBatteryNode(child, depth: depth + 1) { return hit }
+            }
+        } else if let array = value as? [Any] {
+            for child in array {
+                if let hit = findBatteryNode(child, depth: depth + 1) { return hit }
+            }
+        }
+        return nil
     }
 
     // MARK: - House Arrest（App 容器 / 文稿与数据）
@@ -379,12 +464,6 @@ final class MobileDeviceAPI {
         return (afc, reply)
     }
 
-    /// 删一个文件或空目录（AFC 根内相对路径）
-    @discardableResult
-    func removePath(_ afc: UnsafeMutableRawPointer, path: String) -> Bool {
-        guard let afcRemovePath else { return false }
-        return afcRemovePath(afc, path) == 0
-    }
 
     /// 目录条目大小（开文件后 seek 到末尾取长度）。目录或空文件返回 0。
     func entrySize(_ afc: UnsafeMutableRawPointer, path: String) -> Int64 {
@@ -513,12 +592,6 @@ final class MobileDeviceAPI {
         _ = afcFileClose(afc, ref)
     }
 
-    /// 把文件位置拨到指定字节
-    @discardableResult
-    func seekFile(_ afc: UnsafeMutableRawPointer, _ ref: UnsafeMutableRawPointer, to offset: Int64) -> Bool {
-        guard let afcFileSeek else { return false }
-        return afcFileSeek(afc, ref, offset, 0) == 0
-    }
 
     /// 文件总字节数（seek 到末尾再 tell，随后回到开头）。拿不到返回 0。
     func fileSize(_ afc: UnsafeMutableRawPointer, _ ref: UnsafeMutableRawPointer) -> Int64 {
@@ -556,138 +629,22 @@ final class MobileDeviceAPI {
         return Data(buffer[0..<min(Int(length), size)])
     }
 
-    /// 往调用方给的裸缓冲区里读一块，全程不创建 Data / 不桥接 ObjC。
-    /// 返回 (状态码, 有效字节数)。
-    func readChunkRaw(_ afc: UnsafeMutableRawPointer,
-                      _ ref: UnsafeMutableRawPointer,
-                      into buffer: UnsafeMutableRawPointer,
-                      size: Int) -> (status: Int32, count: Int) {
-        var lengthSlot: UInt64 = UInt64(size)
-        let status = withUnsafeMutablePointer(to: &lengthSlot) { slot in
-            afcFileRead(afc, ref, buffer,
-                        UnsafeMutableRawPointer(slot).assumingMemoryBound(to: UInt32.self))
-        }
-        lastReadStatus = status
-        guard status == 0 else { return (status, 0) }
-        return (status, min(Int(UInt32(truncatingIfNeeded: lengthSlot)), size))
-    }
 
-    private static func trace(_ line: String) {
-        let url = URL(fileURLWithPath: "/tmp/cmi-afc.log")
-        let text = line + "\n"
-        if let handle = try? FileHandle(forWritingTo: url) {
-            handle.seekToEndOfFile()
-            handle.write(Data(text.utf8))
-            try? handle.close()
-        } else {
-            try? Data(text.utf8).write(to: url)
-        }
-    }
 
-    /// 完整读取一个文件：中途出错就 seek 到已读位置续读，直到连续多次读不到新数据
-    func readFully(_ afc: UnsafeMutableRawPointer, path: String, yieldEvery: Int = 16) async -> Data? {
-        guard let ref = try? openFile(afc, path: path) else { return nil }
-        defer { closeFile(afc, ref) }
 
-        var data = Data()
-        var stalled = 0
-        var slices = 0
-        while true {
-            if let chunk = readChunk(afc, ref), !chunk.isEmpty {
-                data.append(chunk)
-                stalled = 0
-                slices += 1
-                if slices % yieldEvery == 0 { await Task.yield() }
-                continue
-            }
-            // 读不到新数据：尝试 seek 回已读位置续读，连续 3 次都失败才结束
-            stalled += 1
-            if stalled > 3 { break }
-            if let seek = afcFileSeek {
-                _ = seek(afc, ref, Int64(data.count), 0)
-            }
-            await Task.yield()
-        }
-        return data
-    }
 
-    /// 抗截断下载：读失败就重开文件、seek 回已写位置继续，最多恢复 40 次
-    @discardableResult
-    func downloadRobust(_ afc: UnsafeMutableRawPointer, path: String, to destination: URL) throws -> Int64 {
-        var ref = try openFile(afc, path: path)
-        try? FileManager.default.createDirectory(at: destination.deletingLastPathComponent(),
-                                                 withIntermediateDirectories: true)
-        try? FileManager.default.removeItem(at: destination)
-        FileManager.default.createFile(atPath: destination.path, contents: nil)
-        guard let handle = try? FileHandle(forWritingTo: destination) else {
-            throw NSError(domain: "cleanmyiphone", code: 14,
-                          userInfo: [NSLocalizedDescriptionKey: "无法写入 \(destination.path)"])
-        }
-        defer { try? handle.close() }
-
-        var total: Int64 = 0
-        var recoveries = 0
-        while true {
-            if let chunk = readChunk(afc, ref), !chunk.isEmpty {
-                handle.write(chunk)
-                total += Int64(chunk.count)
-                continue
-            }
-            recoveries += 1
-            if recoveries > 40 { break }
-            closeFile(afc, ref)
-            usleep(120_000)
-            ref = try openFile(afc, path: path)
-            if let seek = afcFileSeek, total > 0 {
-                _ = seek(afc, ref, total, 0)
-            }
-        }
-        closeFile(afc, ref)
-        return total
-    }
-
-    /// 流式下载，读中断就 seek 回已写位置续读（比整份重下稳）
-    @discardableResult
-    func downloadResumable(_ afc: UnsafeMutableRawPointer, path: String, to destination: URL) throws -> Int64 {
-        let ref = try openFile(afc, path: path)
-        defer { closeFile(afc, ref) }
-
-        try? FileManager.default.createDirectory(at: destination.deletingLastPathComponent(),
-                                                 withIntermediateDirectories: true)
-        try? FileManager.default.removeItem(at: destination)
-        FileManager.default.createFile(atPath: destination.path, contents: nil)
-        guard let handle = try? FileHandle(forWritingTo: destination) else {
-            throw NSError(domain: "cleanmyiphone", code: 13,
-                          userInfo: [NSLocalizedDescriptionKey: "无法写入 \(destination.path)"])
-        }
-        defer { try? handle.close() }
-
-        var total: Int64 = 0
-        var stalls = 0
-        var slices = 0
-        while true {
-            if let chunk = readChunk(afc, ref), !chunk.isEmpty {
-                handle.write(chunk)
-                total += Int64(chunk.count)
-                stalls = 0
-                slices += 1
-                continue
-            }
-            stalls += 1
-            if stalls > 3 { break }
-            if let seek = afcFileSeek {
-                _ = seek(afc, ref, total, 0)
-            }
-        }
-        return total
-    }
 
     /// 流式下载到本地文件，返回写入字节数。`onBytes` 每 4 MB 回一次已写字节数，
     /// 父进程据此显示「已读 / 总量」。
     @discardableResult
+    /// 下载一个文件。
+    /// `expected` 给的是计划时量到的字节数：读到它就当文件尾，
+    /// **不要**再用「连续 400 次空读 × 30ms」判尾 —— 那是每个文件固定多花 12 秒的来源，
+    /// 相册库四件套就是因此出现好几次「卡住十几秒」。
     func downloadFile(_ afc: UnsafeMutableRawPointer,
                       path: String,
                       to destination: URL,
+                      expected: Int64 = 0,
                       onBytes: ((Int64) -> Void)? = nil) throws -> Int64 {
         var ref: UnsafeMutableRawPointer?
         let openStatus = afcFileOpen(afc, path, 1, &ref)
@@ -720,10 +677,13 @@ final class MobileDeviceAPI {
             let length = UInt32(truncatingIfNeeded: lengthSlot)
             if status != 0 { break }
             if length == 0 {
-                // 0 字节不一定是文件尾，多半是 USB 通道暂时没数据；等一拍再读
+                // 0 字节有两种：真的读完了，或者 USB 通道瞬时没数据。
+                // 已经读到计划字节数 → 连空 3 拍（60 ms）就收工；
+                // 还没读够 → 继续等，最多 40 拍（0.8 s）。
                 zeroReads += 1
-                if zeroReads > 400 { break }
-                usleep(30_000)
+                let reachedPlan = expected > 0 && total >= expected
+                if reachedPlan ? zeroReads > 3 : zeroReads > 40 { break }
+                usleep(20_000)
                 continue
             }
             zeroReads = 0
