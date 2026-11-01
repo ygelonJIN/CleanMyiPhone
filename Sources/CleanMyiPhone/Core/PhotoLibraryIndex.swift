@@ -19,6 +19,27 @@ struct PhotoLibraryIndex {
         /// 这个资产所有资源（原图 + 编辑渲染版本 + Live Photo 视频分量）的字节合计。
         /// 统计占用必须用它：只看 ZORIGINALFILESIZE 会少算近 30 GB。
         let resourceBytes: Int64
+        /// `ZPLAYBACKSTYLE`：1=普通静图、3=实况、4=视频
+        let playbackStyle: Int
+        /// `ZADDITIONALASSETATTRIBUTES.ZCAMERACAPTUREDEVICE`：1 = 相机拍的（不是从 App 存的）
+        let isCameraCaptured: Bool
+        /// `ZUNIFORMTYPEIDENTIFIER`：RAW 判定用（`public.adobe.raw-image` 之类）
+        let typeIdentifier: String
+
+        /// 实况照片：**两个条件都要**。
+        /// 只有 `subtype == 2` 不够 —— 本机实测 1939 条 subtype=2 里有 4 条
+        /// `playbackStyle = 1`（拍的时候把实况关了），那 4 条没有视频分量，不算实况。
+        var isLive: Bool { !isVideo && subtype == 2 && playbackStyle == 3 }
+
+        /// RAW：认设备报的类型标识，退化时看扩展名
+        var isRaw: Bool {
+            if typeIdentifier.contains("raw-image") { return true }
+            return Self.rawExtensions.contains((fileName as NSString).pathExtension.lowercased())
+        }
+
+        static let rawExtensions: Set<String> = [
+            "dng", "cr2", "cr3", "nef", "arw", "raf", "orf", "rw2", "srw", "pef", "3fr"
+        ]
     }
 
     struct Album: Identifiable, Hashable {
@@ -108,6 +129,9 @@ struct PhotoLibraryIndex {
     /// 库里有、但 PTP 没枚举出来的资产（已隐藏 / 最近删除 / iCloud 优化项 / App 存的随机名）。
     /// 这些页面只能靠它，否则侧栏说有 124 张、点进去却是空的。
     var shadowAssets: [Asset] = []
+    /// 库里的**每一行**（不做文件名去重）。`metaByFile` 是按归一化文件名做键的，
+    /// 两个不同目录下的同名文件会互相覆盖 —— 侧栏统计必须用这一份，否则少算。
+    var allMeta: [Meta] = []
 
     var isEmpty: Bool { metaByFile.isEmpty }
 
@@ -121,7 +145,9 @@ struct PhotoLibraryIndex {
         let assetRows = db.rows("""
             SELECT a.Z_PK, a.ZFILENAME, a.ZDIRECTORY, a.ZDATECREATED, a.ZHIDDEN, a.ZFAVORITE,
                    a.ZTRASHEDSTATE, a.ZKIND, a.ZKINDSUBTYPE, a.ZWIDTH, a.ZHEIGHT, a.ZDURATION,
-                   b.ZORIGINALFILESIZE AS ZSIZE
+                   a.ZPLAYBACKSTYLE, a.ZUNIFORMTYPEIDENTIFIER,
+                   b.ZORIGINALFILESIZE AS ZSIZE,
+                   b.ZCAMERACAPTUREDEVICE AS ZCAMCAPTURED
             FROM ZASSET a
             LEFT JOIN ZADDITIONALASSETATTRIBUTES b ON b.ZASSET = a.Z_PK
             """)
@@ -150,9 +176,13 @@ struct PhotoLibraryIndex {
                 height: row.int("ZHEIGHT"),
                 duration: row.double("ZDURATION"),
                 byteSize: row.int64("ZSIZE"),
-                resourceBytes: resourceByPK[row.int("Z_PK")] ?? row.int64("ZSIZE")
+                resourceBytes: resourceByPK[row.int("Z_PK")] ?? row.int64("ZSIZE"),
+                playbackStyle: row.int("ZPLAYBACKSTYLE"),
+                isCameraCaptured: row.int("ZCAMCAPTURED") == 1,
+                typeIdentifier: row.string("ZUNIFORMTYPEIDENTIFIER") ?? ""
             )
             let key = Self.normalize(name)
+            index.allMeta.append(meta)
             index.metaByFile[key] = meta
             fileNameByPK[row.int("Z_PK")] = key
             if meta.byteSize > 0 {
@@ -185,11 +215,18 @@ struct PhotoLibraryIndex {
         }
         index.shadowAssets.sort { $0.createdAt < $1.createdAt }
 
-        // 相簿
+        // 相簿。
+        // 排除两类**不是相簿**的行：
+        //   1. `ZKIND` 3571/3572/3573 = 系统进度占位（标题 `progress-sync` / `progress-ota-restore` /
+        //      `progress-fs-import`），本机实测确实存在，显示出来就是三个 0 张的空相簿；
+        //   2. 其余没有标题的行（智能相簿 `FetchingAlbum`、导入会话、共享相簿占位）——
+        //      智能相簿的成员是运行期算的，库里没有，列出来点进去永远是空。
         let albumRows = db.rows("""
             SELECT Z_PK, ZTITLE, ZKIND, ZCACHEDCOUNT
             FROM ZGENERICALBUM
             WHERE ZTITLE IS NOT NULL AND TRIM(ZTITLE) <> ''
+              AND ZKIND NOT IN (3571, 3572, 3573)
+              AND ZTITLE NOT LIKE 'progress-%'
             """)
         var albums: [Album] = []
         for row in albumRows {

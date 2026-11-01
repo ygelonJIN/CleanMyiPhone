@@ -207,7 +207,35 @@ enum Probe {
         }
     }
 
+    /// 自检：验证「崩溃那一刻」用的那条删除通路（登记 → unlink）真的有效。
+    /// 崩溃信号里只能调异步信号安全的东西，所以这条路必须单独验一次。
+    private static func traceSelfTest() {
+        let dir = TraceRegistry.dataDirectory.appendingPathComponent("thumbs", isDirectory: true)
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let a = dir.appendingPathComponent("selftest-a.jpg")
+        let b = dir.appendingPathComponent("selftest-b.jpg")
+        let fixed = TraceRegistry.dataDirectory.appendingPathComponent("thumb-log.txt")
+        try? Data("a".utf8).write(to: a)
+        try? Data("b".utf8).write(to: b)
+        try? Data("c".utf8).write(to: fixed)
+        TraceRegistry.registerTrace(a)
+        TraceRegistry.registerTrace(b)
+        TraceRegistry.prepareSignalSafePaths()
+        say("登记后：a=\(FileManager.default.fileExists(atPath: a.path)) b=\(FileManager.default.fileExists(atPath: b.path)) 固定名=\(FileManager.default.fileExists(atPath: fixed.path))")
+        TraceRegistry.unlinkRegistered()
+        let gone = !FileManager.default.fileExists(atPath: a.path)
+            && !FileManager.default.fileExists(atPath: b.path)
+            && !FileManager.default.fileExists(atPath: fixed.path)
+        say("unlink 后：a=\(FileManager.default.fileExists(atPath: a.path)) b=\(FileManager.default.fileExists(atPath: b.path)) 固定名=\(FileManager.default.fileExists(atPath: fixed.path))")
+        say(gone ? "通过" : "失败")
+        exit(0)
+    }
+
     static func runIfRequested() {
+        if CommandLine.arguments.contains("--trace-selftest") {
+            traceSelfTest()
+            return
+        }
         if let index = CommandLine.arguments.firstIndex(of: "--fetch-library"),
            index + 1 < CommandLine.arguments.count {
             fetchLibrary(to: CommandLine.arguments[index + 1])

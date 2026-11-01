@@ -1,17 +1,19 @@
 import SwiftUI
 
-/// 原生 macOS 侧边栏：固定五项 + Section 分组 + 统一选中项。
-/// 相簿不再挂在这里（搬进照片页的二级导航列），所以这一栏永远不会被挤爆。
+/// 原生 macOS 侧边栏：概览 + 照片（全部照片 / 相簿 / 各类型）+ 回收站。
+/// 相簿现在自己占一行（点进去是相簿墙），不再挤在照片页里，所以这一栏永远不会被挤爆。
 struct MainSidebarView: View {
     @Environment(AppStore.self) private var store
 
     private var selection: Binding<AppStore.SidebarItem?> {
         Binding(
             get: {
-                // 相簿在照片页自己的栏里选，侧栏这一行就落在「全部照片」上，
-                // 否则会出现「侧栏全空、内容却在显示某个相簿」的错位。
-                if case .album = store.sidebarItem { return .photos(.all) }
-                return store.sidebarItem
+                // 「某个相簿里」和「相簿墙」都落在「相簿」这一行上，
+                // 否则会出现「侧栏高亮在全部照片、内容却是某个相簿」的错位。
+                switch store.sidebarItem {
+                case .album, .albums: return .albums
+                default: return store.sidebarItem
+                }
             },
             set: { if let item = $0 { store.select(item) } }
         )
@@ -57,7 +59,13 @@ struct MainSidebarView: View {
                         Spacer(minLength: 6)
                         metric(for: filter)
                     }
+                    .help(filter.help)
                     .tag(AppStore.SidebarItem.photos(filter))
+
+                    // 相簿紧跟在「全部照片」下面（位置是用户定的）
+                    if filter == .all {
+                        albumRow
+                    }
                 }
             }
 
@@ -72,12 +80,32 @@ struct MainSidebarView: View {
         .safeAreaInset(edge: .bottom, spacing: 0) { cacheBar }
     }
 
-    /// 左下角：只在「概览」页显示。
-    /// 别的页面（尤其全屏预览、锁屏提示）不该出现这个勾选框。
+    /// 「相簿」这一行：右边只报相簿个数，不报张数体积（那会和「全部照片」重复）
+    private var albumRow: some View {
+        HStack(spacing: 8) {
+            Label("相簿", systemImage: "rectangle.stack")
+            Spacer(minLength: 6)
+            if store.libraryAlbums.isEmpty {
+                if store.metricsLibraryUnavailable {
+                    Text("—")
+                        .font(.caption.monospacedDigit())
+                        .foregroundStyle(.quaternary)
+                } else {
+                    LoadingText()
+                }
+            } else {
+                Text("\(store.libraryAlbums.count) 个")
+                    .font(.caption.monospacedDigit())
+                    .foregroundStyle(.tertiary)
+            }
+        }
+        .help("点开看全部相簿，再点某个相簿进去看里面的照片和视频")
+        .tag(AppStore.SidebarItem.albums)
+    }
+
+    /// 左下角：读取结束后才出现。别的页面（全屏预览、锁屏提示）不该出现这两个按钮。
     private var cacheBar: some View {
         VStack(alignment: .leading, spacing: 6) {
-            // 读取过程中（全屏「正在读取…」那一屏）整块都不出现，
-            // 读完了在概览 / 照片 / 回收站任何页面都显示，勾选框和文字一起进一起出。
             if !store.isScanning {
                 purgeButton
             }
@@ -87,16 +115,15 @@ struct MainSidebarView: View {
         .padding(.bottom, 8)
     }
 
-    /// 底部三件：自动清空勾选 + 立刻清空 + 重新读取
+    /// 底部两件：立刻清空 + 重新读取。
+    /// 没有「自动清空」开关了：退出即清空是无条件的 —— 开关本身就是一条痕迹，
+    /// 而且关掉它等于允许硬盘上留一份 296 MB 的照片库复印件。
     private var purgeButton: some View {
         VStack(alignment: .leading, spacing: 6) {
-            Toggle(isOn: Binding(get: { store.autoPurge },
-                                 set: { store.setAutoPurge($0) })) {
-                Text("自动清空本机数据")
-                    .font(.caption)
-            }
-            .toggleStyle(.checkbox)
-            .help("勾上：退出 App（⌘Q / 关窗口）时自动删干净。**启动时不删** —— 启动就删等于每次都重搬 296 MB 相册库，容易把文件通道撞坏")
+            Text("退出即清空 · 本机不留缓存")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .help("⌘Q、关窗口、崩溃、强制退出，都不会在这台电脑上留下照片数据")
 
             HStack(spacing: 6) {
                 Button("清空本机数据", systemImage: "trash.slash") {
@@ -104,7 +131,7 @@ struct MainSidebarView: View {
                 }
                 .buttonStyle(.bordered)
                 .controlSize(.small)
-                .help("立刻删掉缩略图缓存、相册库快照和所有临时原图/原视频副本；清完不会自动重建")
+                .help("立刻删掉缩略图、临时原图/原视频、相册库中转文件；清完不会自动重建")
 
                 Button("重新读取", systemImage: "arrow.clockwise") {
                     store.resumeReading()
@@ -112,7 +139,7 @@ struct MainSidebarView: View {
                 .buttonStyle(.bordered)
                 .controlSize(.small)
                 .disabled(!store.dataPaused)
-                .help("清空之后用它重新读取设备、重建缩略图")
+                .help("清空之后用它重新读一遍设备")
             }
 
             if store.purgeLeftovers.isEmpty, let message = store.purgeMessage {
@@ -131,5 +158,4 @@ struct MainSidebarView: View {
             }
         }
     }
-
 }

@@ -379,9 +379,7 @@ final class MobileDeviceAPI {
         let text = lines.joined(separator: "\n") + "\n"
         FileHandle.standardError.write(Data("[battery]\n".utf8))
         FileHandle.standardError.write(Data(text.utf8))
-        let base = FileManager.default
-            .urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-            .appendingPathComponent("cleanmyiphone", isDirectory: true)
+        let base = TraceRegistry.dataDirectory
         DeviceFiles.makePrivateDirectory(base)
         try? text.write(to: base.appendingPathComponent("battery-dump.txt"), atomically: true, encoding: .utf8)
     }

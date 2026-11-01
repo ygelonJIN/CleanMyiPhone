@@ -18,9 +18,7 @@ enum SingleInstance {
         if let override = ProcessInfo.processInfo.environment["CMI_LOCK_PATH"] {
             return URL(fileURLWithPath: override)
         }
-        let base = FileManager.default
-            .urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-            .appendingPathComponent("cleanmyiphone", isDirectory: true)
+        let base = TraceRegistry.dataDirectory
         try? FileManager.default.createDirectory(at: base, withIntermediateDirectories: true)
         return base.appendingPathComponent("instance.lock")
     }

@@ -15,11 +15,13 @@ macOS 上的 iPhone 空间清理工具（SwiftUI，零外部依赖）。个人�
 一个把 iPhone 用数据线连到 Mac 上、按相簿浏览照片/视频、按大小与时间筛选、两步确认后删除、并带标记式回收站的工具。目标：不装 Python、不依赖 Homebrew、单 App 10MB 级。
 
 当前进度：
-- 已通：连接、整机统计、照片浏览/筛选/多选、悬停 + 空格预览（图片 + 视频）、两步确认、标记式回收站、**相簿树**（Photos.sqlite 四件套快照，本机 5270 资产 / 21 相簿）。
+- 已通：连接、整机统计、照片浏览/筛选/多选、悬停 + 空格预览（图片 + 视频）、两步确认、标记式回收站（**只在内存**）、**相簿二级栏**（本机 18 个相簿）、**11 项筛选**。
 - 界面（v6）：**两栏导航 + 右侧设备信息栏**（左 236pt / 右 180pt，右上角收起、⌥⌘I 再打开；全屏预览时两侧自动隐藏）；**应用页与文件页整页删除**（拿不到体积/图标/容器，留着是误导）；概览改为**无饼图**（占比条 + 6 张卡片 + 照片类型 + 相簿大小排行）；照片页把「排序 / 视图」做成显眼的分段控件，删掉类型筛选；相簿栏显示张数 + 体积；照片单击即勾选可累积多选。
 - 未做：框选多选、删除流程的真机回归。
 - 右侧栏（2026-11 改）：**不再显示电池温度 / 电话号码 / Apple 账户**（三条都拿不到，占位是误导）；新增 激活状态、芯片架构、区域、时区、配对状态、设备状态（锁屏/解锁）、低电量模式、是否插电、健康度分级（优秀/良好/一般/建议维修），设计 vs 有效最大电量、循环次数并列。实现把 `List` 换成 `ScrollView + VStack`：sidebar List 每行暗加约 9pt、行距被顶到 33pt，23 行塞不进默认窗口；现在**行高 18pt、行间 0pt、分节标题上 11 下 3**，默认 720pt 高度一次看全。
-- 侧栏计数（2026-11 修）：原来每行各自惰性算 + `@ObservationIgnored` 缓存（`countCache`），视图读缓存后就不再依赖 `libraryIndex`，库到了也不刷新，停在 `0 · 8.93 GB` 直到点一下别处；现在改成 `filterMetrics` 一整包可观察赋值（一次遍历算完 7 项），未就绪统一显示 `LoadingText`（「加载中…」），库读不到显示 `—`。
+- 侧栏计数（2026-11 修）：原来每行各自惰性算 + `@ObservationIgnored` 缓存（`countCache`），视图读缓存后就不再依赖 `libraryIndex`，库到了也不刷新，停在 `0 · 8.93 GB` 直到点一下别处；现在改成 `filterMetrics` 一整包可观察赋值，未就绪统一显示 `LoadingText`（「加载中…」），库读不到显示 `—`。**统计必须遍历 `PhotoLibraryIndex.allMeta`（不去重）**：`metaByFile` 按归一化文件名做键，不同目录同名会互相覆盖，用它统计会少算几百条（实测 5291 → 4942）。
+- **筛选（2026-11 定的最终形态）**：侧栏「照片」节 = 全部照片 → **相簿** → 相机 → 照片 → 视频 → 收藏 → 截图 → 实况 → RAW → 已隐藏 → 最近删除。相簿不是筛选项：选「相簿」后**照片页左边挂一条二级栏（相簿列表，不是卡片墙）**，点列表里某个相簿，右边就是那个相簿里的照片和视频；侧栏高亮仍停在「相簿」。进「相簿」时自动选张数最多的那个，不留白页。判据全部来自库：`ZKIND=1` 视频 / `ZKINDSUBTYPE=10` 截图 / `subtype=2 && ZPLAYBACKSTYLE=3` 实况 / `ZADDITIONALASSETATTRIBUTES.ZCAMERACAPTUREDEVICE=1` 相机 / `ZUNIFORMTYPEIDENTIFIER` 含 raw-image 或 .dng 扩展名 = RAW。本机实测 5291 / 397 / 487 / 1935 / 479 / 94。**自拍、电影效果、ProRes 不做**：库里没有可靠判据（自拍没有前置相机标记；电影效果疑似 `ZKINDSUBTYPE=103`、只有 5 条、未与真机核对；ProRes 只能按码率猜），不猜。
+- 相簿二级栏要**排除系统占位行**：`ZKIND` 3571/3572/3573（标题 `progress-sync` / `progress-ota-restore` / `progress-fs-import`）和标题以 `progress-` 开头的行，否则二级栏会多出三个 0 张的空相簿（21 → 18）。智能相簿（`FetchingAlbum`，`Z_ENT=40`）没有标题也没有成员，天然被过滤掉。
 - 已隐藏 / 最近删除（2026-11 修）：这两个筛选以前从 PTP 的 `assets` 里筛，而 PTP 根本不枚举这两类 → 页面永远空。现在用 `PhotoLibraryIndex.shadowAssets`（库行构造的影子资产，id `lib|<归一化文件名>`）补齐，缩略图走 AFC 取 DCIM 原文件；预览查找也走 `asset(withID:)` 兜到影子资产。
 - 电池读数（2026-11 定案）：**健康度/有效最大电量拿不到**。GasGauge 的 `FullChargeCapacity` 是满充百分比不是健康度；IORegistry 每次只回一层 `children`、`regEntry` 为空，按名字点名（AppleSmartBattery / AppleARMPMUCharger / pmu / battery 都试过）也拿不到。界面按"有值才显示"处理，所以这几行不出现，不留 `—`。`batteryNodeProps` 保留但基本拿不到数据，现场写 `battery-dump.txt`。
 - 区域：`RegionInfo` 常常是空字典，改为从型号号码尾码推（`MQ0W3CH/A` → CH → 中国大陆）。
@@ -68,26 +70,32 @@ macOS 上的 iPhone 空间清理工具（SwiftUI，零外部依赖）。个人�
 - **失败路径上的设备调用必须带超时**（2026-11 踩过）：`isDeviceLocked()`、`fetchDeviceStats()` 都是 `@MainActor` 上的阻塞 C 调用，管子半死时**永不返回** → 主线程冻住，门禁一直转、日志不再出任何行，看着像"读了很久"。现在 `isDeviceLocked()` 全部走 `LibraryService.withDeviceTimeout(4, fallback:)`，`fetchDeviceStats()` 换成 `deviceStatsOffMain()`（6 秒超时、不在主线程等）。
 - **自动重试有上限**：连续失败 3 次就停（`libraryFailureCount` / `libraryAutoRetryStopped`）。`retryLibraryOnce` **不再把 `libraryStatus` 清空**——清了门禁会从「读不出来 + 原因 + 按钮」退回转圈态，用户会以为又重新读了一次，而且失败原因也没了。
 
-- **不留痕（2026-11 定案：不管怎么退出都要零痕迹）**：四条退出通路各有人管，见 `PurgeGuard`：
-  | 退出方式 | 谁清 |
-  |---|---|
-  | ⌘Q / 菜单退出 / 点窗口红点 | `applicationWillTerminate` → `AppStore.purgeOnTerminate()`（完整清） |
-  | `kill <pid>` / Ctrl+C / 关机信号 | `PurgeGuard` 的 SIGTERM/SIGINT/SIGHUP/SIGQUIT handler（完整清） |
-  | 崩溃（SIGSEGV/BUS/ABRT/ILL） | handler 里只 `unlink` 那几个固定文件（异步信号安全），其余靠下次启动 |
-  | `kill -9` / 断电 | 进程没有执行机会 —— 靠 **`bootstrap()` 第一步的 `purgeLocalDataOnDisk()`** |
-  `nonisolated` 是必须的：信号 handler 不在主线程，`purgeOnTerminate` / `purgeLocalDataOnDisk` 都改成 `nonisolated` 了。`purgeLocalDataOnDisk()` 会回查剩余项并在侧栏按钮下方报出来；回查必须放在 `purgeTransientFiles()` **之前**（后者会把 `thumbs` 目录重新建出来）。
-  启动那一次清理**不能删**：它是崩溃/`kill -9` 的唯一兜底。代价是"正常退出后启动会重搬 296 MB"——这是零痕迹的必然，想省掉就把「自动清空本机数据」的勾去掉（那就不清，也不留痕这一条就不成立）。**手动清空之后进入暂停态**（`dataPaused`）：不重扫、不重生成缩略图、不能预览，照片页显示「本机数据已清空」，直到点「重新读取」。
+- **不留痕（2026-11 重做：一张清单管到底，零痕迹）**：要删的东西**只在 `TraceRegistry` 里定义一份**（数据目录固定文件 + `thumbs/` + `$TMPDIR` 两个临时目录 + 系统 savedState + 系统 `.ips` + `/tmp` 调试日志），三个时机都读它，见 `PurgeGuard`：
+  | 退出方式 | 谁清 | 清到什么程度 |
+  |---|---|---|
+  | ⌘Q / 菜单退出 / 点窗口红点 | `applicationWillTerminate` → `AppStore.purgeOnTerminate()` | 全清（**无条件**，没有开关） |
+  | `kill <pid>` / Ctrl+C / 关机信号 | SIGTERM/SIGINT/SIGHUP/SIGQUIT handler | 全清 |
+  | 崩溃（SIGSEGV/BUS/ABRT/ILL） | handler 只 `unlink`：固定名 + **`registerTrace` 登记过的每个文件** | 现场能删的全删；系统 `.ips` 与空目录留到下次启动 |
+  | `kill -9` / 断电 | `bootstrap()` 第一步的 `purgeLocalDataOnDisk()` | 全清 |
+  **崩溃那一刻拿不到目录列表**（`readdir` 不是异步信号安全的），所以每写一个文件就 `TraceRegistry.registerTrace(url)`（固定容量 8192 个 C 字符串，存指针再 `+= count`），handler 只做 `remove()`。信号上下文里**不能调 Foundation**，固定名路径在 `install()` 时用 `prepareSignalSafePaths()` 预先 `strdup` 好。
+  `CMI_TRACE_DIR` 可以把整棵数据目录挪到临时位置（测试崩溃清场用，不动真数据）。自检：`CleanMyiPhone --trace-selftest`。
+  **实测**（2026-11-01，真机）：启动/退出后 `ls -A ~/Library/Application Support/cleanmyiphone` 空、`$TMPDIR` 无残留、`.ips` 29→0、`/tmp` 调试日志无；只留 `~/Library/Preferences/local.cleanmyiphone.plist`（862 B，窗口位置）。SIGSEGV 实测：崩溃前目录里有四件套，崩后目录空。
+  **手动清空（`purgeLocalData`）现在连内存一起清**：库索引、相册列表、assets、缩略图、回收站全丢，界面真的空着；点「重新读取」才重新读设备。侧栏不再有「自动清空」勾选框（开关本身就是痕迹，且关掉它等于允许留 296 MB 复印件），改成一行文案「退出即清空 · 本机不留缓存」。
 - 区域（2026-11 修）：`RegionInfo` 在不同读数上会**时有时无、且可能是字符串 `CH/A` 而不是字典**，两种形态都要认；`MQ0W3` 这种无尾码的型号只能靠 RegionInfo。
 - 锁屏→解锁（2026-11）：锁屏时开 `unlockWatch`，每 2 秒问一次，解锁即自动重读；不再停在「设备已锁屏」。
-- 侧栏底部（2026-11）：读取结束后才出现上面那三件套（勾选 + 两个原生 `.bordered`/`.small` 按钮），读取过程中整块不显示；按钮下方一行小字报结果。
-- 相册库快照：`~/Library/Application Support/cleanmyiphone/`（`Photos.sqlite` + `-wal` + `-shm` + `thumbnailConfiguration`，约 296 MB），6 小时内可复用（`loadCachedIndex`）。
+- **一个相簿里的「张数」必须三处一致**（2026-11 修）：二级栏、网格项数、底栏是三个来源，以前会差几十条。现在：① 相簿视图**按成员名去重**（成员集合本身就是 `Set<String>`，见 `computeVisible` 的 `albumCovered`），一张照片只算一项；② 体积统一走 `totalBytes(of:)`（`meta.resourceBytes`，含编辑版与 Live Photo 视频分量），拿不到才退 PTP 大小。实测「微信」：库里成员 615 条 → 归一化去重 613；PTP 枚举 666（原件/编辑版/同名各来一条）→ 去重后 613；体积 877.9 MB ↔ 底栏 878 MB。
+- **读取中只有一张遮罩**（2026-11 修）：以前「根视图」和「照片页」各有一套（一套是转圈 + 一行字，一套是标题 + 字节 + 进度条），同一个动作两处长得不同。现在统一 `LibraryIndexGate`，三行固定：`正在读取相册索引` / `正在读取 <文件名>` / `已读 x / y`，**总量还没到就显示「已读 x MB」+ 进度条不确定态**（原来 `libraryBytesTotal > 0` 之前只有一个空转的圈）。
+- **顶栏不许溢出**（2026-11）：搜索 / 排序 / 升/降序 / 日/月/年 / 视图 / 刷新 整块放进 `.horizontal` 的 `ScrollView`，`.frame(minWidth: 260, maxWidth: .infinity, alignment: .trailing)` + `.clipped()`：窗口窄了就在自己这块里横向滚，绝不压到左边栏上。顶栏**不放标题**（相簿名/类型名都不放，窗口一窄会被挤成竖排两个字）。
+- 三栏宽度（2026-11）：左栏 236、相簿二级栏 190、右栏 180 全部 **min = ideal = max**（定宽，不许被挤扁或裁字），中间内容区 `minWidth: 260`（只保证两列），窗口最小 900 —— 236+190+180+260+4 = 870 < 900，所以任何窗口尺寸下三栏都完整、图片不被裁（列数 2/3/4/5 自适应，单格最小 118pt）。改宽度时这四个数要一起算。
+- 侧栏底部（2026-11 改）：读取结束后才出现「退出即清空 · 本机不留缓存」+ 两个原生按钮（清空本机数据 / 重新读取），读取过程中整块不显示；按钮下方一行小字报结果或残留项。**没有「自动清空」勾选框了**（见上）。
+- **不做快照（2026-11 定）**：那个 6 小时复用的 `loadCachedIndex` 已删除。四件套（`Photos.sqlite` + `-wal` + `-shm` + `thumbnailConfiguration`，约 296 MB）只当**中转**：`LibraryService.fetchOnMain` 读完索引立刻 `purgeSnapshotFiles()` 删掉，失败路径也删。代价是每次启动重读一遍（8–10 秒，后台读、界面照常用）。原来那个 6 小时缓存**其实从来没命中过**——启动第一步就把文件删了。
 - **"快照过期"的判据**：设备上最新资产的时间比快照里最新那条**新 2 分钟以上** → 本次运行后台重抓一次（`didAutoRefreshLibrary` 保证每次运行只一次）。这就是"我刚拍两张照片能不能识别出来"的答案：**能**，一拍到 PTP 就枚举出来了，重抓只是把索引补齐（照片时间戳一定比快照里最新那条新）。原来的灾难不是判据错，而是**残缺快照**让它永远为真 —— 那个根因已经由下面那条完整性对账堵住了。
 - **没库就别出数**：`mediaPhotoBytes` / `mediaVideoBytes` 在 `libraryIndex` 为空时会退化成「PTP 枚举到的部分资产求和」，而 `appsBytes = 已用 − 媒体 − 系统 − 回收站` —— 视频一小，应用与数据就虚高一大截，用户看到的就是「数据都不对」。现在界面统一看 `mediaBytesReady`（= 库索引非空）：概览三张卡片、占比条、右侧栏「照片/视频」在没就绪时显示「读取中…」/「—」，只保留设备自己报的容量/可用/系统。
-- 缩略图缓存：同目录 `thumbs/`（480px JPEG）。里面含文件名、拍摄时间、GPS、相簿名、隐藏/删除标记，以及照片缩小副本 —— 属于真实隐私数据，所以「自动清空」勾着时退出即删。
-- 一次性落盘（原图/原视频）：`$TMPDIR/cleanmyiphone-raw/`、`$TMPDIR/cleanmyiphone-preview/`、`$TMPDIR/cleanmyiphone-raw/preview/`。缩略图生成时把整份原图写进来、解完立刻删；预览的视频以前会留在本机（实测堆到 1.2 GB）。**现在启动、关预览、退出 App 三处都会清**（`DeviceFiles.purgeTransientFiles`）。
+- 缩略图缓存：同目录 `thumbs/`（480px JPEG）。里面含文件名、拍摄时间、GPS、相簿名、隐藏/删除标记，以及照片缩小副本 —— 属于真实隐私数据。现在**每写一张就 `registerTrace` 登记**，退出/崩溃/下次启动三处都删。
+- 一次性落盘（原图/原视频）：`$TMPDIR/cleanmyiphone-raw/`、`$TMPDIR/cleanmyiphone-preview/`、`$TMPDIR/cleanmyiphone-raw/preview/`。缩略图生成时把整份原图写进来、解完立刻删；预览视频按「最近 3 个」缓存，关预览时清。`cleanmyiphone-preview` 以前是 **0755 目录 + 0644 文件**（同机其他账户能读走整份原视频，实测盘上躺着 660 MB），现在走 `makePrivateDirectory`（0700）。退出/启动仍由 `TraceRegistry.purgeAll()` 整个删掉。
 - 目录权限统一 0700（`makePrivateDirectory`）。默认 0755 会被同机其他账户读到。
-- 调试日志：`/tmp/cmi-app.log`、`/tmp/cmi-library.log`、`/tmp/cmi-crash.txt`（都要 `CMI_DEBUG=1` / `CMI_TRACE_CRASH=1`）。
-- 电池诊断：`~/Library/Application Support/cleanmyiphone/battery-dump.txt`（另有 `device-dump.txt` 记 ModelNumber/RegionInfo 实际值）（每次读设备信息都写，记录 diagnostics_relay 每次 IORegistry 请求回了哪些键、有没有命中电池节点；不含照片数据，退出清空时不动它）。
+- 调试日志：`/tmp/cmi-app.log`、`/tmp/cmi-library.log`、`/tmp/cmi-helper-err.log`、`/tmp/cmi-crash.txt`（都要 `CMI_DEBUG=1` / `CMI_TRACE_CRASH=1`）。这四个也在 `TraceRegistry.absoluteFileNames` 里，退出即删。
+- 电池诊断：`<数据目录>/battery-dump.txt`（另有 `device-dump.txt` 记 ModelNumber/RegionInfo 实际值）（每次读设备信息都写；不含照片数据，但**按零痕迹一并删**，要排查用 `CMI_DEBUG=1` 重新生成）。
 
 ## 经验索引
 
@@ -102,8 +110,8 @@ macOS 上的 iPhone 空间清理工具（SwiftUI，零外部依赖）。个人�
 - 不用读：只调数据层时。
 
 **构建与调试.md**
-- 什么时候读：编译失败、要打包、要跑真机探针、要清空本地数据。
-- 包含什么：外置卷 + 沙箱下必须带的构建参数、`make-app.sh`、探针开关与环境变量、`--fetch-library` 子进程、崩溃报告与截图调试习惯；**清空本地数据**（App 内入口 + 命令行 + 沙箱里 rm 会被拒的两种绕法 + 「回查必须在 purgeTransientFiles 之前」这个坑）。
+- 什么时候读：编译失败、要打包、要跑真机探针、要清空本地数据、要验零痕迹。
+- 包含什么：外置卷 + 沙箱下必须带的构建参数、`make-app.sh`、探针开关与环境变量、`--fetch-library` 子进程、崩溃报告与截图调试习惯；**清空本地数据**（App 内入口 + 命令行 + 沙箱里 rm 会被拒的两种绕法）；**零痕迹验收**（退出后四条命令必须为空、`--trace-selftest` 验崩溃清场、`CMI_TRACE_DIR` 隔离测试）。
 - 不用读：日常改业务代码时。
 
 ## 文档同步（改完功能顺手做）

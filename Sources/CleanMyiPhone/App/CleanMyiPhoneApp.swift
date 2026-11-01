@@ -33,7 +33,7 @@ struct CleanMyiPhoneApp: App {
         .windowStyle(.hiddenTitleBar)
         .commands {
             CommandGroup(after: .sidebar) {
-                Button("刷新设备") { Task { await store.startScan() } }
+                Button("刷新设备") { Task { await store.refreshDevice() } }
                     .keyboardShortcut("r")
                 Divider()
                 Button("连接真机") { store.connectRealDevice() }
@@ -108,18 +108,23 @@ struct RootView: View {
         HStack(spacing: 0) {
             if showSidebar && store.previewID == nil {
                 MainSidebarView()
-                    .frame(width: 236)
+                    // 左栏定宽 + 最小宽度：窗口再窄也不许把它挤扁或裁掉文字
+                    .frame(minWidth: 236, idealWidth: 236, maxWidth: 236)
+                    .layoutPriority(2)
                     .transition(.move(edge: .leading))
                 Divider()
             }
 
             page
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .frame(minWidth: 460, maxWidth: .infinity, maxHeight: .infinity)
+                .layoutPriority(1)
 
             if showInspector && store.previewID == nil {
                 Divider()
                 DeviceInspector()
-                    .frame(width: 180)
+                    // 右栏同样定宽 + 最小宽度
+                    .frame(minWidth: 180, idealWidth: 180, maxWidth: 180)
+                    .layoutPriority(2)
                     .transition(.move(edge: .trailing))
             }
         }
@@ -151,21 +156,12 @@ struct RootView: View {
             ConfirmSheet().environment(store)
         }
         .overlay {
-            // 只在「一张都还没有」时盖全屏；目录一到就撤，
-            // 剩下的相册库（296 MB）在后台继续读，侧栏照常用「加载中」表示还没好。
-            if store.isScanning && store.assets.isEmpty {
-                ZStack {
-                    Rectangle()
-                        .fill(.thickMaterial)
-                        .ignoresSafeArea()
-                    VStack(spacing: 10) {
-                        ProgressView().controlSize(.large)
-                        Text(store.progressText)
-                            .font(.callout.monospacedDigit())
-                            .foregroundStyle(.secondary)
-                    }
-                }
-                .transition(.opacity)
+            // 全流程只用**一个**读取中遮罩（`LibraryIndexGate`）：
+            // 以前这里是另一套「转圈 + 一行字」，和照片页那套字体/进度条都不一样，
+            // 同一个动作在两处长得不同 —— 现在统一成同一个组件。
+            if !store.needsLibraryGate, store.isScanning, store.assets.isEmpty {
+                LibraryIndexGate()
+                    .transition(.opacity)
             }
         }
         .overlay {
@@ -193,6 +189,8 @@ struct RootView: View {
         switch store.section {
         case .overview: OverviewView()
         case .photos: PhotosView()
+        // 相簿这一节也用照片页：左边挂二级栏（相簿列表），右边是那个相簿里的图
+        case .albums: PhotosView()
         case .trash: TrashView()
         }
     }

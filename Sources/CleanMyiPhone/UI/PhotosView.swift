@@ -1,27 +1,22 @@
 import AppKit
 import SwiftUI
 
-/// 照片页：左边一列相簿（相簿再多也只在自己这条列表里滚），右边缩略图 / 列表。
+/// 照片页：一页只显示一个范围（全部照片 / 某个类型 / 某个相簿）的缩略图或列表。
+/// 相簿不再挂在这一页的左边 —— 它自己是一页（`AlbumsView`），这里只放「返回相簿」。
 struct PhotosView: View {
     @Environment(AppStore.self) private var store
-    @State private var showAlbums = true
 
     var body: some View {
         @Bindable var store = store
 
         VStack(spacing: 0) {
-            DetailHeader(title: store.currentScopeTitle, subtitle: nil, showTitle: false) {
+            // 标题不放在这里：搜索框左边只留搜索框。
+            // 之前放相簿名（如「微信」），窗口一窄就被挤成竖排两个字。
+            DetailHeader(title: "", subtitle: nil, showTitle: false) {
+                // 顶栏（搜索 + 排序 + 升降序 + 分组 + 视图 + 刷新）整块不换行、不压缩：
+                // 宽度不够就**在自己这块里横向滚动**，绝不溢出到左边栏那边去。
+                ScrollView(.horizontal, showsIndicators: false) {
                 HStack(spacing: 10) {
-                    if !store.libraryAlbums.isEmpty {
-                        Button {
-                            withAnimation(.easeInOut(duration: 0.15)) { showAlbums.toggle() }
-                        } label: {
-                            Image(systemName: showAlbums ? "sidebar.left" : "sidebar.leading")
-                        }
-                        .buttonStyle(.borderless)
-                        .help(showAlbums ? "隐藏相簿栏" : "显示相簿栏")
-                    }
-
                     SearchField(prompt: "搜索照片", text: $store.searchText, width: 112)
 
                     // 主打功能：排序与视图都放大、放显眼
@@ -74,7 +69,7 @@ struct PhotosView: View {
                     .help("缩略图视图 / 列表视图")
 
                     Button {
-                        Task { await store.startScan() }
+                        Task { await store.refreshDevice() }
                     } label: {
                         Image(systemName: "arrow.clockwise")
                     }
@@ -82,18 +77,27 @@ struct PhotosView: View {
                     .help("重新读取设备")
                     .disabled(store.isScanning)
                 }
+                .fixedSize(horizontal: true, vertical: false)
+                .padding(.trailing, 2)
+                }
+                // 最小宽度：比这个窄就滚动，不挤压、不出框
+                .frame(minWidth: 260, maxWidth: .infinity, alignment: .trailing)
+                .clipped()
             }
 
             Divider()
                 .padding(.top, 4)
 
             HStack(spacing: 0) {
-                if showAlbums, !store.libraryAlbums.isEmpty {
+                if store.section == .albums {
                     AlbumRail()
-                        .frame(width: 190)
+                        .frame(minWidth: 190, idealWidth: 190, maxWidth: 190)
                     Divider()
                 }
                 content
+                    // 最小宽度只保证「两列」：再窄宁可窗口不放行，也不裁图
+                    .frame(minWidth: 260, maxWidth: .infinity, maxHeight: .infinity)
+                    .layoutPriority(1)
             }
 
             Divider()
@@ -184,7 +188,7 @@ struct PhotosView: View {
                                 : "这个相簿或筛选条件下没有项，换一个看看。",
                            actionTitle: store.assets.isEmpty ? "重新读取" : "查看全部") {
                 if store.assets.isEmpty {
-                    Task { await store.startScan() }
+                    Task { await store.refreshDevice() }
                 } else {
                     store.select(.photos(.all))
                     store.clearFilters()
@@ -241,70 +245,58 @@ struct PhotosView: View {
     }
 }
 
-/// 相簿栏：搬出侧栏之后，相簿再多也只在这里滚
+/// 相簿二级栏：相簿列表（不是卡片）。只在侧栏选中「相簿」时出现。
+/// 固定最小宽度 190，窗口再窄也不会被挤扁/裁掉，宁可让中间的图区变窄。
 struct AlbumRail: View {
     @Environment(AppStore.self) private var store
+
+    private var albums: [PhotoLibraryIndex.Album] {
+        store.libraryAlbums.sorted { lhs, rhs in
+            if lhs.count != rhs.count { return lhs.count > rhs.count }
+            return lhs.title.localizedStandardCompare(rhs.title) == .orderedAscending
+        }
+    }
 
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 1) {
-                row(title: "全部照片",
-                    count: store.assets.count,
-                    bytes: store.totalBytes,
-                    symbol: "photo.on.rectangle.angled",
-                    selected: store.albumFilter == nil && store.libraryFilter == .all) {
-                    store.select(.photos(.all))
-                }
-
-                Divider()
-                    .padding(.horizontal, 10)
-                    .padding(.vertical, 4)
-
-                Text("相簿")
+                Text("相簿 · \(albums.count)")
                     .font(.caption2.weight(.semibold))
                     .foregroundStyle(.secondary)
-                    .textCase(nil)
                     .padding(.horizontal, 14)
-                    .padding(.bottom, 3)
+                    .padding(.top, 8)
+                    .padding(.bottom, 4)
 
-                ForEach(store.libraryAlbums) { album in
-                    row(title: album.title,
-                        count: album.count,
-                        bytes: store.albumBytes(album.id),
-                        symbol: "rectangle.stack",
-                        selected: store.albumFilter == album.id) {
-                        store.select(.album(album.id))
-                    }
+                ForEach(albums) { album in
+                    row(album)
                 }
             }
-            .padding(.vertical, 6)
+            .padding(.vertical, 2)
             .frame(maxWidth: .infinity, alignment: .leading)
         }
         .background(.background.secondary.opacity(0.4))
     }
 
-    private func row(title: String,
-                     count: Int,
-                     bytes: Int64,
-                     symbol: String,
-                     selected: Bool,
-                     action: @escaping () -> Void) -> some View {
-        Button(action: action) {
+    private func row(_ album: PhotoLibraryIndex.Album) -> some View {
+        let selected = store.albumFilter == album.id
+        return Button {
+            store.select(.album(album.id))
+        } label: {
             HStack(spacing: 7) {
-                Image(systemName: symbol)
+                Image(systemName: "rectangle.stack")
                     .font(.system(size: 12))
-                    .foregroundStyle(selected ? Color.white : .secondary)
+                    .foregroundStyle(selected ? AnyShapeStyle(Color.white) : AnyShapeStyle(.secondary))
                     .frame(width: 16)
-                Text(title)
+                Text(album.title)
                     .font(.callout)
                     .lineLimit(1)
                     .truncationMode(.middle)
                 Spacer(minLength: 6)
                 VStack(alignment: .trailing, spacing: 0) {
-                    Text("\(count) 张")
+                    Text("\(album.count) 张")
                         .font(.caption2.monospacedDigit())
                         .foregroundStyle(selected ? AnyShapeStyle(Color.white.opacity(0.9)) : AnyShapeStyle(.secondary))
-                    Text(AppStore.sizeText(bytes))
+                    Text(AppStore.sizeText(store.albumBytes(album.id)))
                         .font(.system(size: 9).monospacedDigit())
                         .foregroundStyle(selected ? AnyShapeStyle(Color.white.opacity(0.7)) : AnyShapeStyle(.tertiary))
                 }
@@ -320,5 +312,6 @@ struct AlbumRail: View {
         }
         .buttonStyle(.plain)
         .padding(.horizontal, 6)
+        .help(album.title)
     }
 }

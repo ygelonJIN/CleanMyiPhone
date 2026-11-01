@@ -535,9 +535,7 @@ extension PTPBridge: ICCameraDeviceDelegate {
 
     /// 设备端缩略图这条路的诊断（写同一个 thumb-log.txt）
     static func debugThumbLog(_ line: String) {
-        let base = FileManager.default
-            .urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-            .appendingPathComponent("cleanmyiphone", isDirectory: true)
+        let base = TraceRegistry.dataDirectory
         DeviceFiles.makePrivateDirectory(base)
         let url = base.appendingPathComponent("thumb-log.txt")
         let text = "ic-thumb " + line + "\n"

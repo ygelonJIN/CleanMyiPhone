@@ -151,7 +151,7 @@ struct OverviewView: View {
         VStack(alignment: .leading, spacing: 8) {
             Text("照片类型")
                 .font(.subheadline.weight(.semibold))
-            Text("三类互不重叠：相机拍摄、截屏（subtype 10）、视频。已隐藏与最近删除已经算在下面的照片与视频里（隐藏 \(store.hiddenStats.count) 项 · \(AppStore.sizeText(store.hiddenStats.bytes))）。")
+            Text("三类互不重叠：照片（不含截屏）、截屏（subtype 10）、视频。已隐藏与最近删除已经算在下面的照片与视频里（隐藏 \(store.hiddenStats.count) 项 · \(AppStore.sizeText(store.hiddenStats.bytes))）。")
                 .font(.caption2)
                 .foregroundStyle(.tertiary)
                 .fixedSize(horizontal: false, vertical: true)

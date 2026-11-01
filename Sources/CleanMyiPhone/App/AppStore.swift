@@ -9,7 +9,7 @@ final class AppStore {
     // MARK: - 导航
 
     enum Section: String, Identifiable {
-        case overview, photos, trash
+        case overview, photos, albums, trash
         var id: String { rawValue }
     }
 
@@ -17,6 +17,7 @@ final class AppStore {
     /// 不会再出现「侧栏选中 A、内容显示 B」的错位。
     enum SidebarItem: Hashable {
         case overview
+        case albums
         case photos(LibraryFilter)
         case album(Int)
         case trash
@@ -27,7 +28,9 @@ final class AppStore {
     var section: Section {
         switch sidebarItem {
         case .overview: return .overview
-        case .photos, .album: return .photos
+        // 「相簿」和「某个相簿里」都算相簿这一节：二级栏（相簿列表）只在那一节出现
+        case .albums, .album: return .albums
+        case .photos: return .photos
         case .trash: return .trash
         }
     }
@@ -46,6 +49,7 @@ final class AppStore {
     func select(_ item: SidebarItem) {
         guard item != sidebarItem else { return }
         sidebarItem = item
+        if case .albums = item { ensureAlbumSelection() }
         clearSelection()
         closePreview()
     }
@@ -130,7 +134,8 @@ final class AppStore {
     /// 这一阶段空格预览也是直接 return 的 —— 没有库就拿不到设备上的真实路径，
     /// 让人能点、点了又没反应，比直接挡住更难受。
     var needsLibraryGate: Bool {
-        guard section == .photos else { return false }
+        // 相簿墙也全靠库：没有库，相簿一个都列不出来
+        guard section == .photos || section == .albums else { return false }
         guard libraryIndex == nil, !usingFixture else { return false }
         // 暂停态要能点到左下角「重新读取」；未连接 / 锁屏另有提示，不盖
         return !dataPaused && !needsConnection && !isDeviceLocked
@@ -275,14 +280,14 @@ final class AppStore {
         // 正常退出时上一轮已经在 `applicationWillTerminate` 里清干净了，这里什么都不用删，
         // 所以这一步不会白删东西 —— 它是"再怎么退出也不留痕"的最后一道兜底
         // （SIGKILL 那种进程没有执行机会的情况，靠的就是下一次启动的这一行）。
-        if autoPurge {
-            let leftovers = Self.purgeLocalDataOnDisk()
-            if !leftovers.isEmpty {
-                Self.debugLog("[purge] 启动清理上次非正常退出的残留：\(leftovers.joined(separator: "、"))")
-            }
-            purgeLeftovers = leftovers
+        // **无条件**清一次，不看任何开关：
+        // 上一次是崩溃 / kill -9 / 断电的话，进程没机会自己收尾，只能靠这一行。
+        // 正常退出时上一轮已经清干净了，这里什么都不会删。
+        let leftovers = Self.purgeLocalDataOnDisk()
+        if !leftovers.isEmpty {
+            Self.debugLog("[purge] 启动清理上次非正常退出的残留：\(leftovers.joined(separator: "、"))")
         }
-        DeviceFiles.purgeTransientFiles()
+        purgeLeftovers = leftovers
 
         // 模拟设备只留给开发：CMI_FIXTURE=1 才用
         guard ProcessInfo.processInfo.environment["CMI_FIXTURE"] == nil, ptpAllowed else {
@@ -328,10 +333,13 @@ final class AppStore {
 
     /// 调试用：CMI_START_SECTION=apps|files|photos|trash 直接落到某一页，方便截图核对
     private func applyDebugStartSection() {
+        // 命令行也认：`open build/cleanmyiphone.app --args --albums`（零痕迹测试/截图用）
+        if CommandLine.arguments.contains("--albums") { sidebarItem = .albums; return }
         guard let raw = ProcessInfo.processInfo.environment["CMI_START_SECTION"]?.lowercased() else { return }
         switch raw {
         case "trash": sidebarItem = .trash
         case "photos": sidebarItem = .photos(.all)
+        case "albums": sidebarItem = .albums
         default: sidebarItem = .overview
         }
     }
@@ -441,7 +449,21 @@ final class AppStore {
         stats = fake
     }
 
+    /// 用户主动「刷新」：暂停态下先解除暂停，再读。
+    /// 菜单 ⌘R、照片页工具栏、锁屏解锁后的自动重读都走这一个入口，
+    /// 谁都不许绕过 `dataPaused` 自己重新读库。
+    func refreshDevice() async {
+        if dataPaused {
+            resumeReading()
+            return
+        }
+        await startScan()
+    }
+
     func startScan() async {
+        // 手动清空过 = 暂停态：不重扫、不重读、不重建缩略图。
+        // 想恢复只能点「重新读取」（或走 `refreshDevice`，它先解除暂停）。
+        guard !dataPaused else { return }
         if usingFixture {
             assets = (try? await (source as? FixtureDevice)?.load()) ?? []
             invalidateCounts()
@@ -577,24 +599,6 @@ final class AppStore {
         guard !usingFixture, !libraryDone, !libraryStarted else { return }
         libraryStarted = true
         recomputeProgress()
-
-        // 本地已有新鲜快照就直接用，别再搬一次 296MB
-        if !forceLibraryRefresh, let cached = LibraryService.loadCachedIndex() {
-            libraryIndex = cached
-            metaCacheStore.removeAll()
-            Self.debugLog("[library] 用本地快照，库索引就绪（门禁撤）")
-            libraryAlbums = cached.albumsSorted()
-            invalidateCounts()
-            libraryDone = true
-            libraryFraction = 1
-            libraryStatus = nil
-            if let snapshot = try? await LibraryService.fetchDeviceStats() {
-                applyStats(snapshot)
-            }
-            recomputeProgress()
-            maybeFinishScan()
-            return
-        }
         forceLibraryRefresh = false
 
         // 看门狗：相册库万一卡住，超时也要收尾，界面不能永远停在「正在读取」
@@ -628,6 +632,7 @@ final class AppStore {
             metaCacheStore.removeAll()
             Self.debugLog("[library] 从设备读完整库，库索引就绪（门禁撤）")
             libraryAlbums = snapshot.index.albumsSorted()
+            ensureAlbumSelection()
             invalidateCounts()
             applyStats(snapshot.stats)
             libraryDone = true
@@ -639,6 +644,8 @@ final class AppStore {
             await refreshScreen()
         } catch {
             Self.debugLog("[library] 读取失败：\(error.localizedDescription)")
+            // 失败也不留半份落盘：四件套只作中转，绝不留在硬盘上
+            LibraryService.purgeSnapshotFiles()
             libraryDone = true
             libraryFraction = 1
             rebuildMetrics()
@@ -673,13 +680,16 @@ final class AppStore {
             while !Task.isCancelled {
                 try? await Task.sleep(nanoseconds: 2_000_000_000)
                 guard let self else { return }
+                // 手动清空之后是暂停态：解锁**不该**偷偷把 296 MB 又读回来
+                guard !self.dataPaused else { return }
                 let unlocked = await Task.detached { !LibraryService.isDeviceLocked() }.value
                 guard unlocked else { continue }
                 await MainActor.run {
                     self.isDeviceLocked = false
                     self.unlockWatch = nil
                 }
-                await self.startScan()
+                guard !self.dataPaused else { return }
+                await self.refreshDevice()
                 return
             }
         }
@@ -889,7 +899,11 @@ final class AppStore {
         var hidden = FilterMetric(count: 0, bytes: 0)
         var trashed = FilterMetric(count: 0, bytes: 0)
         var shots = FilterMetric(count: 0, bytes: 0)
-        for meta in index.metaByFile.values {
+        var camera = FilterMetric(count: 0, bytes: 0)
+        var live = FilterMetric(count: 0, bytes: 0)
+        var raw = FilterMetric(count: 0, bytes: 0)
+        let rows = index.allMeta.isEmpty ? Array(index.metaByFile.values) : index.allMeta
+        for meta in rows {
             let bytes = meta.resourceBytes
             if meta.isVideo { videos.count += 1; videos.bytes += bytes }
             else { photos.count += 1; photos.bytes += bytes }
@@ -897,15 +911,26 @@ final class AppStore {
             if meta.isHidden { hidden.count += 1; hidden.bytes += bytes }
             if meta.isTrashed { trashed.count += 1; trashed.bytes += bytes }
             if meta.subtype == 10 { shots.count += 1; shots.bytes += bytes }
+            if meta.isCameraCaptured { camera.count += 1; camera.bytes += bytes }
+            if meta.isLive { live.count += 1; live.bytes += bytes }
+            if meta.isRaw { raw.count += 1; raw.bytes += bytes }
         }
         let all = FilterMetric(count: photos.count + videos.count, bytes: photos.bytes + videos.bytes)
-        filterMetrics = [.all: all, .photos: photos, .videos: videos,
-                         .favorites: favorites, .screenshots: shots,
-                         .hidden: hidden, .trashed: trashed]
+        filterMetrics = [.all: all, .camera: camera, .photos: photos, .videos: videos,
+                         .favorites: favorites, .screenshots: shots, .live: live,
+                         .raw: raw, .hidden: hidden, .trashed: trashed]
         metricsReady = true
         metricsLibraryUnavailable = false
     }
 
+
+    /// 相簿页：进来先落在一个相簿上，右边不至于空着。
+    /// 库还没读到时先不动，等 `loadLibrary` 末尾再调一次。
+    func ensureAlbumSelection() {
+        guard section == .albums, albumFilter == nil,
+              let first = libraryAlbums.max(by: { $0.count < $1.count }) else { return }
+        sidebarItem = .album(first.id)
+    }
 
     /// 相册库里的张数（含已隐藏 / 最近删除），PTP 没枚举出来时用它兜底
     var libraryPhotoCount: Int {
@@ -975,7 +1000,7 @@ final class AppStore {
         let videos = mediaVideoBytes
         let total = max(photoOnly + shotBytes + videos, 1)
         return [
-            .init(title: "相机拍摄",
+            .init(title: "照片（不含截屏）",
                   count: max(0, libraryPhotoCount - shots.count),
                   bytes: photoOnly, percent: Double(photoOnly) / Double(total) * 100,
                   color: Theme.photo),
@@ -1027,10 +1052,16 @@ final class AppStore {
         let files = index.files(inAlbum: albumID)
         var total: Int64 = 0
         if !files.isEmpty {
-            for asset in assets {
-                let name = metaCache(asset).map { PhotoLibraryIndex.normalize($0.fileName) }
-                    ?? PhotoLibraryIndex.normalize(asset.fileName)
-                if files.contains(name) { total += asset.byteSize }
+            // 按库里的成员求和：只数 PTP 枚举到的那部分会少一大截
+            // （实测「微信」613 张，PTP 只覆盖 375 张 → 387 MB vs 真实 887 MB）
+            for name in files {
+                if let m = index.meta(for: name) { total += m.resourceBytes }
+            }
+            // 库里没有 meta 的（极少）再用 PTP 大小补
+            if total == 0 {
+                for asset in assets where files.contains(PhotoLibraryIndex.normalize(asset.fileName)) {
+                    total += asset.byteSize
+                }
             }
         }
         albumByteCache[albumID] = total
@@ -1147,6 +1178,9 @@ final class AppStore {
         case .hidden: return meta(asset)?.isHidden == true
         case .trashed: return meta(asset)?.isTrashed == true
         case .screenshots: return tagSet(asset).contains(.screenshot)
+        case .camera: return meta(asset)?.isCameraCaptured == true
+        case .live: return meta(asset)?.isLive == true
+        case .raw: return meta(asset)?.isRaw == true
         }
     }
 
@@ -1154,6 +1188,7 @@ final class AppStore {
         if let albumFilter, let album = libraryAlbums.first(where: { $0.id == albumFilter }) {
             return album.title
         }
+        if case .albums = sidebarItem { return "相簿" }
         return libraryFilter.title
     }
 
@@ -1191,14 +1226,23 @@ final class AppStore {
         if libraryFilter != .all {
             result = result.filter { matches($0, filter: libraryFilter) }
         }
+        // 相簿：成员集合本身是 `Set<String>`（归一化文件名），所以这里**按命中名去重**。
+        // 同一张照片可能从几条路进来（PTP 原件 / 编辑版 `IMG_E…` / 影子资产），
+        // 按名字去重才能保证「网格项数 = 二级栏张数」。
+        var albumCovered: Set<String> = []
         if let albumFilter, let index = libraryIndex {
             let files = index.files(inAlbum: albumFilter)
-            result = result.filter { asset in
-                if let meta = meta(asset) {
-                    return files.contains(PhotoLibraryIndex.normalize(meta.fileName))
-                }
-                return files.contains(PhotoLibraryIndex.normalize(asset.fileName))
+            var kept: [Asset] = []
+            for asset in result {
+                let byMeta = PhotoLibraryIndex.normalize(meta(asset)?.fileName ?? asset.fileName)
+                let byRaw = PhotoLibraryIndex.normalize(asset.fileName)
+                let key: String
+                if files.contains(byMeta) { key = byMeta }
+                else if files.contains(byRaw) { key = byRaw }
+                else { continue }
+                if albumCovered.insert(key).inserted { kept.append(asset) }
             }
+            result = kept
         }
         if let kindFilter {
             result = result.filter { $0.kind == kindFilter }
@@ -1210,6 +1254,7 @@ final class AppStore {
         if let index = libraryIndex, !index.isEmpty {
             let needsShadow = libraryFilter == .hidden || libraryFilter == .trashed
                 || libraryFilter == .favorites || libraryFilter == .screenshots
+                || libraryFilter == .camera || libraryFilter == .live || libraryFilter == .raw
                 || albumFilter != nil || cloudOnlyFilter
             if needsShadow {
                 let known = Set(result.map { PhotoLibraryIndex.normalize($0.fileName) })
@@ -1225,19 +1270,43 @@ final class AppStore {
                 let albumFiles = albumFilter.map { index.files(inAlbum: $0) }
                 for shadow in index.shadowAssets {
                     let key = PhotoLibraryIndex.normalize(shadow.fileName)
-                    if claimed.contains(key) { continue }
+                    // 相簿视图：上面已经按成员名精确覆盖过，别再补一遍
+                    if albumFilter != nil ? albumCovered.contains(key) : claimed.contains(key) { continue }
                     guard let meta = index.meta(for: shadow.fileName) else { continue }
                     switch libraryFilter {
                     case .hidden where !meta.isHidden: continue
                     case .trashed where !meta.isTrashed: continue
                     case .favorites where !meta.isFavorite: continue
                     case .screenshots where meta.subtype != 10: continue
+                    case .camera where !meta.isCameraCaptured: continue
+                    case .live where !meta.isLive: continue
+                    case .raw where !meta.isRaw: continue
                     default: break
                     }
                     if let albumFiles, !albumFiles.contains(key) { continue }
                     result.append(shadow)
                 }
             }
+        }
+
+        // 去重：**同一张照片只算一项**。
+        // 目录枚举（PTP）里同一张照片可能来两条：一条是原件 `IMG_1234.HEIC`、
+        // 一条是编辑版 `IMG_E1234.HEIC`，两条都归到库里同一条资产；也可能同一个
+        // 路径被列了两遍。不去重的话网格里是两个一模一样的格子，底栏也会多算。
+        // 键用「库里的目录 + 库里的文件名（`IMG_E1234` 归一化回 `IMG_1234`）」：
+        //  · 编辑版和原件 → 同一个键，合成一项；
+        //  · 不同目录下的同名文件 → 目录不同，仍然是两张真图，不会误合。
+        let preDedupe = result.count
+        var seen = Set<String>()
+        if albumFilter == nil { result = result.filter { asset in
+            // 键只认「归一化文件名」：相簿成员本身就是按文件名集合算的
+            // （`files(inAlbum:)` 是 `Set<String>`），所以按名字去重才能和二级栏那个数对上。
+            // 拿 meta 文件名优先，是为了把编辑版 `IMG_E1234` 和原件 `IMG_1234` 合成一项。
+            let name = meta(asset)?.fileName ?? asset.fileName
+            return seen.insert(PhotoLibraryIndex.normalize(name)).inserted
+        } }
+        if let albumFilter, let index = libraryIndex {
+            Self.debugLog("[album] \(albumFilter) 命中去重前 \(preDedupe) → 最终 \(result.count)；覆盖成员 \(albumCovered.count) / \(index.files(inAlbum: albumFilter).count)")
         }
 
         if let tagFilter {
@@ -1259,9 +1328,16 @@ final class AppStore {
         return result
     }
 
-    var visibleBytes: Int64 { visibleAssets.reduce(0) { $0 + $1.byteSize } }
+    /// 体积统一口径：优先用库里的「资产全部资源合计」（`resourceBytes`，含编辑版与
+    /// Live Photo 视频分量），拿不到才退 PTP 报的大小。侧栏、底栏、相簿栏都用它，
+    /// 否则同一个相簿会出现「387.9 MB」和「887.1 MB」两个数。
+    func totalBytes(of asset: Asset) -> Int64 {
+        meta(asset)?.resourceBytes ?? asset.byteSize
+    }
+
+    var visibleBytes: Int64 { visibleAssets.reduce(0) { $0 + totalBytes(of: $1) } }
     var selectedAssets: [Asset] { visibleAssets.filter { selection.contains($0.id) } }
-    var selectedBytes: Int64 { selectedAssets.reduce(0) { $0 + $1.byteSize } }
+    var selectedBytes: Int64 { selectedAssets.reduce(0) { $0 + totalBytes(of: $1) } }
     var pendingDeletions: Set<Asset.ID> { trash.ids }
 
 
@@ -1501,8 +1577,10 @@ final class AppStore {
     }
 
     static let previewDirectory: URL = {
-        let url = FileManager.default.temporaryDirectory.appendingPathComponent("cleanmyiphone-preview", isDirectory: true)
-        try? FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("cleanmyiphone-preview", isDirectory: true)
+        // 权限 0700：这里放的是**整份原视频**，默认 0755 会被同机其他账户读走
+        DeviceFiles.makePrivateDirectory(url)
         return url
     }()
 
@@ -1754,9 +1832,7 @@ final class AppStore {
     func thumbTrace(_ text: String) {
         guard thumbLogWrites < 4000 else { return }
         thumbLogWrites += 1
-        let base = FileManager.default
-            .urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-            .appendingPathComponent("cleanmyiphone", isDirectory: true)
+        let base = TraceRegistry.dataDirectory
         DeviceFiles.makePrivateDirectory(base)
         let url = base.appendingPathComponent("thumb-log.txt")
         let line = Date().formatted(.dateTime.hour().minute().second()) + " " + text + "\n"
@@ -1894,54 +1970,31 @@ final class AppStore {
 
     // MARK: - 不留痕模式（退出即清空）
 
-    private static let autoPurgeKey = "cmi.autoPurge"
-
-    /// 自动清空（退出 / 启动时）。默认开。手动「清空本机数据」不受这个开关影响。
-    var autoPurge: Bool = (UserDefaults.standard.object(forKey: "cmi.autoPurge") as? Bool) ?? true
-
-    func setAutoPurge(_ on: Bool) {
-        autoPurge = on
-        UserDefaults.standard.set(on, forKey: Self.autoPurgeKey)
-    }
+    /// 老版本留过一个「自动清空」开关（UserDefaults 里的 `cmi.autoPurge`）。
+    /// 现在不留痕是**无条件**的，那个 key 就成了纯痕迹，启动时顺手删掉。
+    static let legacyAutoPurgeKey = "cmi.autoPurge"
 
     /// 手动清空之后**暂停一切重建**：不重扫、不重生成缩略图。
-    /// 想继续用就点「重新读取」（这是用户明确要求的：清空就该真的空着）。
+    /// 想继续用就点「重新读取」。
     private(set) var dataPaused = false
 
-    /// 删掉所有落盘的设备数据：缩略图、相册库四件套、一次性原图/原视频。
+    /// 删掉所有落盘的设备数据。清单只有一份，在 `TraceRegistry` 里。
     /// 返回**没删掉的**条目 —— 删不动要能看见，不能让界面假装"已清空"。
     @discardableResult
     nonisolated static func purgeLocalDataOnDisk() -> [String] {
-        let fm = FileManager.default
-        let root = fm.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-            .appendingPathComponent("cleanmyiphone", isDirectory: true)
-        // thumb-log.txt 里是照片文件名，属于痕迹，一并删掉；
-        // battery-dump / device-dump 只有机型和键名，留着方便排查。
-        let names = ["thumbs", "Photos.sqlite", "Photos.sqlite-wal",
-                     "Photos.sqlite-shm", "thumbnailConfiguration", "thumb-log.txt"]
-        for name in names {
-            try? fm.removeItem(at: root.appendingPathComponent(name))
-        }
-        // 先回查：purgeTransientFiles 会把缓存根目录（含 thumbs）重新建出来，
-        // 放在它后面查，就会永远报「thumbs 没删掉」。
-        let leftovers = names.filter { fm.fileExists(atPath: root.appendingPathComponent($0).path) }
-        DeviceFiles.purgeTransientFiles()
-        return leftovers
+        TraceRegistry.purgeAll()
     }
 
     /// 上次清空有没有漏：界面要如实显示
     private(set) var purgeLeftovers: [String] = []
 
-    /// 退出回调里拿不到 store 实例，用这个静态入口；勾了「自动清空」才清。
+    /// 退出回调里拿不到 store 实例，用这个静态入口。**无条件清**。
     nonisolated static func purgeOnTerminate() {
-        let on = (UserDefaults.standard.object(forKey: autoPurgeKey) as? Bool) ?? true
-        guard on else { return }
         purgeLocalDataOnDisk()
     }
 
-    /// 立即清空磁盘数据。
-    /// **只删磁盘，不动内存里已经解析好的库索引**：内存不是痕迹，
-    /// 清掉它反而让侧栏计数掉回「加载中」，看起来像清空了数据。
+    /// 立即清空。**磁盘 + 内存一起清**：清完界面是真的空着，不是"还记得但看不到"。
+    /// 想恢复只能点「重新读取」。
     func purgeLocalData() {
         // 先把还在跑的缩略图任务按停，否则删完目录它又被写回来，
         // 回查就会看到「thumbs 没删掉」。
@@ -1953,22 +2006,48 @@ final class AppStore {
         thumbOrder.removeAll()
 
         purgeLeftovers = Self.purgeLocalDataOnDisk()
+
+        // 内存里那份库索引也丢掉：硬盘上什么都没有了，留它在内存里
+        // 只会让侧栏继续显示张数、点进去却一张图都出不来。
+        libraryIndex = nil
+        libraryAlbums = []
+        libraryStatus = nil
+        libraryStarted = false
+        libraryDone = false
+        librarySkipped = false
+        libraryFailureCount = 0
+        libraryAutoRetryStopped = false
+        metaCacheStore.removeAll()
+        albumByteCache.removeAll()
+        flagCache.removeAll()
+        filterMetrics = [:]
+        metricsReady = false
+        assets = []
+        selection.removeAll()
+        thumbUnavailable.removeAll()
+        trash.removeAll()
+        invalidateCounts()
+
         // 清完就停在这：不重扫、不重生成缩略图，等用户点「重新读取」
         dataPaused = true
         previewError = nil
-        purgeMessage = purgeLeftovers.isEmpty ? "已清空，点「重新读取」可重新建立"
+        purgeMessage = purgeLeftovers.isEmpty ? "已清空（磁盘和内存），点「重新读取」重新读设备"
             : "有 \(purgeLeftovers.count) 项没删掉：\(purgeLeftovers.joined(separator: "、"))"
     }
 
-    /// 手动恢复：解除暂停并重新读取设备
+    /// 手动恢复：解除暂停并**真的重新读一遍**设备（现在没有快照可用了）
     func resumeReading() {
         guard dataPaused else { return }
         dataPaused = false
         purgeMessage = nil
+        libraryIndex = nil
+        libraryAlbums = []
+        libraryStarted = false
+        libraryDone = false
+        libraryStatus = nil
+        forceLibraryRefresh = true
         bumpThumbEpoch()
-        if libraryIndex == nil {
-            Task { await startScan() }
-        }
+        Task { await startScan() }
     }
 
     // MARK: - 缩略图缓存

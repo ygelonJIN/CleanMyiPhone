@@ -419,29 +419,56 @@ struct LibraryIndexGate: View {
         .allowsHitTesting(true)
     }
 
+    /// 读取中的那一屏。
+    /// **三行固定**：标题 / 正在读哪个文件 + 已读多少 / 进度条。
+    /// 以前只有「`libraryBytesTotal > 0` 才显示字节和进度条」，而总量要等子进程打出
+    /// `SIZE` 才有 —— 那之前用户只看到一个空转的圈，和「另一个遮罩」长得完全不一样。
+    /// 现在总量没到就显示进度**不确定态** + 「已读 x MB」，两种状态长得一致。
     private var progressState: some View {
         VStack(spacing: 12) {
             ProgressView().controlSize(.large)
+
             VStack(spacing: 3) {
                 Text("正在读取相册索引")
                     .font(.system(size: 14, weight: .medium))
-                if store.libraryBytesTotal > 0 {
-                    Text("\(AppStore.sizeText(store.libraryBytesDone)) / \(AppStore.sizeText(store.libraryBytesTotal))")
-                        .font(.system(size: 16, weight: .semibold, design: .rounded))
-                        .monospacedDigit()
-                        .foregroundStyle(.secondary)
-                }
+                Text(store.libraryFileStage.isEmpty
+                     ? "正在等手机回包"
+                     : "正在读取 \(store.libraryFileStage)")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .frame(width: 320)
+                Text(byteLine)
+                    .font(.system(size: 16, weight: .semibold, design: .rounded))
+                    .monospacedDigit()
+                    .foregroundStyle(.secondary)
+                    .frame(width: 320)
             }
+
             if store.libraryBytesTotal > 0 {
-                ProgressView(value: min(1, Double(store.libraryBytesDone) / Double(max(store.libraryBytesTotal, 1))))
+                ProgressView(value: min(1, Double(store.libraryBytesDone)
+                                          / Double(max(store.libraryBytesTotal, 1))))
+                    .progressViewStyle(.linear)
+                    .frame(width: 320)
+            } else {
+                // 总量还没到：走不确定态，位置和上面那条一样，不跳
+                ProgressView()
                     .progressViewStyle(.linear)
                     .frame(width: 320)
             }
-            Text("读完就能浏览与预览")
+
+            Text("读完就能浏览与预览（约 8 秒）")
                 .font(.caption2)
                 .foregroundStyle(.tertiary)
         }
         .padding(20)
+    }
+
+    private var byteLine: String {
+        let done = AppStore.sizeText(store.libraryBytesDone)
+        if store.libraryBytesTotal > 0 {
+            return "\(done) / \(AppStore.sizeText(store.libraryBytesTotal))"
+        }
+        return "已读 \(done)"
     }
 
     private func failedState(_ status: String) -> some View {

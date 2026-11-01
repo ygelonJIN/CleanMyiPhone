@@ -116,9 +116,7 @@ final class LibraryService {
         if let override = ProcessInfo.processInfo.environment["CMI_CACHE_DIR"] {
             base = URL(fileURLWithPath: override, isDirectory: true)
         } else {
-            base = FileManager.default
-                .urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-                .appendingPathComponent("cleanmyiphone", isDirectory: true)
+            base = TraceRegistry.dataDirectory
         }
         try? FileManager.default.createDirectory(at: base, withIntermediateDirectories: true)
         return base.appendingPathComponent("Photos.sqlite")
@@ -126,15 +124,21 @@ final class LibraryService {
 
     /// 主线程执行（MobileDevice 的通知只往主 RunLoop 投递），
     /// 下载按 256 KB 分片，每 16 片让出一次，界面不卡。
-    @MainActor
-    /// 用上次抓好的本地快照（默认 6 小时内有效），避免每次启动都重下 296MB
-    static func loadCachedIndex(maxAge: TimeInterval = 6 * 3600) -> PhotoLibraryIndex? {
+    ///
+    /// **不做快照**（2026-11 定）：四件套只作中转，读完进内存就立刻删掉。
+    /// 原来那个「6 小时内复用」的 `loadCachedIndex` 已经删了 —— 它和零痕迹直接冲突，
+    /// 而且勾着「自动清空」时启动第一步就把文件删了，等于从来没命中过。
+    ///
+    /// 把这一次的落盘删干净：主库 + WAL + SHM + 缩略图配置，外加子进程留下的暂存。
+    static func purgeSnapshotFiles() {
         let url = cacheURL
-        guard let attrs = try? FileManager.default.attributesOfItem(atPath: url.path),
-              let modified = attrs[.modificationDate] as? Date,
-              Date().timeIntervalSince(modified) < maxAge else { return nil }
-        guard let index = PhotoLibraryIndex.load(dbPath: url.path), !index.isEmpty else { return nil }
-        return index
+        let fm = FileManager.default
+        for suffix in ["", "-wal", "-shm"] {
+            try? fm.removeItem(atPath: url.path + suffix)
+            try? fm.removeItem(atPath: url.path + ".new" + suffix)
+        }
+        try? fm.removeItem(at: url.deletingLastPathComponent()
+            .appendingPathComponent("thumbnailConfiguration"))
     }
 
     static func fetch(progress: @escaping (Double) -> Void,
@@ -238,9 +242,13 @@ final class LibraryService {
         }
 
         guard let index = PhotoLibraryIndex.load(dbPath: url.path), !index.isEmpty else {
+            // 读不出来也要把落盘删掉：库里已经有东西进来了，文件就没用了
+            purgeSnapshotFiles()
             throw ServiceError.nonIndex
         }
         Self.dbg("index assets=\(index.metaByFile.count) albums=\(index.albums.count)")
+        // 索引已经在内存里了 —— 四件套立刻删，硬盘上不留这份 296 MB 的复印件
+        purgeSnapshotFiles()
         progress(0.95)
 
         let stats = try await fetchDeviceStats()
@@ -736,9 +744,7 @@ final class LibraryService {
 
     /// 区域/型号相关的现场，写到 App Support（和电池 dump 同一个地方）
     static func writeDeviceDump(_ lines: [String]) {
-        let base = FileManager.default
-            .urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-            .appendingPathComponent("cleanmyiphone", isDirectory: true)
+        let base = TraceRegistry.dataDirectory
         DeviceFiles.makePrivateDirectory(base)
         let text = lines.joined(separator: "\n") + "\n"
         try? text.write(to: base.appendingPathComponent("device-dump.txt"), atomically: true, encoding: .utf8)

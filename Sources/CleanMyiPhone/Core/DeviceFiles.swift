@@ -213,6 +213,8 @@ final class DeviceFiles: @unchecked Sendable {
 
         try? FileManager.default.removeItem(at: local)
         FileManager.default.createFile(atPath: local.path, contents: nil)
+        // 原图 / 原视频的落盘：逐份登记，崩溃那一刻也删得掉
+        TraceRegistry.registerTrace(local)
         guard let handle = try? FileHandle(forWritingTo: local) else { return nil }
         defer { try? handle.close() }
 
@@ -488,9 +490,7 @@ final class DeviceFiles: @unchecked Sendable {
     /// 缩略图缓存目录。
     /// **权限 0700**：里面是照片的缩小副本，同机其他账户不该能读。
     static var thumbDirectory: URL {
-        let base = FileManager.default
-            .urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-            .appendingPathComponent("cleanmyiphone", isDirectory: true)
+        let base = TraceRegistry.dataDirectory
             .appendingPathComponent("thumbs", isDirectory: true)
         Self.makePrivateDirectory(base)
         Self.makePrivateDirectory(base.deletingLastPathComponent())
@@ -527,23 +527,21 @@ final class DeviceFiles: @unchecked Sendable {
         CGImageDestinationAddImage(dest, cg, [kCGImageDestinationLossyCompressionQuality: quality] as CFDictionary)
         guard CGImageDestinationFinalize(dest) else { return nil }
         let result = data as Data
-        try? result.write(to: thumbCacheURL(fileName: fileName, maxPixel: maxPixel))
+        let url = thumbCacheURL(fileName: fileName, maxPixel: maxPixel)
+        if (try? result.write(to: url)) != nil {
+            // 逐张登记：崩溃那一刻才删得掉（信号上下文里拿不到目录列表）
+            TraceRegistry.registerTrace(url)
+        }
         return result
     }
 
-    /// 清掉所有「原图/原视频」级别的一次性落盘。
-    /// 缩略图缓存和相册库快照是**故意保留**的（缓存就是它的用途），这里不动。
+    /// 清掉所有「原图/原视频」级别的一次性落盘（只清临时目录，不动缩略图缓存）。
+    /// 退出/启动用的那一套在 `TraceRegistry.purgeAll()`，这里是「关预览」「换目标」时的小清理。
     static func purgeTransientFiles() {
         emptyDirectory(rawCacheDirectory)
         emptyDirectory(FileManager.default.temporaryDirectory
             .appendingPathComponent("cleanmyiphone-preview", isDirectory: true))
         emptyDirectory(rawCacheDirectory.appendingPathComponent("preview", isDirectory: true))
-        // 缓存根目录收紧权限
-        let root = FileManager.default
-            .urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-            .appendingPathComponent("cleanmyiphone", isDirectory: true)
-        makePrivateDirectory(root)
-        makePrivateDirectory(root.appendingPathComponent("thumbs", isDirectory: true))
     }
 
     /// 清一个目录下的所有文件（不删目录本身）
@@ -685,6 +683,7 @@ final class DeviceFiles: @unchecked Sendable {
             return nil
         }
         try? data.write(to: cached)
+        TraceRegistry.registerTrace(cached)
         return data
     }
 
