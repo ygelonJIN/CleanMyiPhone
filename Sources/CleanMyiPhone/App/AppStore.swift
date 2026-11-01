@@ -234,6 +234,8 @@ final class AppStore {
     @ObservationIgnored private var thumbTasks: [Asset.ID: Task<Void, Never>] = [:]
     private var sessionTask: Task<Void, Never>?
     private var libraryRetryTask: Task<Void, Never>?
+    /// 扫描的最后一道时间闸（见 `scheduleScanDeadline`）
+    private var scanDeadlineTask: Task<Void, Never>?
     private var didBootstrap = false
 
     init() {
@@ -413,6 +415,7 @@ final class AppStore {
         librarySkipped = false
         device = DeviceSnapshot(id: "connecting", name: "iPhone", model: "正在读取", isReady: false)
         resetScan(skipLibrary: false)
+        scheduleScanDeadline()
         Task { await bootstrapAfterRetry() }
     }
 
@@ -526,9 +529,40 @@ final class AppStore {
         // 「正在读取相册索引 / 正在等手机回包 / 已读 0 KB」一直不动。
         // 这里直接起一次会话链，不依赖回调是否还会来。
         beginSession()
+        scheduleScanDeadline()
+    }
+
+    /// 扫描的**最后一道时间闸**：超时就收尾，绝不让界面永远转圈。
+    ///
+    /// 为什么必须有：`isScanning` 只认 `scanFinished`，而 `maybeFinishScan()` 要求
+    /// `catalogDone`。PTP 会话被设备侧关掉时（iPhone 锁屏最常见），目录枚举永远不会
+    /// 完成 → 界面永远显示「正在读取照片目录」、刷新按钮永远是转圈禁用态、
+    /// 删除整批报「设备未连接」，用户被彻底锁死，连重试的按钮都点不了
+    /// （2026-11-01 用户现场踩到）。`bootstrapAfterRetry` 里那段 10 秒兜底只覆盖
+    /// 首启，⌘R / 刷新按钮走的 `startScan` 这条路上原来一个兜底都没有。
+    private func scheduleScanDeadline(timeout: TimeInterval = 30) {
+        scanDeadlineTask?.cancel()
+        scanDeadlineTask = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: UInt64(timeout * 1_000_000_000))
+            guard let self, !Task.isCancelled, !self.scanFinished else { return }
+            if !self.catalogDone {
+                self.catalogDone = true
+                self.catalogFraction = 1
+                if self.errorText == nil, !self.isDeviceLocked {
+                    self.errorText = "读不到照片目录：解锁 iPhone 后点刷新重试"
+                }
+            }
+            self.recomputeProgress()
+            self.maybeFinishScan()
+            self.finishScan()
+            Self.debugLog("scan deadline fired：强制收尾（catalogDone forced）")
+        }
     }
 
     private func beginSession() {
+        // 闸门从这里开始计时最准：会话真正开始的那一刻。上面 startScan / 连接真机
+        // 那两处也各挂了一次（不依赖 `onDevice` 回调是否还会来），这里是幂等覆盖。
+        scheduleScanDeadline()
         sessionTask?.cancel()
         sessionTask = Task { [weak self] in
             guard let self else { return }
@@ -578,6 +612,8 @@ final class AppStore {
     private func finishScan() {
         guard !scanFinished else { return }
         scanFinished = true
+        scanDeadlineTask?.cancel()          // 已经收尾，闸门不必再睡到点
+        scanDeadlineTask = nil
         progress = 1
         Self.debugLog("scan finished")
     }

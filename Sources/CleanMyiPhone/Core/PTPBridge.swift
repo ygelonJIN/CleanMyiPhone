@@ -311,9 +311,15 @@ final class PTPBridge: NSObject, DeviceSource {
     }
 
     func delete(ids: [Asset.ID]) async -> (succeeded: [Asset.ID], failed: [(id: Asset.ID, message: String)]) {
-        guard let camera else {
-            return ([], ids.map { ($0, "设备未连接") })
+        // 设备侧会话会自己消失（iPhone 锁屏 / 空闲太久 / 被访达和照片 App 抢走），
+        // 这时 `camera` 是 nil，整批删除会一项都没试就全部失败 —— 用户看到的就是
+        // 「成功 0 项，全都失败，设备未连接」（2026-11-01 现场）。别再让用户自己去
+        // 重启 App 或拔插数据线，这里先自己做一次完整重连再重试。
+        guard let camera = await cameraOrReconnect(timeout: 8) else {
+            return ([], ids.map { ($0, "设备未连接（解锁 iPhone 后重试）") })
         }
+        // 会话刚重建时文件表还在填，给几秒收尾；空表会让下面每条都判成「设备上找不到」
+        await waitForFiles(timeout: 3)
 
         var files: [ICCameraFile] = []
         var idByFile: [ObjectIdentifier: Asset.ID] = [:]
@@ -424,6 +430,44 @@ final class PTPBridge: NSObject, DeviceSource {
         guard !started else { return }
         started = true
         browser.start()
+    }
+
+    /// 拿相机对象；拿不到就把浏览器**整个重置一遍**再等设备上来。
+    ///
+    /// 为什么需要：iPhone 锁屏 / 空闲太久 / 被访达或「照片」抢走时，设备侧会关掉
+    /// PTP 会话，`camera` 变 nil。这时整批删除会一项都没试就全失败 ——
+    /// 用户看到的就是「成功 0 项，全都失败，设备未连接」。
+    ///
+    /// 为什么是 `stop()` + `start()` 而不是只 `start()`：`start()` 有 `started` 守卫，
+    /// **浏览器活着但会话死了**的时候它什么都不做，等于白等。先 `stop()` 把 `started`
+    /// 清掉、`browser.stop()`，再 `start()` 才是一次真正的重连（这也是「拔插数据线
+    /// 才有用」在 App 内的等价操作）。
+    ///
+    /// 只在主线程调用（`delete` ← `PurgeEngine` 是 @MainActor），IC 的 browser 要求主线程。
+    private func cameraOrReconnect(timeout: TimeInterval) async -> ICCameraDevice? {
+        if let camera { return camera }
+        stop()
+        try? await Task.sleep(nanoseconds: 300_000_000)   // 让 browser 真正停稳
+        start()
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            if let camera { return camera }
+            try? await Task.sleep(nanoseconds: 200_000_000)
+        }
+        return camera
+    }
+
+    /// 文件表里有没有东西（同步读，配合 async 里的轮询用）
+    private func filesAreReady() -> Bool {
+        lock.withLock { !filesByID.isEmpty }
+    }
+
+    private func waitForFiles(timeout: TimeInterval) async {
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            if filesAreReady() { return }
+            try? await Task.sleep(nanoseconds: 100_000_000)
+        }
     }
 
     func stop() {

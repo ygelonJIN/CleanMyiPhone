@@ -4,35 +4,35 @@
 <dict>
 	<key>CFBundleDevelopmentRegion</key>
 	<string>zh_CN</string>
-	<key>CFBundleIconFile</key>
-	<string>AppIcon</string>
+	<key>CFBundleDisplayName</key>
+	<string>CleanMyiPhone</string>
 	<key>CFBundleExecutable</key>
 	<string>cleanmyiphone</string>
+	<key>CFBundleIconFile</key>
+	<string>AppIcon</string>
 	<key>CFBundleIdentifier</key>
 	<string>local.cleanmyiphone</string>
 	<key>CFBundleInfoDictionaryVersion</key>
 	<string>6.0</string>
 	<key>CFBundleName</key>
 	<string>CleanMyiPhone</string>
-	<key>CFBundleDisplayName</key>
-	<string>CleanMyiPhone</string>
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleShortVersionString</key>
-	<string>0.1.0</string>
+	<string>0.1.1</string>
 	<key>CFBundleVersion</key>
-	<string>1</string>
-	<key>LSMinimumSystemVersion</key>
-	<string>14.0</string>
+	<string>2</string>
 	<key>LSApplicationCategoryType</key>
 	<string>public.app-category.utilities</string>
+	<key>LSMinimumSystemVersion</key>
+	<string>14.0</string>
 	<key>NSHighResolutionCapable</key>
 	<true/>
-	<key>NSQuitAlwaysKeepsWindows</key>
-	<false/>
-	<key>NSPrincipalClass</key>
-	<string>NSApplication</string>
 	<key>NSHumanReadableCopyright</key>
 	<string>ygelon</string>
+	<key>NSPrincipalClass</key>
+	<string>NSApplication</string>
+	<key>NSQuitAlwaysKeepsWindows</key>
+	<false/>
 </dict>
 </plist>
