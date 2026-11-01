@@ -32,6 +32,14 @@ struct PhotoLibraryIndex {
     var metaByFile: [String: Meta] = [:]
     /// 按「体积 + 拍摄时间(秒)」建的第二索引：PTP 的名字和磁盘名对不上时用
     private var metaBySizeDate: [String: Meta] = [:]
+    /// 数字后缀索引：`img_7329.jpg` → "7329" → [归一化文件名]。
+    /// 查询必须走这张预建表 —— 在查询里现扫 `metaByFile` 就是 O(n)，
+    /// 而 `meta()` 对每张资产都会被调（`tagSet` / `computeVisible` / 侧栏统计），
+    /// 5000 张 × 5000 条字符串过滤 ≈ 2700 万次，实测直接把界面卡死几分钟。
+    private var fileNameByDigits: [String: [String]] = [:]
+    /// 拍摄时间索引（到秒）：`PTP 名字随机 + 体积也对不上`时的最后一道匹配。
+    /// 视频的 PTP `byteSize` 长期不准，只靠「体积 + 时间」那层基本全 miss。
+    private var metaBySecond: [Int: [Meta]] = [:]
 
     static func normalize(_ name: String) -> String {
         var key = name.lowercased()
@@ -39,8 +47,29 @@ struct PhotoLibraryIndex {
         return key
     }
 
+    /// 诊断用：时间索引里到底装了多少东西（0 就说明根本没建起来）
+    var timeIndexCoverage: (seconds: Int, assets: Int) {
+        (metaBySecond.count, metaBySecond.values.reduce(0) { $0 + $1.count })
+    }
+
     func meta(for fileName: String) -> Meta? {
         metaByFile[Self.normalize(fileName)]
+    }
+
+    /// PTP 名字是随机的（`HPQE7329.MP4` ↔ `IMG_7329.MP4` 连数字都对不上）时，
+    /// 只剩拍摄时间可用：在 ±2 秒窗口里找**同种类**资产，**唯一命中**才算。
+    /// 不唯一（连拍、批量导入同一秒）就返回 nil，宁可退到慢路也不猜错。
+    func meta(matchingTimeOf date: Date, isVideo: Bool) -> Meta? {
+        let base = Int(date.timeIntervalSinceReferenceDate.rounded())
+        var hits: [Meta] = []
+        for offset in -2...2 {
+            if let list = metaBySecond[base + offset] { hits.append(contentsOf: list) }
+        }
+        var seen = Set<String>()
+        let unique = hits.filter {
+            $0.isVideo == isVideo && seen.insert(Self.normalize($0.fileName)).inserted
+        }
+        return unique.count == 1 ? unique[0] : nil
     }
 
     static func sizeDateKey(bytes: Int64, date: Date) -> String {
@@ -55,6 +84,23 @@ struct PhotoLibraryIndex {
             if let hit = metaBySizeDate[Self.sizeDateKey(bytes: bytes, date: shifted)] { return hit }
         }
         return nil
+    }
+
+    /// PTP 报的名字和磁盘名对不上时再用一层：按**数字后缀 + 同扩展名**找。
+    /// 例：PTP 给 `HPQE7329.MP4`，磁盘上是 `IMG_7329.MP4`。
+    /// 要求唯一命中 —— 撞了两个就不猜，交给名字匹配那条路。
+    /// 走预建的 `fileNameByDigits`，只看候选，不扫全库。
+    func meta(matchingDigitsOf fileName: String) -> Meta? {
+        let digits = fileName.filter(\.isNumber)
+        guard digits.count >= 3, let keys = fileNameByDigits[digits] else { return nil }
+        let ext = (fileName as NSString).pathExtension.lowercased()
+        var hit: Meta?
+        for key in keys {
+            guard ext.isEmpty || (key as NSString).pathExtension.lowercased() == ext else { continue }
+            if hit != nil { return nil }
+            hit = metaByFile[key]
+        }
+        return hit
     }
     var albums: [Album] = []
     var members: [Int: Set<String>] = [:]
@@ -112,6 +158,14 @@ struct PhotoLibraryIndex {
             if meta.byteSize > 0 {
                 index.metaBySizeDate[Self.sizeDateKey(bytes: meta.byteSize, date: meta.createdAt)] = meta
             }
+            // 数字后缀索引：建一次，之后每次查询都不用扫全库
+            let digits = key.filter(\.isNumber)
+            if digits.count >= 3 {
+                index.fileNameByDigits[digits, default: []].append(key)
+            }
+            // 拍摄时间索引：PTP 名字随机、体积又不准时，靠它兜底
+            let second = Int(meta.createdAt.timeIntervalSinceReferenceDate.rounded())
+            index.metaBySecond[second, default: []].append(meta)
         }
 
         // 影子资产：库里有、PTP 不一定枚举得到的那些（已隐藏 / 最近删除 / 云端项）

@@ -96,7 +96,7 @@ struct MainSidebarView: View {
                     .font(.caption)
             }
             .toggleStyle(.checkbox)
-            .help("勾上：退出 App 和下次启动时自动删干净")
+            .help("勾上：退出 App（⌘Q / 关窗口）时自动删干净。**启动时不删** —— 启动就删等于每次都重搬 296 MB 相册库，容易把文件通道撞坏")
 
             HStack(spacing: 6) {
                 Button("清空本机数据", systemImage: "trash.slash") {

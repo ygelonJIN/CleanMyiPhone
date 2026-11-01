@@ -28,11 +28,16 @@ struct PreviewOverlay: View {
             .padding(.vertical, 20)
         }
         .onChange(of: store.previewVideoURL) { _, url in
-            // 流式播放优先（url 为空、但给了 remoteAsset 时走下面那个 onChange）
-            guard url != nil else { return }
+            // 换目标时 loadPreviewImage 会先把 url 置空：这时必须把播放器一起放掉，
+            // 否则 media 里 `if let player` 仍然成立，屏幕上还放着上一个视频。
             player?.pause()
             player = url.map { AVPlayer(url: $0) }
             player?.play()
+        }
+        .onChange(of: store.previewID) { _, _ in
+            // 直接从一个视频跳到另一个（← →）也要停掉旧的，别让上一段在旁边接着放
+            player?.pause()
+            player = nil
         }
         .onDisappear { player?.pause() }
     }

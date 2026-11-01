@@ -39,15 +39,50 @@ macOS 上的 iPhone 空间清理工具（SwiftUI，零外部依赖）。个人�
 | `经验文档/` | 领域经验，见下 |
 | `不推送/` | 本地私人物件，永不提交 |
 
-- 缩略图（2026-11 定案）：**设备端缩略图**。`ICCameraDeviceDelegate` 里实现 `shouldGetThumbnailOf` + 主动 `requestThumbnailData(options: [.imageSourceThumbnailMaxPixelSize: 800])`（**不能同时传 imageSourceShouldCache，否则尺寸参数被忽略**，拿回来就是 160×120 的糊图），收到即落 480px JPEG。取不到就跳过，网格里从不下整片视频。流式播放、AVFoundation 抽帧、resource-loader 那几套全部删掉（这台设备上实测不通，白等超时）。
+- 缩略图（2026-11 定案，**已换成「直接读设备端缓存」**）：网格缩略图按这个顺序取，别再往回改：
+  1. **`/PhotoData/Thumbnails/V2/<ZDIRECTORY>/<ZFILENAME>/5005.JPG`**（AFC 直读）。这是设备自己维护的缩略图缓存，iMazing 也读这一套（`imazing-reverse/FILESYSTEM.md`）。实测：命中 299/300、**平均 7 ms、平均 65 KB**，照片和视频都有，一张 14–86 KB。`ZDIRECTORY` 自带 `DCIM/109APPLE` 前缀（iCloud 那批是 `PhotoData/PhotoCloudSharingData/...`），**不要再拼一个 `DCIM/`**，否则变成 `V2/DCIM/DCIM/...` 全不命中。找不到 `5005.JPG` 就列一次该资产的目录取最大的 `.JPG`（编号不固定）。
+  2. PTP 主动 `requestThumbnailData`（缓存里没有：刚拍、刚导入、iCloud 没落地）。超时按种类：照片 3 秒 / 视频 8 秒；熔断阈值 8 次，**熔断 30 秒后放一次探路请求**（熔断是让开，不是判死刑）。
+  3. 只有照片才有第 3 步：AFC 下原图 + ImageIO 降采样。`**不能同时传 imageSourceShouldCache**`，否则尺寸参数被忽略、拿回来是 160×120 糊图。
+  以前慢/只出一部分的原因：主路径是"问 PTP"（1.5 秒超时、串行、连续 3 次就熔断），视频只有这条路 → 整屏空；照片兜底又拿 PTP 的 `byteSize` 判完整性 → 明明读完的被判「下载不完整」删掉。两个都改掉了；`loadThumbnail` 的前置 sleep 也从 140 ms 收到 60 ms。
+- **asset → 库的匹配有四层**（`AppStore.resolveMeta`）：① 名字一样 ② 数字后缀 + 同扩展名 ③ 体积 + 拍摄时间 ±2 秒 ④ **拍摄时间 ±2 秒 + 同种类**（唯一命中才算）。第 ④ 层是给视频兜底的：PTP 报的视频名常是随机的（`HPQE7329.MP4`），而视频的 PTP `byteSize` 又长期不准 → 第 ③ 层必 miss → 只剩时间可用。实测 396 条视频里 372 条能唯一定位，剩下 24 条是同一秒/相邻秒录的多个视频（有歧义就不猜）。
+- **设备端缩略图缓存的覆盖率**（`--probe-videos` 全量审计）：4932 条资产里 **4930 条有缓存**，只有 2 条视频（`IMG_9301.MP4` / `IMG_1771.MOV`）**设备上根本没有这张缩略图**（原片完好，224 MB / 373 MB）。这两条：网格里给「视频占位」（不是空白），PTP 也回不来（SIGTERM 前等 8 秒），所以登记进 `thumbUnavailable` 免得每次滚回来再等一次；点开预览仍可播（走 AFC 原片）。
+- **SQLite 是动态类型的（2026-11 修的隐藏 bug）**：`ZDATECREATED` 在同一列里 **2328 行是 integer、2958 行是 real**。`SQLiteDB.Row.double()` 原来只认 `as? Double` → 那 2328 条资产的拍摄时间全变成 `0`（= 2001-01-01）：排序、按时间筛选、"新照片是否让快照过期"、影子资产的日期全跟着错，而界面上看不出来。现在 `int/int64/double` 三种取值都互相兼容。**任何从 Photos.sqlite 取数的列都要按这个前提写**。
+- 缩略图日志（`~/Library/Application Support/cleanmyiphone/thumb-log.txt`，最多 4000 行）：`cache-thumb`＝走了设备缓存（最好）、`device-thumb`＝PTP 拿到、`ok(照片)`＝下原图降采样、`fail(照片)`＝失败（`err=` 里的 `lastError` 是共享字段，可能串台，别照字面信）、`drop(不在当前视图)`＝滚过去了。
+- 会话（2026-11 修）：**所有开 lockdownd 会话的地方都要 `stopSession`**。`isDeviceLocked()` / `probeAFCOnce()` / `fetchDeviceStats()` / `deviceStatsOffMain()` / `refreshScreen()` 原来都是只 open 不 stop，而这些全在**失败路径**上被反复调用（解锁轮询每 2 秒一次、通道探针每轮一次）→ 设备上漏一串会话，漏够了开始拒连，现象就是「手机的文件通道被系统关掉了」。`DeviceFiles.Session.reset()` 也要真的 `closeAFC` 再置 nil，只置 nil 等于把连接留给了设备。实测并发两条 AFC 这台设备是允许的（两条同时读都没事），所以别把「并发」当元凶，重点是**用完关掉**。
 - 预览/下载（2026-11）：优先用**库里的绝对路径** `/DCIM/<ZDIRECTORY>/<ZFILENAME>` 走 AFC（实测 36 MB/s，100 MB ≈ 3 秒）；库还没读到时才退 `ICCameraFile.requestDownload`（PTP 单流小包，几十 MB 的视频会慢到超时）；最后才是名字匹配。进度用设备报的真实大小当分母（PTP 的 `byteSize` 对大视频常偏大，会卡在 90/118 不动）。切目标时上一条下载要**作废并删半截文件**，只有完整文件才进会话缓存（最近 3 个）。
-- 预览卡片（2026-11）：两行——第一行固定阶段（正在读取相册索引 / 正在取回视频 / 第一次没取到，重试中），第二行只放字节 `24.6 MB / 118.3 MB`（等宽、固定 300pt），卡片固定 340pt，数字位数变化不抽动。"等待设备响应"那种模糊提示已删。
-- 库门禁（2026-11）：库索引没读到（`libraryIndex == nil`）时照片页盖一层进度卡（`x MB / y MB` + 进度条），并且**空格预览直接 return**——没有库就拿不到设备真实路径，只能走慢路。
-- 不留痕（2026-11 定案）：侧栏底部三件套——`☑ 自动清空本机数据`（控制退出/启动时自动清，默认勾选）、`清空本机数据`（立刻清一次）、`重新读取`（清空后手动重建）。**手动清空之后进入暂停态**（`dataPaused`）：不重扫、不重生成缩略图、不能预览，照片页显示「本机数据已清空」，直到点「重新读取」——这是用户明确要求的行为，别改成清完自动重建。`purgeLocalDataOnDisk()` 会回查剩余项并在按钮下方报出来；回查必须放在 `purgeTransientFiles()` **之前**（后者会把 `thumbs` 目录重新建出来，放后面就永远报没删掉）。
+- 取回作废（2026-11 修，原结论从没生效）：`cancelPreviewDownload()` 原来只写在 `if previewID != id` 分支里，而 openPreview / stepPreview / move 都是「先赋 previewID 再调 loadPreviewImage」→ 判断恒不成立，令牌一次都没起效：关掉或换目标后旧视频继续占着串行下载通道跑到收尾，新视频排在它后面干等。现在 `loadPreviewImage` 顶部**无条件**作废，`closePreview()` 也调一次；IC 那条没有自己的取消通路，靠 `isCancelled` 闭包 0.2 秒查一次令牌，过期就 `progressRef.cancel()` 并删半截。
+- 进度归属（2026-11 修）：`onProgress` 闭包必须 `guard previewID == id` 再写 `previewBytesDone/Total/ProgressText`，否则旧下载的字节数会一直画在新预览上（"显示的还是上一个视频"就是这么来的）。`waitForLibraryIndex(for:)` 同理，换目标即停止改写阶段文案。
+- 完整性判据（2026-11 修）：只有 AFC 的 `st_size` 能当基准（`downloadByDevicePath` 返回 `PathDownload(url, received, planned)`），`planned == 0` 表示这次没可信基准（IC / 名字匹配），**跳过校验**。拿 `previewBytesTotal` 当基准会把"其实已经取完"误报成「取回不完整，再试一次」——PTP 的 `totalUnitCount`/`byteSize` 对大视频长期偏大。
+- 预览层播放器（2026-11 修）：`previewVideoURL` 变 nil 时要把 `player` 一起置空；原来 `guard url != nil else { return }` 让旧 `AVPlayer` 留在 `media` 的 `if let player` 分支里，A→B 直接切时屏幕上还是 A 在放。
+- 预览卡片（2026-11）：两行——第一行固定阶段（正在读取相册索引 / 正在取回视频 / 正在等待设备通道 / 第一次没取到，重试中），第二行只放字节 `24.6 MB / 118.3 MB`（等宽、固定 300pt），卡片固定 340pt，数字位数变化不抽动。"等待设备响应"那种模糊提示已删；「正在等待设备通道」是 1.5 秒还没收到第一个字节时的兜底，收到数据就换回「正在取回视频」。
+- 库门禁（2026-11 定案，已升级成全屏）：照片页在 `libraryIndex == nil` 时**整窗盖死**——遮罩在根视图（`RootView` 的 `.overlay` + `store.needsLibraryGate`），盖住左右两栏和网格，什么都点不了，中间是「正在读取相册索引 + x MB / y MB + 条」。三个例外不盖：暂停态（`dataPaused`，要能点「重新读取」）、未连接（`needsConnection`）、锁屏（`isDeviceLocked`）。`PhotosView` 里那层只留暂停态的「本机数据已清空」卡片，别做成双层。空格预览在库没好时仍然直接 `return`（没有库拿不到设备真实路径）。
+- 预览通道（2026-11 修）：`downloadByDevicePath` 走**独立的 AFC 会话 + 独立串行队列**（`previewSession` / `previewQueue`），不再和整屏缩略图挤在 `queue` 上。之前首次进照片页那串缩略图（每个都要在 `downloadLocked` 里 `buildIndex()` 枚举 /DCIM）会把队列顶满，预览排在后面 → 卡片上只有转圈、一个字节都没有，关掉再点别的又正常（因为索引已经建好）。建不起第二条会话时自动回退共用通道，并置 `previewChannelBroken` 不再反复试，`reset()` 清掉该标志。`download(priority: true)` 也走这条通道。
+- 取回路径顺序（2026-11 修，实测踩过）：**AFC 绝对路径（库里查得到）→ AFC 名字匹配（/DCIM 索引）→ IC 单流兜底**。原来 IC 排在名字匹配前面，而 PTP 报的名字经常是随机的（实测 `HPQE7329.MP4`，磁盘上是 `IMG_7329.MP4`），`meta(asset)` 查不到就直接掉进 IC → 开头几秒一个字节都没有，卡片显示「正在等待设备通道」。现在 `meta()` 多一层「数字后缀 + 同扩展名」在库里兜（要求唯一命中），查不到也先走 AFC 名字匹配。
+- 门禁不会总出现：库在启动阶段就读完时（正常情况，也会打印「库索引就绪（门禁撤）」），进照片页时 `needsLibraryGate` 已经为 false。要验证遮罩得在库读取期间进照片页，或删掉快照重来。
+- **性能红线**（2026-11 踩过一次，界面卡死几分钟）：任何「按名字 / 后缀找」的查询都必须走**预建索引**（`PhotoLibraryIndex.fileNameByDigits`），不能在查询里现扫 `metaByFile`。`meta()` 对每张资产都会被调（`tagSet` / `computeVisible` / 侧栏统计），5000 张 × 5000 条字符串过滤 ≈ 2700 万次，全在主线程 → 界面卡死、进度不刷新，表现成「读索引读了 3 分钟」。`AppStore.meta()` 另加一层 `metaCacheStore`，`libraryIndex` 更新时要 `removeAll()`。
+- **子进程收尾（2026-11 定案，比"防孤儿"更重要）**：`kill -9` 掉卡在 AFC 调用里的 helper 会把**手机侧 afcd 的通道搞坏**——之后 `--probe-afc` 一律 `连接被关闭`、`--fetch-library` 连 `SIZE` 都打不出来，而 PTP / lockdownd / `isLocked` 全部正常。恢复只能拔插数据线或重启 iPhone。所以退出必须走 `Probe.HelperGuard`：`AFCConnectionInvalidate`（放出阻塞读）→ `AFCConnectionClose` → `AMDeviceStopSession` → `_exit`。触发点三条：`SIGTERM/SIGINT`、**父进程死亡**（父进程拿一根永不打字的管道当子进程 stdin，父进程一死子进程 `read(0,…)` 得 EOF）、正常读完的 `defer`。`getppid()==1` 只在 `report()` 里，卡在第一个 AFC 调用上永远轮不到。父进程侧 `stopHelper`：`terminate()` → 等 2.5 秒 → 才 `SIGKILL`；`killStrayHelpers` 也是先 SIGTERM、**等满 2.5 秒**（用 `pkill -0` 轮询确认真退了）才 `-9`。**看门狗 30 秒**（原来 15 秒太急：设备刚枚举完，AFC 首个回包常要 10 秒以上，一急就 SIGTERM 一个正卡在 AFC 调用里的子进程），总时限 90 秒，296 MB 实测 8–10 秒。
+- **完整性与"读了一半当成功"（2026-11 修，这是"数据都不对"的元凶）**：helper 的 `CHECK > 0` 只证明「拿到的这份主库 + WAL 自洽」，证明不了「和刚才量到的 `SIZE` 一致」。AFC 半死时每个文件都会「成功地」只读回一部分，只要主库上次 checkpoint 之前的内容还在，`quick_check` 就过、`ZASSET` 也有行 → 旧的、缺了 WAL 里最新照片的库被当成成功快照，视频数和体积全对不上。现在 `OutputPump` 记下 `SIZE`/`PROGRESS` 的终值，`runFetchHelper` 出结果前对账：**少超过 0.5%（或 512 KB）就抛 `ServiceError.incomplete`**，`fetchOnMain` 因此在 copy 之前就 throw，上一份可用快照原地保留。`ServiceError.incomplete` 以前是死代码，现在真的会抛。
+- **重抓前必须让出通道**：`retryLibraryOnce` 除了 `stopPTP()` 还要 `releaseDeviceFiles()`（异步调 `DeviceFiles.shared.reset()`，不阻塞主线程）——否则缩略图的 `photoSession` 和预览的 `previewSession` 还攥着两条 AFC，加上 helper 就是三条压在同一根管子上。
+- **单实例守卫**：`SingleInstance` 用 `flock` 锁 `~/Library/Application Support/cleanmyiphone/instance.lock`，第二个实例激活已有窗口后退出。命令行连起两次没有 LaunchServices 拦着，两个实例会各开 PTP、各起 helper 抢同一条 AFC，结果就是"库读不出来"。测试用 `CMI_LOCK_PATH=/tmp/x.lock`（沙箱里 `~/Library` 写不进去，`open` 失败会静默放行）。
+- **库读取失败必须有 UI 出口**：`needsLibraryGate` 只认 `libraryIndex == nil`，库读挂了它照样成立；`LibraryIndexGate` 以前只有一个转圈，等于永远在"读"。现在 `libraryStatus` 非空就切换成错误态（原因 + 「重新读取」按钮 → `store.retryLibraryNow()`）。失败日志写 `[library] 读取失败：…`。文案要能定性：`.locked`（真锁屏）/`.channelClosed`（AFC 被设备关掉，要拔插线）/`.timeout`（通道正常但没读完），三者由 `LibraryService.afcChannelState()` 4 秒探针区分，别再一律甩「检查是否已解锁」。
+- **失败路径上的设备调用必须带超时**（2026-11 踩过）：`isDeviceLocked()`、`fetchDeviceStats()` 都是 `@MainActor` 上的阻塞 C 调用，管子半死时**永不返回** → 主线程冻住，门禁一直转、日志不再出任何行，看着像"读了很久"。现在 `isDeviceLocked()` 全部走 `LibraryService.withDeviceTimeout(4, fallback:)`，`fetchDeviceStats()` 换成 `deviceStatsOffMain()`（6 秒超时、不在主线程等）。
+- **自动重试有上限**：连续失败 3 次就停（`libraryFailureCount` / `libraryAutoRetryStopped`）。`retryLibraryOnce` **不再把 `libraryStatus` 清空**——清了门禁会从「读不出来 + 原因 + 按钮」退回转圈态，用户会以为又重新读了一次，而且失败原因也没了。
+
+- **不留痕（2026-11 定案：不管怎么退出都要零痕迹）**：四条退出通路各有人管，见 `PurgeGuard`：
+  | 退出方式 | 谁清 |
+  |---|---|
+  | ⌘Q / 菜单退出 / 点窗口红点 | `applicationWillTerminate` → `AppStore.purgeOnTerminate()`（完整清） |
+  | `kill <pid>` / Ctrl+C / 关机信号 | `PurgeGuard` 的 SIGTERM/SIGINT/SIGHUP/SIGQUIT handler（完整清） |
+  | 崩溃（SIGSEGV/BUS/ABRT/ILL） | handler 里只 `unlink` 那几个固定文件（异步信号安全），其余靠下次启动 |
+  | `kill -9` / 断电 | 进程没有执行机会 —— 靠 **`bootstrap()` 第一步的 `purgeLocalDataOnDisk()`** |
+  `nonisolated` 是必须的：信号 handler 不在主线程，`purgeOnTerminate` / `purgeLocalDataOnDisk` 都改成 `nonisolated` 了。`purgeLocalDataOnDisk()` 会回查剩余项并在侧栏按钮下方报出来；回查必须放在 `purgeTransientFiles()` **之前**（后者会把 `thumbs` 目录重新建出来）。
+  启动那一次清理**不能删**：它是崩溃/`kill -9` 的唯一兜底。代价是"正常退出后启动会重搬 296 MB"——这是零痕迹的必然，想省掉就把「自动清空本机数据」的勾去掉（那就不清，也不留痕这一条就不成立）。**手动清空之后进入暂停态**（`dataPaused`）：不重扫、不重生成缩略图、不能预览，照片页显示「本机数据已清空」，直到点「重新读取」。
 - 区域（2026-11 修）：`RegionInfo` 在不同读数上会**时有时无、且可能是字符串 `CH/A` 而不是字典**，两种形态都要认；`MQ0W3` 这种无尾码的型号只能靠 RegionInfo。
 - 锁屏→解锁（2026-11）：锁屏时开 `unlockWatch`，每 2 秒问一次，解锁即自动重读；不再停在「设备已锁屏」。
 - 侧栏底部（2026-11）：读取结束后才出现上面那三件套（勾选 + 两个原生 `.bordered`/`.small` 按钮），读取过程中整块不显示；按钮下方一行小字报结果。
-- 相册库快照：`~/Library/Application Support/cleanmyiphone/`（`Photos.sqlite` + `-wal` + `-shm` + `thumbnailConfiguration`，约 296 MB），6 小时内复用，设备上有更新照片会自动重抓。删掉即回到「新机」状态。
+- 相册库快照：`~/Library/Application Support/cleanmyiphone/`（`Photos.sqlite` + `-wal` + `-shm` + `thumbnailConfiguration`，约 296 MB），6 小时内可复用（`loadCachedIndex`）。
+- **"快照过期"的判据**：设备上最新资产的时间比快照里最新那条**新 2 分钟以上** → 本次运行后台重抓一次（`didAutoRefreshLibrary` 保证每次运行只一次）。这就是"我刚拍两张照片能不能识别出来"的答案：**能**，一拍到 PTP 就枚举出来了，重抓只是把索引补齐（照片时间戳一定比快照里最新那条新）。原来的灾难不是判据错，而是**残缺快照**让它永远为真 —— 那个根因已经由下面那条完整性对账堵住了。
+- **没库就别出数**：`mediaPhotoBytes` / `mediaVideoBytes` 在 `libraryIndex` 为空时会退化成「PTP 枚举到的部分资产求和」，而 `appsBytes = 已用 − 媒体 − 系统 − 回收站` —— 视频一小，应用与数据就虚高一大截，用户看到的就是「数据都不对」。现在界面统一看 `mediaBytesReady`（= 库索引非空）：概览三张卡片、占比条、右侧栏「照片/视频」在没就绪时显示「读取中…」/「—」，只保留设备自己报的容量/可用/系统。
 - 缩略图缓存：同目录 `thumbs/`（480px JPEG）。里面含文件名、拍摄时间、GPS、相簿名、隐藏/删除标记，以及照片缩小副本 —— 属于真实隐私数据，所以「自动清空」勾着时退出即删。
 - 一次性落盘（原图/原视频）：`$TMPDIR/cleanmyiphone-raw/`、`$TMPDIR/cleanmyiphone-preview/`、`$TMPDIR/cleanmyiphone-raw/preview/`。缩略图生成时把整份原图写进来、解完立刻删；预览的视频以前会留在本机（实测堆到 1.2 GB）。**现在启动、关预览、退出 App 三处都会清**（`DeviceFiles.purgeTransientFiles`）。
 - 目录权限统一 0700（`makePrivateDirectory`）。默认 0755 会被同机其他账户读到。
@@ -58,7 +93,7 @@ macOS 上的 iPhone 空间清理工具（SwiftUI，零外部依赖）。个人�
 
 **设备通路与照片库.md**
 - 什么时候读：接设备、读 `Photos.sqlite`、判断某字段能不能拿到、排查"读到 0 条/数量对不上"、改缩略图/预览的取数逻辑。
-- 包含什么：usbmuxd 已不可用的结论、MobileDevice 私有框架签名与五个坑、lockdownd 键名表（含真实可用空间键）、照片库表结构与相簿关联表探测、跨通路匹配策略、明确拿不到的四类数据（含电池健康度/温度为什么不行）、删除通道结论；**第八节：相册库 WAL 四件套快照**（整搬 main/wal/shm、不能用 seek 判大小、0 字节读要重试、PTP 会占设备、下载放子进程）；**第九节**：iOS 26.7 实测（house_arrest 全关、GasGauge 只有 4 个键、AFC 根目录清单、App 清单、会话泄漏、设备端缩略图怎么做、按库路径取原文件）。
+- 包含什么：usbmuxd 已不可用的结论、MobileDevice 私有框架签名与五个坑、lockdownd 键名表（含真实可用空间键）、照片库表结构与相簿关联表探测、跨通路匹配策略、明确拿不到的四类数据（含电池健康度/温度为什么不行）、删除通道结论；**第八节：相册库 WAL 四件套快照**（整搬 main/wal/shm、不能用 seek 判大小、0 字节读要重试、PTP 会占设备、下载放子进程）；**8.1 读库卡几分钟的三个原因**、**8.2 收尾三步 + 单实例**、**8.3「数据不对 / 缩略图只出一部分 / 通道被关掉」三个独立毛病**（含 `thumb-log.txt` 行义表、完整性对账口径、AFC 好坏的两条探针）、**8.4 设备端缩略图缓存 `/PhotoData/Thumbnails/V2`**、**8.5 四层退出清场**、**8.6 视频缩略图/匹配四层**、**8.7 SQLite 列类型不固定的坑**；**第九节**：iOS 26.7 实测（house_arrest 全关、GasGauge 只有 4 个键、AFC 根目录清单、App 清单、会话泄漏、设备端缩略图怎么做、按库路径取原文件）。
 - 不用读：只改界面版式时。
 
 **SwiftUI-版式与崩溃.md**

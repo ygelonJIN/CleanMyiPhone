@@ -37,6 +37,11 @@ final class MobileDeviceAPI {
     private typealias AFCFileSeekFn = @convention(c) (UnsafeMutableRawPointer?, UnsafeMutableRawPointer?, Int64, Int32) -> Int32
     private typealias AFCFileTellFn = @convention(c) (UnsafeMutableRawPointer?, UnsafeMutableRawPointer?, UnsafeMutablePointer<UInt64>?) -> Int32
     private typealias AFCRemovePathFn = @convention(c) (UnsafeMutableRawPointer?, UnsafePointer<CChar>) -> Int32
+    // 收尾用：不走这套就退出，设备侧的 afcd 会留半截连接，
+    // 之后所有 AFC 连接都被设备直接关掉（实测 `--probe-afc` 连三次全是「连接被关闭」）
+    private typealias AFCConnectionCloseFn = @convention(c) (UnsafeMutableRawPointer?) -> Int32
+    private typealias AFCConnectionInvalidateFn = @convention(c) (UnsafeMutableRawPointer?) -> Int32
+    private typealias StopSessionFn = @convention(c) (UnsafeMutableRawPointer?) -> Int32
 
     private let createDeviceList: CreateDeviceListFn
     private let subscribe: SubscribeFn
@@ -58,6 +63,9 @@ final class MobileDeviceAPI {
     private let afcFileSeek: AFCFileSeekFn?
     private let afcFileTell: AFCFileTellFn?
     private let afcRemovePath: AFCRemovePathFn?
+    private let afcClose: AFCConnectionCloseFn?
+    private let afcInvalidate: AFCConnectionInvalidateFn?
+    private let stopSessionFn: StopSessionFn?
 
     init() throws {
         guard let handle = dlopen("/System/Library/PrivateFrameworks/MobileDevice.framework/MobileDevice", RTLD_NOW) else {
@@ -95,6 +103,9 @@ final class MobileDeviceAPI {
         afcFileSeek = dlsym(handle, "AFCFileRefSeek").map { unsafeBitCast($0, to: AFCFileSeekFn.self) }
         afcFileTell = dlsym(handle, "AFCFileRefTell").map { unsafeBitCast($0, to: AFCFileTellFn.self) }
         afcRemovePath = dlsym(handle, "AFCRemovePath").map { unsafeBitCast($0, to: AFCRemovePathFn.self) }
+        afcClose = dlsym(handle, "AFCConnectionClose").map { unsafeBitCast($0, to: AFCConnectionCloseFn.self) }
+        afcInvalidate = dlsym(handle, "AFCConnectionInvalidate").map { unsafeBitCast($0, to: AFCConnectionInvalidateFn.self) }
+        stopSessionFn = dlsym(handle, "AMDeviceStopSession").map { unsafeBitCast($0, to: StopSessionFn.self) }
     }
 
     // 不要 dlclose：框架里的通知回调可能还活着，卸载代码会直接把进程写崩
@@ -542,6 +553,21 @@ final class MobileDeviceAPI {
         return afc
     }
 
+    /// 优雅关掉 AFC 连接。
+    /// 先 invalidate（让另一条线程里阻塞中的 `AFCFileRefOpen/Read` 立刻返回），
+    /// 再 close（发 CLOSE 包并释放）。顺序反了会在阻塞线程里 UAF。
+    func closeAFC(_ afc: UnsafeMutableRawPointer) {
+        _ = afcInvalidate?(afc)
+        _ = afcClose?(afc)
+    }
+
+    /// 结束 lockdownd 会话。子进程退出前调用，设备侧才认为这次 AFC 使用结束。
+    func stopSession(_ device: UnsafeMutableRawPointer) {
+        guard sessionOpened else { return }
+        _ = stopSessionFn?(device)
+        sessionOpened = false
+    }
+
     /// 读取设备上的文件（AFC_FOPEN_RDONLY = 1）
     func readFile(_ afc: UnsafeMutableRawPointer, path: String, limit: Int = 64 * 1024 * 1024) throws -> Data {
         var ref: UnsafeMutableRawPointer?
@@ -571,6 +597,16 @@ final class MobileDeviceAPI {
             data.append(contentsOf: buffer[0..<count])
         }
         return data
+    }
+
+    /// 打开文件并返回 AFC 原始状态码（0 = 成功）。诊断用：
+    /// 目录里明明有这个文件却「打不开」时，状态码能区分「没有文件」和「文件在但设备不给」。
+    func openFileStatus(_ afc: UnsafeMutableRawPointer,
+                        path: String,
+                        _ ref: UnsafeMutablePointer<UnsafeMutableRawPointer?>?) -> Int32 {
+        apiLock.lock()
+        defer { apiLock.unlock() }
+        return afcFileOpen(afc, path, 1, ref)
     }
 
     /// 打开文件用于分片读取

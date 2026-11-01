@@ -60,6 +60,12 @@ final class AppStore {
     var libraryIndex: PhotoLibraryIndex?
     var libraryAlbums: [PhotoLibraryIndex.Album] = []
     var libraryStatus: String?
+    /// 连续失败次数：满 3 次就停掉自动重试，别一直撞同一面墙
+    private(set) var libraryFailureCount = 0
+    /// 自动重试已停（门禁要提示「点重新读取」）
+    private(set) var libraryAutoRetryStopped = false
+    /// 正在重试中（门禁显示「正在重试…」，但仍保留上次的失败原因）
+    private(set) var libraryRetrying = false
     var screenImage: NSImage?
     var stats = LibraryService.DeviceStats()
 
@@ -119,6 +125,16 @@ final class AppStore {
     // 相册索引的字节进度（MB 级，按四个文件大小累加当分母）
     var libraryBytesDone: Int64 = 0
     var libraryBytesTotal: Int64 = 0
+
+    /// 照片页在等相册索引：整页盖死，什么都点不了（和启动那一层同样的做法）。
+    /// 这一阶段空格预览也是直接 return 的 —— 没有库就拿不到设备上的真实路径，
+    /// 让人能点、点了又没反应，比直接挡住更难受。
+    var needsLibraryGate: Bool {
+        guard section == .photos else { return false }
+        guard libraryIndex == nil, !usingFixture else { return false }
+        // 暂停态要能点到左下角「重新读取」；未连接 / 锁屏另有提示，不盖
+        return !dataPaused && !needsConnection && !isDeviceLocked
+    }
 
 
     // MARK: - 读取进度（全流程只有一个进度）
@@ -252,14 +268,21 @@ final class AppStore {
     func bootstrap() async {
         guard !didBootstrap else { return }
         didBootstrap = true
+        Self.debugLog("[boot] start")
         resetScan(skipLibrary: false)
         applyDebugStartSection()
-        // 启动先清一遍：覆盖「上次被强杀 / Cmd+Q 没走完」的情况
+        // 启动第一件事：清掉上一次**非正常退出**（崩溃 / kill -9 / 断电）留下的痕迹。
+        // 正常退出时上一轮已经在 `applicationWillTerminate` 里清干净了，这里什么都不用删，
+        // 所以这一步不会白删东西 —— 它是"再怎么退出也不留痕"的最后一道兜底
+        // （SIGKILL 那种进程没有执行机会的情况，靠的就是下一次启动的这一行）。
         if autoPurge {
-            purgeLeftovers = Self.purgeLocalDataOnDisk()
-        } else {
-            DeviceFiles.purgeTransientFiles()
+            let leftovers = Self.purgeLocalDataOnDisk()
+            if !leftovers.isEmpty {
+                Self.debugLog("[purge] 启动清理上次非正常退出的残留：\(leftovers.joined(separator: "、"))")
+            }
+            purgeLeftovers = leftovers
         }
+        DeviceFiles.purgeTransientFiles()
 
         // 模拟设备只留给开发：CMI_FIXTURE=1 才用
         guard ProcessInfo.processInfo.environment["CMI_FIXTURE"] == nil, ptpAllowed else {
@@ -558,6 +581,8 @@ final class AppStore {
         // 本地已有新鲜快照就直接用，别再搬一次 296MB
         if !forceLibraryRefresh, let cached = LibraryService.loadCachedIndex() {
             libraryIndex = cached
+            metaCacheStore.removeAll()
+            Self.debugLog("[library] 用本地快照，库索引就绪（门禁撤）")
             libraryAlbums = cached.albumsSorted()
             invalidateCounts()
             libraryDone = true
@@ -600,6 +625,8 @@ final class AppStore {
                 self?.libraryFileStage = name
             })
             libraryIndex = snapshot.index
+            metaCacheStore.removeAll()
+            Self.debugLog("[library] 从设备读完整库，库索引就绪（门禁撤）")
             libraryAlbums = snapshot.index.albumsSorted()
             invalidateCounts()
             applyStats(snapshot.stats)
@@ -611,10 +638,12 @@ final class AppStore {
             maybeFinishScan()
             await refreshScreen()
         } catch {
+            Self.debugLog("[library] 读取失败：\(error.localizedDescription)")
             libraryDone = true
             libraryFraction = 1
             rebuildMetrics()
             libraryStatus = error.localizedDescription
+            libraryFailureCount += 1
             if let service = error as? LibraryService.ServiceError, case .locked = service {
                 isDeviceLocked = true
                 // 锁屏时什么都读不到。开一个探针盯着，一解锁就自动重读，
@@ -624,11 +653,10 @@ final class AppStore {
                 maybeFinishScan()
                 return
             }
-            // 相册库读不到也要拿到容量/型号，概览才有内容
-            if stats.totalCapacity == 0 {
-                if let fallback = try? await LibraryService.fetchDeviceStats() {
-                    applyStats(fallback)
-                }
+            // 相册库读不到也要拿到容量/型号，概览才有内容。
+            // 走带超时的离线版本：设备管子坏的时候 @MainActor 那版会把界面冻住。
+            if stats.totalCapacity == 0, let fallback = await LibraryService.deviceStatsOffMain() {
+                applyStats(fallback)
             }
             recomputeProgress()
             maybeFinishScan()
@@ -658,10 +686,19 @@ final class AppStore {
     }
 
     /// 设备上出现了比本地快照更新的照片 → 相册库快照过期
+    ///
+    /// 判据就是「**设备上最新那张资产的时间，比快照里最新那张新 2 分钟以上**」。
+    /// 你刚拍两张照片 → 它们的时间戳一定比快照里最新那张新 → 判为过期 → 本次运行重抓一次。
+    /// （所以"6 小时内识别不出来"是**不会**发生的：快照只是缺条目，PTP 枚举永远是最新的，
+    /// 一拍到就会被看见，重抓只是把索引补齐。真正会慢的只有那一次 296 MB 重读。）
+    ///
+    /// 每次运行最多重抓一次（`didAutoRefreshLibrary`）：避免"设备一直在拍 → 一直重抓"。
+    /// 原来的 120 秒判据之所以是灾难，是因为**残缺快照**会让它永远为真；
+    /// 那个根因现在由 `ServiceError.incomplete` 的完整性对账堵住了，所以这里可以恢复成灵敏判据。
     private func libraryLooksStale() -> Bool {
-        guard libraryIndex != nil, !usingFixture else { return false }
+        guard let index = libraryIndex, !index.isEmpty, !usingFixture else { return false }
         guard let newestDevice = assets.map(\.createdAt).max() else { return false }
-        let newestSnapshot = libraryIndex?.metaByFile.values.map(\.createdAt).max() ?? .distantPast
+        let newestSnapshot = index.metaByFile.values.map(\.createdAt).max() ?? .distantPast
         return newestDevice.timeIntervalSince(newestSnapshot) > 120
     }
 
@@ -682,6 +719,13 @@ final class AppStore {
     /// 相册库被 iOS 写库打断时，隔一段时间自动再试几次（不打扰用户）
     private func scheduleLibraryRetry() {
         guard !usingFixture, libraryIndex == nil else { return }
+        // 连着失败三次就别再自动试了：通道坏了的时候每次重试都要起一个子进程去
+        // 撞同一面墙（15 秒 + 一次 AFC 连接），越试越糟，界面还会一直在「正在读取」。
+        guard libraryFailureCount < 3 else {
+            libraryAutoRetryStopped = true
+            Self.debugLog("[library] 已连续失败 \(libraryFailureCount) 次，停止自动重试")
+            return
+        }
         libraryRetryTask?.cancel()
         libraryRetryTask = Task { [weak self] in
             let waits: [UInt64] = [15, 30, 60, 120, 180]
@@ -695,23 +739,52 @@ final class AppStore {
         }
     }
 
+    /// 门禁里的「重试」：绕过 started/done 标记，重新读一次库
+    func retryLibraryNow() async {
+        libraryFailureCount = 0
+        libraryAutoRetryStopped = false
+        await retryLibraryOnce(force: true)
+    }
+
     private func retryLibraryOnce(force: Bool = false) async {
         guard !usingFixture else { return }
         if !force, libraryIndex != nil { return }
         forceLibraryRefresh = true
+        // 重试前先把上一轮残留的辅助进程清掉：它们不随父进程退出，
+        // 几个叠在一起就会互相抢设备，读库永远起不来。
+        LibraryService.killStrayHelpers()
         // 重试时临时让出设备：有 ICCamera 会话时子进程的 AFC 会打不开文件
         let pausePTP = ptpWired
         if pausePTP { stopPTP() }
+        // 也让出**自己的 AFC**：缩略图和预览各自攥着一条连接（`photoSession` /
+        // `previewSession`）。重抓 296 MB 时它们还开着，就是「App 两条 + helper 一条」
+        // 压在同一根管子上 —— 这是最容易把设备侧 afcd 顶到拒连的一档。
+        await releaseDeviceFiles()
         try? await Task.sleep(nanoseconds: 800_000_000)
 
         libraryStarted = false
         libraryDone = false
         libraryFraction = 0
-        libraryStatus = nil
+        // 注意：**不清 libraryStatus**。清了门禁就从「读不出来 + 原因 + 重试按钮」
+        // 退回转圈态，看着像又开始读了（用户就是这么点的），而且失败原因也没了。
+        libraryRetrying = true
         await loadLibrary()
+        libraryRetrying = false
 
         if pausePTP { startPTP() }
         maybeFinishScan()
+    }
+
+    /// 关掉 App 自己那两条 AFC 连接（读库前必须让开），不阻塞主线程：
+    /// `reset()` 里是 `queue.sync`，正在下载缩略图时会等上几秒。
+    private func releaseDeviceFiles() async {
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            DispatchQueue.global(qos: .userInitiated).async {
+                DeviceFiles.shared.cancelPending()
+                DeviceFiles.shared.reset()
+                continuation.resume()
+            }
+        }
     }
 
     private func applyStats(_ snapshot: LibraryService.DeviceStats) {
@@ -747,6 +820,7 @@ final class AppStore {
             let api = try MobileDeviceAPI.shared()
             let device = try api.firstDevice(timeout: 8)
             try api.openSession(device)
+            defer { api.stopSession(device) }
             if let data = try api.screenshot(device), let image = NSImage(data: data) {
                 screenImage = image
             }
@@ -759,6 +833,15 @@ final class AppStore {
 
     var photoBytes: Int64 { assets.filter { $0.kind == .photo }.reduce(0) { $0 + $1.byteSize } }
     var videoBytes: Int64 { assets.filter { $0.kind == .video }.reduce(0) { $0 + $1.byteSize } }
+
+    /// 照片/视频的**库口径**准备好了没有。
+    /// 没准备好就别出数字：`数学上算得出来`不等于`数字是对的` —— 没有库时
+    /// 「应用与数据」是拿「已用 − 媒体 − 系统 − 回收站」反推的，媒体按 PTP 的部分
+    /// 资产算，视频一小、应用与数据就虚高一大截，看着就是「数据都不对」。
+    var mediaBytesReady: Bool {
+        guard let index = libraryIndex else { return false }
+        return !index.isEmpty
+    }
 
     /// 照片 / 视频体积以相册库里的 ZORIGINALFILESIZE 为准。
     /// PTP 报的 fileSize 普遍偏小（视频尤其离谱），不能用它做统计。
@@ -965,12 +1048,7 @@ final class AppStore {
     /// meta 查询带一层小缓存：饼图一次要跑好几遍，别每次都在字典里重新匹配
     @ObservationIgnored private var metaCacheStore: [Asset.ID: PhotoLibraryIndex.Meta?] = [:]
 
-    func metaCache(_ asset: Asset) -> PhotoLibraryIndex.Meta? {
-        if let cached = metaCacheStore[asset.id] { return cached }
-        let value = meta(asset)
-        metaCacheStore[asset.id] = value
-        return value
-    }
+    func metaCache(_ asset: Asset) -> PhotoLibraryIndex.Meta? { meta(asset) }
 
     // MARK: - 筛选
 
@@ -981,9 +1059,26 @@ final class AppStore {
     }
 
     func meta(_ asset: Asset) -> PhotoLibraryIndex.Meta? {
+        // 带缓存：`tagSet` / `computeVisible` / 侧栏统计会对着每张资产反复问，
+        // 5000 张就是上万次查询，缓存命中后只剩一次字典读
+        if let cached = metaCacheStore[asset.id] { return cached }
+        let value = resolveMeta(asset)
+        metaCacheStore[asset.id] = value
+        return value
+    }
+
+    private func resolveMeta(_ asset: Asset) -> PhotoLibraryIndex.Meta? {
         guard let index = libraryIndex else { return nil }
+        // 1) 名字一样（最常见）
         if let hit = index.meta(for: asset.fileName) { return hit }
-        return index.meta(matching: asset.byteSize, date: asset.createdAt)
+        // 2) PTP 名字和磁盘名对不上，但数字后缀一样（`HPQE7329.MP4` ↔ `IMG_7329.MP4`）
+        if let hit = index.meta(matchingDigitsOf: asset.fileName) { return hit }
+        // 3) 体积 + 拍摄时间都对得上
+        if let hit = index.meta(matching: asset.byteSize, date: asset.createdAt) { return hit }
+        // 4) **只剩拍摄时间**：视频的 PTP `byteSize` 常年不准，第 3 层对视频几乎必 miss，
+        //    于是 preview 会退到「DCIM 里找不到」→ IC 单流 → 几十秒后「取不回来」。
+        //    按「±2 秒 + 同种类」唯一命中兜一层，视频的预览/缩略图就能走回 AFC 快路。
+        return index.meta(matchingTimeOf: asset.createdAt, isVideo: asset.kind == .video)
     }
 
     /// PTP 标签 + 设备库里的 subtype 合并成最终标签
@@ -1083,7 +1178,15 @@ final class AppStore {
     }
 
     private func computeVisible() -> [Asset] {
-
+        // 这函数一次要过全量资产（每张都可能问到 meta）；PTP 目录回调抖动时
+        // 会被反复触发。超时就直接记一笔，排查"界面卡几分钟"时有据可查。
+        let started = Date()
+        defer {
+            let ms = Int(Date().timeIntervalSince(started) * 1000)
+            if ms > 200 {
+                Self.debugLog("[perf] computeVisible \(ms)ms assets=\(assets.count) filter=\(libraryFilter)")
+            }
+        }
         var result = assets
         if libraryFilter != .all {
             result = result.filter { matches($0, filter: libraryFilter) }
@@ -1325,17 +1428,38 @@ final class AppStore {
     }
 
     func closePreview() {
+        // 正在取回的那次立刻作废：不掐掉的话，关掉预览后它还会一直占着
+        // 那条串行下载通道跑到收尾，下一次空格的新视频只能排在它后面干等。
+        DeviceFiles.shared.cancelPreviewDownload()
+        DeviceFiles.shared.setPreviewWaiting(false)
+        previewWaitNotice?.cancel()
+        previewWaitNotice = nil
         previewID = nil
         previewImage = nil
         previewVideoURL = nil
         previewLoading = false
         previewProgressText = ""
+        previewStageText = ""
         previewError = nil
-        // 不再这里删文件：播放器可能还拿着它，删了就是"播放不可用"。
-        // 预览副本仍然会在**退出 App / 下次启动**时统一清掉（purgeTransientFiles），
-        // 会话内最多留最近 3 个视频。
+        previewBytesDone = 0
+        previewBytesTotal = 0
+        // 缓存里的完整文件不能删：播放器可能还拿着它，删了就是"播放不可用"。
+        // 半截文件（用户中途关掉的）清掉，别留在原地冒充完整视频。
+        purgeUncachedPreviewFiles()
         DeviceFiles.emptyDirectory(DeviceFiles.rawCacheDirectory.appendingPathComponent("preview",
                                                                                      isDirectory: true))
+    }
+
+    /// 清掉预览目录里**没进缓存**的文件：用户中断后留下的半截。
+    /// 已缓存的（最近 3 个）保留，预览副本仍会在退出 App / 下次启动时统一清掉。
+    private func purgeUncachedPreviewFiles() {
+        // /var/folders 在 TMPDIR 里常常是符号链接，两边都解析一次再比路径
+        let keep = Set(previewFileCache.values.map { $0.resolvingSymlinksInPath().path })
+        guard let items = try? FileManager.default.contentsOfDirectory(
+            at: Self.previewDirectory, includingPropertiesForKeys: nil) else { return }
+        for url in items where !keep.contains(url.resolvingSymlinksInPath().path) {
+            try? FileManager.default.removeItem(at: url)
+        }
     }
 
     func stepPreview(_ delta: Int) {
@@ -1350,6 +1474,8 @@ final class AppStore {
     /// 本次会话里已经取回的视频文件：反复空格开关同一个视频不再重下，
     /// 也不会出现"取完就被删、播放器拿着失效路径 → 播放不可用"。
     @ObservationIgnored private var previewFileCache: [Asset.ID: URL] = [:]
+    /// 预览迟迟没有第一个字节时的兜底提示（1.5 秒），关预览/换目标要作废
+    @ObservationIgnored private var previewWaitNotice: Task<Void, Never>?
     private static let previewCacheLimit = 3
 
     private func cachedPreviewFile(for id: Asset.ID) -> URL? {
@@ -1384,10 +1510,13 @@ final class AppStore {
         // 预览是用户主动操作，优先给它带宽：把还没开始的缩略图请求全丢掉
         pendingThumbs.removeAll()
         DeviceFiles.shared.cancelPending()
-        // 换到另一个视频时，把上一次还没下完的作废 ——
-        // 否则新视频会排在旧视频后面取，看起来像"打开了却没反应"。
+        // 换目标 / 重新取回，一律把上一次还没下完的作废。
+        // **不能**只写在 `if previewID != id` 分支里：openPreview / stepPreview / move
+        // 都是「先给 previewID 赋新值、再调这里」，那个判断恒不成立，
+        // 作废令牌等于从来没生效过 —— 旧视频占着通道跑到收尾，新视频排在它后面，
+        // 用户看到的就是「打开了却没反应、数字还是上一个」。
+        DeviceFiles.shared.cancelPreviewDownload()
         if previewID != id {
-            DeviceFiles.shared.cancelPreviewDownload()
             previewBytesDone = 0
             previewBytesTotal = 0
         }
@@ -1413,40 +1542,79 @@ final class AppStore {
             previewError = nil
             previewBytesDone = 0
             previewBytesTotal = 0
+            // 令牌要在起下载**之前**取：之后任何一次换目标都会让它过期
+            let token = DeviceFiles.shared.previewToken()
+            // 预览要通道了，缩略图先让路（共用队列时这条是唯一保命手段）
+            DeviceFiles.shared.setPreviewWaiting(true)
+            DeviceFiles.trace("ui preview video \(asset.fileName) lib=\(libraryIndex != nil)")
+            // 1.5 秒还没收到第一个字节：多半是在等设备通道（或降级到了 IC 单流），
+            // 这时候只转圈会让人以为卡死，说清楚在等什么
+            previewWaitNotice?.cancel()
+            previewWaitNotice = Task { [weak self] in
+                try? await Task.sleep(nanoseconds: 1_500_000_000)
+                guard let self, !Task.isCancelled else { return }
+                guard self.previewID == id, self.previewLoading, self.previewBytesDone == 0 else { return }
+                self.previewStageText = "正在等待设备通道"
+            }
             Task {
-                self.previewStageText = "正在取回视频"
-                var url: URL?
-                for attempt in 0..<2 {
-                    url = await self.downloadOriginal(for: asset, to: Self.previewDirectory) { done, total in
-                        Task { @MainActor in
-                            self.previewBytesDone = done
-                            self.previewBytesTotal = total
-                            // 报字节，不报百分比：进度条骗人的时候，字节数是实打实的
-                            self.previewProgressText = total > 0
-                                ? "\(Self.sizeText(done)) / \(Self.sizeText(total))"
-                                : Self.sizeText(done)
-                        }
+                // 不管成功、失败还是被作废，都要放开让路；
+                // 让路期间被放弃的缩略图要让格子重新请求一次，不然那几格一直空着
+                defer {
+                    if self.previewID == id {
+                        DeviceFiles.shared.setPreviewWaiting(false)
+                        if DeviceFiles.shared.takePreviewYielded() { self.bumpThumbEpoch() }
                     }
-                    if url != nil { break }
+                }
+                guard self.previewID == id else { return }
+                self.previewStageText = "正在取回视频"
+                var got: (url: URL, planned: Int64)?
+                for attempt in 0..<2 {
+                    guard self.previewID == id else { return }
+                    got = await self.downloadOriginal(
+                        for: asset,
+                        to: Self.previewDirectory,
+                        isCancelled: { DeviceFiles.shared.isPreviewCancelled(token) },
+                        onProgress: { done, total in
+                            Task { @MainActor in
+                                // 进度必须归属到发起它的那次预览：
+                                // 以前这里直接写共享状态，换目标后数字还是上一个视频的
+                                guard self.previewID == id else { return }
+                                if done > 0, self.previewBytesDone == 0 {
+                                    DeviceFiles.trace("ui first bytes \(done)B")
+                                }
+                                self.previewBytesDone = done
+                                self.previewBytesTotal = total
+                                // 真在取数据了：把「等待设备通道」换回正常阶段
+                                if done > 0, self.previewStageText == "正在等待设备通道" {
+                                    self.previewStageText = "正在取回视频"
+                                }
+                                // 报字节，不报百分比：进度条骗人的时候，字节数是实打实的
+                                self.previewProgressText = total > 0
+                                    ? "\(Self.sizeText(done)) / \(Self.sizeText(total))"
+                                    : Self.sizeText(done)
+                            }
+                        })
+                    if got != nil { break }
                     if attempt == 0, self.previewID == id {
                         previewStageText = "第一次没取到，重试中"
                     }
                 }
                 if self.previewID != id { return }
                 self.previewLoading = false
-                if let url {
+                if let got {
                     // 只有完整文件才进缓存：半截文件留在缓存里 = 下次"播放失败"
-                    let size = (try? FileManager.default.attributesOfItem(atPath: url.path))?[.size] as? Int64 ?? 0
-                    // 用设备报的字节数当基准（PTP 的 byteSize 对大视频常偏大，不能拿来校验）
-                    let expected = self.previewBytesTotal
-                    if expected > 0, size > 0, size < expected {
-                        try? FileManager.default.removeItem(at: url)
-                        self.previewLoading = false
+                    let size = (try? FileManager.default.attributesOfItem(atPath: got.url.path))?[.size] as? Int64 ?? 0
+                    // 基准只认 AFC 报的**设备真实大小**（st_size 是准的）。
+                    // IC 的 totalUnitCount 对大视频常偏大，PTP 的 byteSize 更不准，
+                    // 拿它们判就会把「其实已经取完」误报成「取回不完整」。
+                    // planned == 0 表示这次没有可信基准，直接放行。
+                    if got.planned > 0, size > 0, size < got.planned {
+                        try? FileManager.default.removeItem(at: got.url)
                         self.previewError = "取回不完整，再试一次"
                         return
                     }
-                    self.rememberPreviewFile(url, for: id)
-                    self.previewVideoURL = url
+                    self.rememberPreviewFile(got.url, for: id)
+                    self.previewVideoURL = got.url
                 } else {
                     self.previewError = DeviceFiles.shared.lastError ?? "取不回来"
                 }
@@ -1455,12 +1623,14 @@ final class AppStore {
             // 已有小图就先把 loading 关掉；大图在后台换
             previewLoading = previewImage == nil
             previewError = nil
+            let token = DeviceFiles.shared.previewToken()
             Task {
                 // 预览要原图：整份下载 → 原生尺寸解码，不降采样、不重编码。
                 var cg: CGImage?
-                if let url = await self.downloadOriginal(for: asset,
-                                                         to: DeviceFiles.previewPhotoDirectory),
-                   let decoded = DeviceFiles.decodeOriginal(url, asset: asset) {
+                if let got = await self.downloadOriginal(for: asset,
+                                                         to: DeviceFiles.previewPhotoDirectory,
+                                                         isCancelled: { DeviceFiles.shared.isPreviewCancelled(token) }),
+                   let decoded = DeviceFiles.decodeOriginal(got.url, asset: asset) {
                     cg = decoded
                 } else {
                     // IC 取不到才退回 AFC
@@ -1485,10 +1655,12 @@ final class AppStore {
     /// 预览取原文件前，等相册库索引就绪（最多 10 秒）。
     /// 库里有 `ZDIRECTORY`/`ZFILENAME` 才能走 AFC 的 36 MB/s；
     /// 库没到就只能退回 IC 的单流下载，几百 MB 的视频会慢到超时。
-    private func waitForLibraryIndex(maxSeconds: Double = 20) async {
+    private func waitForLibraryIndex(maxSeconds: Double = 20, for id: Asset.ID? = nil) async {
         guard libraryIndex == nil, !usingFixture else { return }
         let deadline = Date().addingTimeInterval(maxSeconds)
         while libraryIndex == nil, Date() < deadline {
+            // 目标已经被换掉了就别再往界面写阶段文案（会盖掉新视频的进度）
+            if let id, previewID != id { return }
             // 让用户看到"在等什么"：库索引读到哪了
             previewStageText = "正在读取相册索引"
             previewProgressText = libraryBytesTotal > 0
@@ -1498,10 +1670,13 @@ final class AppStore {
         }
     }
 
+    /// 返回 `(url, planned)`：`planned` 是**可信的**完成基准字节数，0 表示这次没有基准
+    /// （IC / 名字匹配两条路都给不出准数）。完整性判定只认它，不认界面上的进度状态。
     private func downloadOriginal(for asset: Asset,
                                   to directory: URL,
-                                  onProgress: ((Int64, Int64) -> Void)? = nil) async -> URL? {
-        await waitForLibraryIndex()
+                                  isCancelled: (() -> Bool)? = nil,
+                                  onProgress: ((Int64, Int64) -> Void)? = nil) async -> (url: URL, planned: Int64)? {
+        await waitForLibraryIndex(for: asset.id)
         // 1) 最快且最准：库里有 `/ZDIRECTORY/ZFILENAME`，直接用绝对路径走 AFC（实测 36 MB/s）。
         //    IC 的 PTP 下载是单流小包，几百 MB 的视频会慢到超时（用户看到的 30 秒"没取到"）。
         if let meta = meta(asset) {
@@ -1513,21 +1688,35 @@ final class AppStore {
                 paths.append("/DCIM/\(dir)/\(meta.fileName)")
             }
             paths.append("/\(dir)/\(meta.fileName)")
-            if let url = await DeviceFiles.shared.downloadByDevicePath(paths, to: directory,
-                                                                      expected: asset.byteSize,
-                                                                      onProgress: onProgress) {
-                return url
+            DeviceFiles.trace("download path=\(paths[0]) alt=\(paths[1])")
+            if let hit = await DeviceFiles.shared.downloadByDevicePath(paths, to: directory,
+                                                                       expected: asset.byteSize,
+                                                                       onProgress: onProgress) {
+                return (hit.url, hit.planned)
+            }
+            DeviceFiles.trace("AFC 取不到，降级 IC：\(asset.fileName) err=\(DeviceFiles.shared.lastError ?? "-")")
+        } else {
+            DeviceFiles.trace("库里没有这条 → 直接走 IC：\(asset.fileName)")
+        }
+        // 2) 库里没有这条 / 库路径打不开：**先走 /DCIM 名字索引（AFC，36 MB/s）**。
+        //    PTP 报的名字看着是随机的（`HPQE7329.MP4`），磁盘上往往就是这个名字，
+        //    精确名匹配命中率不低；比 IC 单流快一个数量级，也不会"开头几秒一个字节都没有"。
+        if let url = await DeviceFiles.shared.download(fileName: asset.fileName,
+                                                       libraryName: meta(asset)?.fileName,
+                                                       to: directory,
+                                                       priority: true) {
+            DeviceFiles.trace("AFC 名字匹配命中：\(asset.fileName)")
+            return (url, 0)
+        }
+        // 3) 最后才是 IC 单流兜底（按对象句柄取，几十 MB 要等十几秒）
+        if let ptp = source as? PTPBridge {
+            if let url = await ptp.downloadOriginal(for: asset, to: directory,
+                                                    onProgress: onProgress,
+                                                    isCancelled: isCancelled) {
+                return (url, 0)
             }
         }
-        // 2) 库还没读到时：IC 按对象句柄下载
-        if let ptp = source as? PTPBridge,
-           let url = await ptp.downloadOriginal(for: asset, to: directory, onProgress: onProgress) {
-            return url
-        }
-        // 3) 最后才是名字匹配
-        return await DeviceFiles.shared.download(fileName: asset.fileName,
-                                                 libraryName: meta(asset)?.fileName,
-                                                 to: directory)
+        return nil
     }
 
     /// 按 id 找资产：PTP 枚举结果 → 库里的影子资产（已隐藏 / 最近删除 只存在这里）
@@ -1558,6 +1747,9 @@ final class AppStore {
     /// 缩略图诊断日志：只记「请求了什么、为什么没出图」，不记图片内容。
     /// 排查"某一屏全空"时让用户复现后直接看这个文件。
     @ObservationIgnored private var thumbLogWrites = 0
+    /// 这一轮里确定取不到的资产（设备端没缓存 + PTP 不回数据）。
+    /// 不清掉的话，格子被复用/滚动回来会again 等 8 秒视频超时；`bumpThumbEpoch` 时清空重试。
+    @ObservationIgnored private var thumbUnavailable: Set<Asset.ID> = []
 
     func thumbTrace(_ text: String) {
         guard thumbLogWrites < 4000 else { return }
@@ -1582,6 +1774,8 @@ final class AppStore {
     /// `requestThumbnail` 会以为"已经在取了"直接返回，那些格子就永远空着。
     func bumpThumbEpoch() {
         thumbEpoch &+= 1
+        // 换排序 / 换相簿 / 目录重枚举：给"上一轮取不到"的一次重试机会
+        thumbUnavailable.removeAll()
         for (id, task) in thumbTasks where thumbnails[id] == nil {
             task.cancel()
         }
@@ -1627,8 +1821,10 @@ final class AppStore {
     }
 
     private func loadThumbnail(_ asset: Asset) async {
-        // 滚动时快速掠过格子：等一小会儿再下，格子被回收就不为它拉原文件
-        try? await Task.sleep(nanoseconds: 140_000_000)
+        // 滚动时快速掠过格子：等一小会儿再下，格子被回收就不为它拉原文件。
+        // 现在主路径是「读设备端缩略图缓存」（单张 3–4 ms），不用再等 140 ms 那么久，
+        // 否则一屏格子的首帧延迟全被这段 sleep 占着。
+        try? await Task.sleep(nanoseconds: 60_000_000)
         if Task.isCancelled { return }
 
         // 切排序 / 换相簿 / 换筛选之后，上一屏的排队请求就不再需要了
@@ -1637,8 +1833,29 @@ final class AppStore {
             thumbTrace("drop(不在当前视图) \(asset.fileName)")
             return
         }
+        // 这一轮已经确认取不到（设备端没缓存、PTP 也不回）：别再为它等一次超时
+        let alreadyMissing = await MainActor.run { thumbUnavailable.contains(asset.id) }
+        if alreadyMissing {
+            thumbTrace("skip(本轮已确认取不到) \(asset.fileName)")
+            return
+        }
 
-        // 1) 设备端缩略图（照片和视频都有，实现 shouldGetThumbnailOf 之后才有）
+        // 1) **设备自己的缩略图缓存**：`/PhotoData/Thumbnails/V2/DCIM/<目录>/<文件名>/5005.JPG`。
+        //    照片和视频都有，一张 14–86 KB，实测单张 3–4 毫秒（iMazing 也读这套）。
+        //    这条必须排第一：它比问 PTP（超时+串行）和下整份原图（DNG 能到 72 MB）快三个数量级。
+        let info = await MainActor.run { meta(asset) }
+        if let data = await DeviceFiles.shared.deviceThumbnail(directory: info?.directory,
+                                                              fileName: info?.fileName ?? asset.fileName) {
+            await MainActor.run {
+                if let image = NSImage(data: data) {
+                    thumbTrace("cache-thumb \(asset.fileName) \(data.count)B")
+                    storeThumbnail(asset.id, image)
+                }
+            }
+            return
+        }
+
+        // 2) 设备端缩略图（PTP 主动请求）：缓存里没有（刚拍、刚导入、iCloud 未落地）时才走
         if let image = await source.thumbnail(for: asset, maxPixel: 480) {
             await MainActor.run {
                 thumbTrace("device-thumb \(asset.fileName)")
@@ -1647,13 +1864,21 @@ final class AppStore {
             return
         }
 
-        // 2) 视频：设备端缩略图没给就跳过。
+        // 3) 视频：这两条都不给就跳过。
         //    网格里下整片（一屏几 GB）不现实，抽帧那套已经删掉了。
-        if asset.kind == .video { return }
+        //    设备端缓存没有 + PTP 不回，就是"设备上真的没有这张图"（实测全库 4932 条里
+        //    只有极少数这种），登记下来别让它每次滚回来都再等 8 秒。
+        if asset.kind == .video {
+            await MainActor.run {
+                thumbUnavailable.insert(asset.id)
+                thumbTrace("no-thumb \(asset.fileName)（设备端缓存没有，PTP 未回数据）")
+            }
+            return
+        }
 
-        // 3) 照片：AFC 下原图 + 降采样
+        // 4) 照片：AFC 下原图 + 降采样
         let data = await DeviceFiles.shared.thumbnailData(for: asset,
-                                                          libraryName: meta(asset)?.fileName,
+                                                          libraryName: info?.fileName,
                                                           maxPixel: 480)
         await MainActor.run {
             // NSImage 一律在主线程创建，后台创建的拿到这里渲染是黑图
@@ -1661,6 +1886,7 @@ final class AppStore {
                 thumbTrace("ok(照片) \(asset.fileName) \(data.count)B")
                 storeThumbnail(asset.id, image)
             } else {
+                thumbUnavailable.insert(asset.id)
                 thumbTrace("fail(照片) \(asset.fileName) err=\(DeviceFiles.shared.lastError ?? "-")")
             }
         }
@@ -1685,7 +1911,7 @@ final class AppStore {
     /// 删掉所有落盘的设备数据：缩略图、相册库四件套、一次性原图/原视频。
     /// 返回**没删掉的**条目 —— 删不动要能看见，不能让界面假装"已清空"。
     @discardableResult
-    static func purgeLocalDataOnDisk() -> [String] {
+    nonisolated static func purgeLocalDataOnDisk() -> [String] {
         let fm = FileManager.default
         let root = fm.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
             .appendingPathComponent("cleanmyiphone", isDirectory: true)
@@ -1707,7 +1933,7 @@ final class AppStore {
     private(set) var purgeLeftovers: [String] = []
 
     /// 退出回调里拿不到 store 实例，用这个静态入口；勾了「自动清空」才清。
-    static func purgeOnTerminate() {
+    nonisolated static func purgeOnTerminate() {
         let on = (UserDefaults.standard.object(forKey: autoPurgeKey) as? Bool) ?? true
         guard on else { return }
         purgeLocalDataOnDisk()

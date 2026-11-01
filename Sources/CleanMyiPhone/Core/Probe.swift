@@ -7,17 +7,94 @@ enum Probe {
 
     private static let logURL = URL(fileURLWithPath: "/tmp/cmi-probe.log")
 
+    /// 信号源必须被保住，出了作用域就被回收，handler 也就没了
+    private static var signalSources: [DispatchSourceSignal] = []
+
+    /// 子进程收尾守卫：谁先要求退出，谁负责关 AFC / 关会话，关完立刻 `_exit`。
+    /// 不这么做，主进程超时 `kill` 掉的子进程会在手机侧留半截 AFC 连接，
+    /// 之后这台机器上所有 AFC 连接都会被设备直接关掉（实测三次 `--probe-afc` 全是「连接被关闭」）。
+    final class HelperGuard: @unchecked Sendable {
+        static let shared = HelperGuard()
+        private let lock = NSLock()
+        private var api: MobileDeviceAPI?
+        private var device: UnsafeMutableRawPointer?
+        private var afc: UnsafeMutableRawPointer?
+        private var finished = false
+
+        func attach(api: MobileDeviceAPI, device: UnsafeMutableRawPointer, afc: UnsafeMutableRawPointer) {
+            lock.lock(); defer { lock.unlock() }
+            self.api = api
+            self.device = device
+            self.afc = afc
+        }
+
+        /// 谁先触发谁生效；后来的直接睡死（第一个会在毫秒内 `_exit`）。
+        func shutdown(_ reason: String, code: Int32) {
+            lock.lock()
+            if finished {
+                lock.unlock()
+                Thread.sleep(forTimeInterval: 5)
+                _exit(code)
+            }
+            finished = true
+            let api = self.api
+            let device = self.device
+            let afc = self.afc
+            self.afc = nil
+            lock.unlock()
+
+            print("TEARDOWN \(reason)")
+            fflush(stdout)
+            if let api, let afc { api.closeAFC(afc) }
+            if let api, let device { api.stopSession(device) }
+            print("TEARDOWN \(reason) closed")
+            fflush(stdout)
+            _exit(code)
+        }
+    }
+
+    /// 子进程的两条兜底退出通路：
+    /// 1) SIGTERM / SIGINT —— 父进程超时 `terminate()` 或人按 Ctrl+C；
+    /// 2) 父进程死亡 —— 父进程把一根管道的写端挂成子进程的 stdin（自己永不写），
+    ///    父进程一死，子进程 `read(0,…)` 立刻 EOF。
+    /// `getppid() == 1` 那套只在 `report()` 里检查，卡在第一个 AFC 调用上就永远轮不到，
+    /// 而且被 `kill -9` 的父进程也不会让子进程走到任何回调。
+    private static func installHelperWatchdogs() {
+        for sig in [SIGTERM, SIGINT] {
+            signal(sig, SIG_IGN)
+            let source = DispatchSource.makeSignalSource(signal: sig, queue: .global(qos: .userInitiated))
+            source.setEventHandler {
+                HelperGuard.shared.shutdown("signal \(sig)", code: 4)
+            }
+            source.resume()
+            signalSources.append(source)
+        }
+        guard ProcessInfo.processInfo.environment["CMI_HELPER_GUARD"] == "1" else { return }
+        Thread.detachNewThread {
+            var byte: UInt8 = 0
+            while true {
+                let got = read(0, &byte, 1)
+                if got <= 0 {
+                    HelperGuard.shared.shutdown("parent gone", code: 3)
+                }
+            }
+        }
+    }
+
     /// 子进程入口：把 /PhotoData/Photos.sqlite 拉到指定路径。
     /// 单独成进程，是因为这根 AFC 读大文件的调用会随机把堆写坏，
     /// 放在主 App 进程里会把界面一起带崩。
     private static func fetchLibrary(to path: String) {
         var code: Int32 = 1
-        defer { exit(code) }
+        // 正常结束也走同一套收尾：先关 AFC、再关会话，最后才退。
+        defer { HelperGuard.shared.shutdown("done", code: code) }
+        installHelperWatchdogs()
         do {
             let api = try MobileDeviceAPI.shared()
             let device = try api.firstDevice()
             try api.openSession(device)
             let afc = try api.openAFC(device)
+            HelperGuard.shared.attach(api: api, device: device, afc: afc)
 
             let destination = URL(fileURLWithPath: path)
             let dir = destination.deletingLastPathComponent()
@@ -44,12 +121,24 @@ enum Probe {
             for (remote, _) in paths {
                 planned += api.entrySize(afc, path: remote)
             }
-            if planned <= 0 { planned = 1 }
+            // 四个文件一个大小都量不到 = AFC 通而不通（设备侧 afcd 卡住）。
+            // 别硬着头皮往下读：不给 SIZE，父进程 15 秒内就会判定失败并给出准确文案，
+            // 界面也不会显示「0 KB / 1 字节」这种假分母。
+            guard planned > 0 else {
+                print("ERR 读不到照片库大小，AFC 无响应")
+                fflush(stdout)
+                code = 5
+                return
+            }
             print("SIZE 0 \(planned)")
             fflush(stdout)
 
             var done: Int64 = 0
             func report(_ bytes: Int64) {
+                // 父进程被 kill / 崩溃后，这个子进程会变成孤儿继续占着 AFC，
+                // 下一个实例就抢不到设备、读库卡到超时（实测"读了 3 分钟"）。
+                // getppid() == 1 表示已被 launchd 收养 → 走收尾通路退出。
+                if getppid() == 1 { HelperGuard.shared.shutdown("orphan", code: 3) }
                 done = max(done, bytes)
                 print("PROGRESS \(done) \(planned)")
                 fflush(stdout)
@@ -172,6 +261,14 @@ enum Probe {
             probeDBOnly()
             return
         }
+        if CommandLine.arguments.contains("--probe-thumbs") {
+            probeThumbCache()
+            return
+        }
+        if CommandLine.arguments.contains("--probe-videos") {
+            probeVideoThumbs()
+            return
+        }
         if CommandLine.arguments.contains("--probe-md") {
             probeMobileDevice()
             return
@@ -271,6 +368,206 @@ enum Probe {
         }
 
         bridge.stop()
+        exit(0)
+    }
+
+
+    /// 视频缩略图为什么取不到：逐条比对「库里的 ZDIRECTORY/ZFILENAME」→
+    /// V2 缓存目录存在吗、末级文件叫什么、原片在不在、iCloud 是否已落地。
+    private static func probeVideoThumbs() {
+        let dbPath = PurgeGuard.dataDirectory + "/Photos.sqlite"
+        guard let index = PhotoLibraryIndex.load(dbPath: dbPath), !index.isEmpty else {
+            say("没有本地快照，先跑一次读库")
+            exit(1)
+        }
+        do {
+            let api = try MobileDeviceAPI.shared()
+            let device = try api.firstDevice(timeout: 15)
+            try api.openSession(device)
+            let afc = try api.openAFC(device)
+
+            // 全量审计：每一条资产都试一遍 V2 缓存 + 原片大小
+            let all = Array(index.metaByFile.values)
+            var hit = 0
+            var stubs: [(PhotoLibraryIndex.Meta, Int64)] = []      // 原片 0 字节（iCloud 离线）
+            var noThumb: [(PhotoLibraryIndex.Meta, Int64)] = []     // 没缓存但有原片
+            var tiny: [PhotoLibraryIndex.Meta] = []
+            for meta in all {
+                let dir = meta.directory.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+                let itemPath = "/PhotoData/Thumbnails/V2/\(dir)/\(meta.fileName)"
+                var got = false
+                for leaf in ["5005.JPG", "5003.JPG", "5007.JPG"] {
+                    if let data = try? api.readFile(afc, path: "\(itemPath)/\(leaf)", limit: 4 << 20),
+                       !data.isEmpty { got = true; break }
+                }
+                if !got {
+                    for leaf in ((try? api.listDirectory(afc, path: itemPath)) ?? []) where leaf.uppercased().hasSuffix(".JPG") {
+                        if let data = try? api.readFile(afc, path: "\(itemPath)/\(leaf)", limit: 4 << 20),
+                           !data.isEmpty { got = true; break }
+                    }
+                }
+                if got { hit += 1; continue }
+                var ref: UnsafeMutableRawPointer?
+                let status = api.openFileStatus(afc, path: "/\(dir)/\(meta.fileName)", &ref)
+                if let ref { api.closeFile(afc, ref) }
+                let diskSize = status == 0 ? api.entrySize(afc, path: "/\(dir)/\(meta.fileName)") : 0
+                if status != 0 { noThumb.append((meta, -1)) }
+                else if diskSize == 0 { stubs.append((meta, 0)) }
+                else { noThumb.append((meta, diskSize)) }
+                if meta.byteSize < 100_000 { tiny.append(meta) }
+            }
+            say("全量 \(all.count) 条：V2 命中 \(hit)，"
+                + "原片 0 字节 \(stubs.count)，有原片但没缩略图 \(noThumb.count)")
+            for (meta, disk) in stubs.prefix(8) {
+                say("  0字节 \(meta.fileName)  \(meta.directory)  库记 \(meta.byteSize) B  \(meta.isVideo ? "视频" : "照片")")
+            }
+            for (meta, disk) in noThumb.prefix(8) {
+                say("  无缓存 \(meta.fileName)  \(meta.directory)  库记 \(meta.byteSize) B  盘上 \(disk) B  \(meta.isVideo ? "视频" : "照片")")
+            }
+            say("其中不满 100 KB 的失败 \(tiny.count) 条：\(tiny.prefix(8).map(\.fileName).joined(separator: ","))")
+
+            // 第 4 层匹配（±2 秒 + 同种类）覆盖率自检：视频最容易需要它
+            var videoTotal = 0, videoResolved = 0, zeroHits = 0
+            let bySec = Dictionary(grouping: all) { Int($0.createdAt.timeIntervalSinceReferenceDate.rounded()) }
+            for meta in all where meta.isVideo {
+                videoTotal += 1
+                let base = Int(meta.createdAt.timeIntervalSinceReferenceDate.rounded())
+                let window = (-2...2).flatMap { bySec[base + $0] ?? [] }.filter(\.isVideo)
+                if window.isEmpty { zeroHits += 1 }
+                if index.meta(matchingTimeOf: meta.createdAt, isVideo: true) != nil { videoResolved += 1 }
+            }
+            let coverage = index.timeIndexCoverage
+            _ = coverage
+            _ = zeroHits
+            let ambiguous: [String] = []
+            let exampleNote = ambiguous.isEmpty ? "" : "  例：" + ambiguous.joined(separator: ",")
+            say("按拍摄时间±2秒匹配：视频 \(videoTotal) 条里能唯一定位 \(videoResolved)，有歧义 \(videoTotal - videoResolved)\(exampleNote)")
+            api.stopSession(device)
+        } catch {
+            say("失败：\(error.localizedDescription)")
+        }
+        exit(0)
+    }
+
+    private static func entrySizeOf(_ api: MobileDeviceAPI, _ afc: UnsafeMutableRawPointer, _ relative: String) -> Int64 {
+        for candidate in ["/\(relative)", "/DCIM/\(relative)"] {
+            let size = api.entrySize(afc, path: candidate)
+            if size > 0 { return size }
+        }
+        return 0
+    }
+
+    /// 设备端缩略图缓存探针：iMazing 直接读 `/PhotoData/Thumbnails/V2`
+    /// （见 imazing-reverse/FILESYSTEM.md）。这里确认目录结构、数量、单张大小，
+    /// 判断能不能用「批量 AFC 读几千张小图」替代「逐张问 PTP / 下整份原图」。
+    private static func probeThumbCache() {
+        do {
+            let api = try MobileDeviceAPI.shared()
+            let device = try api.firstDevice(timeout: 15)
+            try api.openSession(device)
+            let afc = try api.openAFC(device)
+            for dir in ["/PhotoData/Thumbnails", "/PhotoData/Thumbnails/V2"] {
+                let list = (try? api.listDirectory(afc, path: dir)) ?? []
+                say("\(dir)：\(list.count) 项  \(list.prefix(20).joined(separator: ", "))")
+                var files = 0
+                var total: Int64 = 0
+                var sample: String?
+                for entry in list.prefix(40) {
+                    let path = "\(dir)/\(entry)"
+                    let size = api.entrySize(afc, path: path)
+                    if size > 0 {
+                        files += 1
+                        total += size
+                        if sample == nil, size > 512, size < 400_000 { sample = path }
+                    }
+                }
+                say("  前 40 项里：文件 \(files) 个，合计 \(total) B，示例 \(sample ?? "-")")
+            }
+            // 下几张小图看看：大小 + 文件头（JPEG / HEIC / PLIST？）
+            for dir in ["/PhotoData/Thumbnails/V2/DCIM", "/PhotoData/Thumbnails/V2/PhotoData"] {
+                guard let sub = (try? api.listDirectory(afc, path: dir))?.first else { continue }
+                let subPath = "\(dir)/\(sub)"
+                let inner = (try? api.listDirectory(afc, path: subPath)) ?? []
+                say("\(subPath)：\(inner.count) 项  \(inner.prefix(10).joined(separator: ", "))")
+                for name in inner.prefix(4) {
+                    let path = "\(subPath)/\(name)"
+                    let size = api.entrySize(afc, path: path)
+                    let data = try? api.readFile(afc, path: path, limit: 64)
+                    let head = data?.prefix(12).map { String(format: "%02x", $0) }.joined() ?? "-"
+                    say("  \(name)  \(size) B  head=\(head)")
+                    // 里面还有一层：Apple 的 V2 缓存是 `<原文件名>/<缩略图名>.jpeg`
+                    let deeper = (try? api.listDirectory(afc, path: path)) ?? []
+                    if !deeper.isEmpty {
+                        say("    └ \(deeper.count) 项：\(deeper.prefix(6).joined(separator: ", "))")
+                        for leaf in deeper.prefix(3) {
+                            let leafPath = "\(path)/\(leaf)"
+                            let leafSize = api.entrySize(afc, path: leafPath)
+                            let leafData = try? api.readFile(afc, path: leafPath, limit: 16)
+                            let leafHead = leafData?.prefix(8).map { String(format: "%02x", $0) }.joined() ?? "-"
+                            say("      \(leaf)  \(leafSize) B  head=\(leafHead)")
+                        }
+                    }
+                }
+            }
+            // 视频也走同一套缓存吗？直接验一条 .MP4
+            let sampleDir = "/PhotoData/Thumbnails/V2/DCIM"
+            if let folder = (try? api.listDirectory(afc, path: sampleDir))?.first {
+                let folderPath = "\(sampleDir)/\(folder)"
+                let names = (try? api.listDirectory(afc, path: folderPath)) ?? []
+                for name in names where name.uppercased().hasSuffix(".MP4") || name.uppercased().hasSuffix(".MOV") {
+                    let itemPath = "\(folderPath)/\(name)"
+                    let leaves = (try? api.listDirectory(afc, path: itemPath)) ?? []
+                    say("视频缓存 \(name)：\(leaves.count) 项 \(leaves.prefix(5).joined(separator: ", "))")
+                    for leaf in leaves.prefix(3) {
+                        let leafPath = "\(itemPath)/\(leaf)"
+                        let leafSize = api.entrySize(afc, path: leafPath)
+                        let started = Date()
+                        let data = try? api.readFile(afc, path: leafPath, limit: 2_000_000)
+                        say("  \(leaf)  \(leafSize) B  读到 \(data?.count ?? 0) B，"
+                            + String(format: "%.0f ms", Date().timeIntervalSince(started) * 1000))
+                    }
+                }
+                // 直接按「原文件名/5005.JPG」这条路试一次，读整张
+                if let first = names.first(where: { !$0.hasSuffix("APPLE") }) {
+                    let direct = "\(folderPath)/\(first)/5005.JPG"
+                    let size = api.entrySize(afc, path: direct)
+                    let started = Date()
+                    let data = try? api.readFile(afc, path: direct, limit: 2_000_000)
+                    say("直读 \(direct)：\(size) B / 读到 \(data?.count ?? 0) B，"
+                        + String(format: "%.0f ms", Date().timeIntervalSince(started) * 1000))
+                }
+            }
+            // 用**真实库索引**里的 ZDIRECTORY/ZFILENAME 拼路径，验证生产代码那条拼法对不对
+            let dbPath = PurgeGuard.dataDirectory + "/Photos.sqlite"
+            if let index = PhotoLibraryIndex.load(dbPath: dbPath), !index.isEmpty {
+                let metas = Array(index.metaByFile.values.prefix(300))
+                var hit = 0
+                var miss = 0
+                var bytes = 0
+                var ms: Double = 0
+                var samples: [String] = []
+                for meta in metas {
+                    let dir = meta.directory.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+                    let path = "/PhotoData/Thumbnails/V2/\(dir)/\(meta.fileName)/5005.JPG"
+                    let started = Date()
+                    if let data = try? api.readFile(afc, path: path, limit: 4 << 20), !data.isEmpty {
+                        hit += 1
+                        bytes += data.count
+                        ms += Date().timeIntervalSince(started) * 1000
+                    } else {
+                        miss += 1
+                        if samples.count < 3 { samples.append(path) }
+                    }
+                }
+                say("按库索引拼路径：命中 \(hit) / 未命中 \(miss)，平均 "
+                    + String(format: "%.1f ms", hit > 0 ? ms / Double(hit) : 0)
+                    + "，平均 \(hit > 0 ? bytes / hit : 0) B")
+                for sample in samples { say("  未命中示例：\(sample)") }
+            }
+            api.stopSession(device)
+        } catch {
+            say("失败：\(error.localizedDescription)")
+        }
         exit(0)
     }
 

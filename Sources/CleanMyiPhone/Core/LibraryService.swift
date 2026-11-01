@@ -90,16 +90,19 @@ final class LibraryService {
         case timeout
         case nonIndex
         case locked
+        case channelClosed
         case incomplete(received: Int64, expected: Int64)
 
         var errorDescription: String? {
             switch self {
             case .timeout:
-                return "设备没有响应，检查是否已解锁并点过「信任」"
+                return "读相册索引超时，设备没响应。点「重新读取」重试"
             case .nonIndex:
                 return "照片库读取失败"
             case .locked:
                 return "iPhone 已锁屏，请先解锁屏幕再点刷新"
+            case .channelClosed:
+                return "手机的文件通道被系统关掉了（AFC 无响应）。拔插一次数据线、必要时重启 iPhone，再点「重新读取」"
             case .incomplete(let received, let expected):
                 let got = ByteCountFormatter.string(fromByteCount: received, countStyle: .file)
                 let all = ByteCountFormatter.string(fromByteCount: expected, countStyle: .file)
@@ -145,7 +148,47 @@ final class LibraryService {
         guard let api = try? MobileDeviceAPI(),
               let device = try? api.firstDevice(timeout: 3) else { return false }
         guard (try? api.openSession(device)) != nil else { return false }
+        // 用完必须 stopSession。这个方法在失败路径上会被反复调用（通道探针、
+        // 解锁轮询每 2 秒一次），只 open 不 stop 就是在设备上漏 lockdownd 会话；
+        // 漏够多了设备开始拒连，表现就是「手机的文件通道被系统关掉了」。
+        defer { api.stopSession(device) }
         return api.isLocked(device)
+    }
+
+    /// 清掉上一轮残留的 `--fetch-library` 辅助进程。
+    /// 它不随父进程退出（主进程被 kill 后会被 launchd 收养），
+    /// 几个叠在一起就互相抢 AFC，表现是「读相册索引卡几分钟」。
+    static func killStrayHelpers() {
+        // 先礼：SIGTERM 让子进程自己关 AFC、关会话再退（返回值 1 = 本来就没残留）
+        let soft = runPkill(["-f", "--", "--fetch-library"])
+        guard soft == 0 else { return }        // 没有残留，连等都不用等
+        // 给足 2.5 秒，和 stopHelper 一个标准。400 ms 就 -9 等于把「优雅收尾」
+        // 变成一次硬杀：卡在 AFC 调用里的子进程被打死后，设备侧 afcd 会留半截连接。
+        let deadline = Date().addingTimeInterval(2.5)
+        while Date() < deadline {
+            usleep(100_000)
+            // 第二次 SIGTERM 查询：pkill 的返回值取反就是「还剩几个」
+            let still = runPkill(["-0", "-f", "--", "--fetch-library"])
+            if still != 0 { break }
+        }
+        // 后兵：还在的就是真卡死了，只能硬杀（并且要接受通道可能变脏）
+        let hard = runPkill(["-9", "-f", "--", "--fetch-library"])
+        Self.dbg("已清理残留 fetch-library 进程（SIGTERM \(soft) / SIGKILL \(hard)）")
+    }
+
+    private static func runPkill(_ arguments: [String]) -> Int32 {
+        let tool = Process()
+        tool.executableURL = URL(fileURLWithPath: "/usr/bin/pkill")
+        tool.arguments = arguments
+        tool.standardOutput = FileHandle.nullDevice
+        tool.standardError = FileHandle.nullDevice
+        do {
+            try tool.run()
+        } catch {
+            return -1
+        }
+        tool.waitUntilExit()
+        return tool.terminationStatus
     }
 
     /// 有没有真机插着（只看通知，不开会话）
@@ -160,8 +203,9 @@ final class LibraryService {
                                     onFile: @escaping (String) -> Void) async throws -> Snapshot {
         progress(0.01)
 
-        // 锁屏检查放在最前面：这时还没起子进程，失败得快、提示得准
-        if Self.isDeviceLocked() {
+        // 锁屏检查放在最前面：这时还没起子进程，失败得快、提示得准。
+        // 但这一问本身也可能永远不返回（设备管子半死时），必须带超时。
+        if await withDeviceTimeout(4, fallback: false, { Self.isDeviceLocked() }) {
             throw ServiceError.locked
         }
 
@@ -216,7 +260,28 @@ final class LibraryService {
         process.arguments = ["--fetch-library", path]
         let pipe = Pipe()
         process.standardOutput = pipe
-        process.standardError = FileHandle.nullDevice
+        // 子进程 stderr 别丢：AFC 报错都写这儿，出问题时有据可查
+        let errPath = "/tmp/cmi-helper-err.log"
+        if ProcessInfo.processInfo.environment["CMI_DEBUG"] != nil {
+            FileManager.default.createFile(atPath: errPath, contents: nil)
+            if let errHandle = FileHandle(forWritingAtPath: errPath) {
+                try? errHandle.truncate(atOffset: 0)
+                process.standardError = errHandle
+            } else {
+                process.standardError = FileHandle.nullDevice
+            }
+        } else {
+            process.standardError = FileHandle.nullDevice
+        }
+
+        // 父进程死亡兜底：这根管道当子进程的 stdin，父进程永不打字。
+        // 父进程一死（哪怕被 kill -9），写端关闭，子进程 read(0,…) 立刻 EOF →
+        // 自己关掉 AFC 再退。这是唯一能盖住「卡在第一个 AFC 调用上」的通路。
+        let deathPipe = Pipe()
+        process.standardInput = deathPipe
+        var env = ProcessInfo.processInfo.environment
+        env["CMI_HELPER_GUARD"] = "1"
+        process.environment = env
 
         try process.run()
 
@@ -236,20 +301,40 @@ final class LibraryService {
         }
         pump.start()
 
-        // 看门狗：15 秒内连 SIZE 都没打出来，说明库根本打不开，别让界面干等
+        // 看门狗：30 秒内连 SIZE 都没打出来，说明库根本打不开（多半是设备被上一个
+        // 残留的辅助进程占着，或刚插线设备还在忙）。以前这里只是 break 出来再等 180 秒，
+        // 用户看到的就是"读相册索引 3 分钟"。
+        // 15 秒太急：设备刚枚举完、AFC 首个回包常常要 10 秒以上，一急就 SIGTERM 一个
+        // 正卡在 AFC 调用里的子进程，等于每次失败都赌一次「优雅收尾」。
         let start = Date()
-        while process.isRunning && Date().timeIntervalSince(start) < 15 {
+        while process.isRunning && Date().timeIntervalSince(start) < 30 {
             try? await Task.sleep(nanoseconds: 200_000_000)
             if pump.sawSize { break }
         }
         let sawSize = pump.sawSize
+        if !sawSize {
+            await stopHelper(process)
+            pump.stop()
+            Self.dbg("helper 30s 内没给出 SIZE，已终止")
+            if await withDeviceTimeout(4, fallback: false, { Self.isDeviceLocked() }) {
+                throw ServiceError.locked
+            }
+            // helper 全程零输出时靠探针定性：是通道被设备关了，还是它自己卡住了
+            switch await Self.afcChannelState() {
+            case .ok:
+                throw ServiceError.timeout
+            case .closed, .dead:
+                throw ServiceError.channelClosed
+            }
+        }
 
-        let deadline = Date().addingTimeInterval(180)
+        // 总时限 90 秒：296 MB 实测 8 秒读完，慢速 USB 也远不到 90 秒
+        let deadline = Date().addingTimeInterval(90)
         while process.isRunning && Date() < deadline {
             try? await Task.sleep(nanoseconds: 200_000_000)
         }
         if process.isRunning {
-            process.terminate()
+            await stopHelper(process)
             pump.stop()
             throw ServiceError.timeout
         }
@@ -259,13 +344,121 @@ final class LibraryService {
         for line in output.split(separator: "\n") where line.hasPrefix("CHECK ") {
             check = Int(line.dropFirst(6)) ?? 0
         }
-        Self.dbg("helper exit=\(process.terminationStatus) check=\(check) sawSize=\(sawSize)")
+        let totals = pump.byteTotals()
+        Self.dbg("helper exit=\(process.terminationStatus) check=\(check) sawSize=\(sawSize) "
+                 + "read=\(totals.done)/\(totals.planned)")
 
         // 子进程没能给出 SIZE 又没读到东西：多半是锁屏 / 会话被抢
-        if check == 0, !sawSize, Self.isDeviceLocked() {
+        if check == 0, !sawSize, await withDeviceTimeout(4, fallback: false, { Self.isDeviceLocked() }) {
             throw ServiceError.locked
         }
+
+        // **完整性刹车**：CHECK > 0 只证明「拿到的这份主库 + WAL 自洽」，
+        // 证明不了「和刚才量到的总大小一致」。AFC 半死时每个文件都会「成功地」只读回
+        // 一部分：只要主库最后一次 checkpoint 之前的内容还在，quick_check 就过、
+        // ZASSET 也有行 —— 于是把一份**缺了 WAL 里最新照片**的旧库当成成功快照，
+        // 界面上的视频数、体积全对不上（「数据都不对」就是这么来的）。
+        // 所以这里必须跟 SIZE 对账；对不上就报 incomplete，让上层保留上一份可用快照。
+        if check > 0, sawSize, totals.planned > 0 {
+            let short = totals.planned - totals.done
+            let tolerance = max(Int64(512 * 1024), totals.planned / 200)   // 0.5% 或 512 KB
+            if short > tolerance {
+                Self.dbg("读取不完整：\(totals.done)/\(totals.planned)（少 \(short) 字节）")
+                throw ServiceError.incomplete(received: totals.done, expected: totals.planned)
+            }
+        }
         return check
+    }
+
+    /// 让子进程退出：先 SIGTERM（它自己会关 AFC / 关会话再退），2.5 秒不退才 SIGKILL。
+    /// 直接 `kill -9` 是上一轮把手机 AFC 通道搞坏的元凶：连接没关，设备侧 afcd 留半截，
+    /// 之后所有 AFC 连接都被设备关掉。
+    @MainActor
+    private static func stopHelper(_ process: Process, grace: Double = 2.5) async {
+        guard process.isRunning else { return }
+        process.terminate()
+        let deadline = Date().addingTimeInterval(grace)
+        while process.isRunning && Date() < deadline {
+            try? await Task.sleep(nanoseconds: 100_000_000)
+        }
+        if process.isRunning {
+            Self.dbg("helper 没理会 SIGTERM，已 SIGKILL")
+            kill(process.processIdentifier, SIGKILL)
+        }
+        process.waitUntilExit()
+    }
+
+    enum AFCChannel { case ok, closed, dead }
+
+    /// 单独探一次 AFC：能连上、能读到已知文件的大小 = 通道正常。
+    /// 4 秒没回音也当通道不通 —— 设备侧 afcd 卡住时连 `openAFC` 都不回包。
+    static func afcChannelState(timeout: Double = 4) async -> AFCChannel {
+        await withCheckedContinuation { (continuation: CheckedContinuation<AFCChannel, Never>) in
+            let once = ProbeOnce()
+            Task.detached {
+                once.finish(probeAFCOnce(), continuation)
+            }
+            DispatchQueue.global().asyncAfter(deadline: .now() + timeout) {
+                once.finish(.dead, continuation)
+            }
+        }
+    }
+
+    /// 任何「问设备一句话」的阻塞调用都必须带上这个：
+    /// USB/AFC 那根管子半死的时候，`isDeviceLocked()` / `fetchDeviceStats()` 会**永远不返回**，
+    /// 而且它们都在 MainActor 上 → 界面直接卡死几分钟，看起来就是「读索引读了很久」。
+    /// 超时就用 fallback 继续往下走。
+    static func withDeviceTimeout<T: Sendable>(_ seconds: Double,
+                                               fallback: T,
+                                               _ work: @escaping @Sendable () -> T) async -> T {
+        await withCheckedContinuation { (continuation: CheckedContinuation<T, Never>) in
+            let box = OnceBox<T>()
+            Task.detached {
+                let value = work()
+                box.finish(value, continuation)
+            }
+            DispatchQueue.global().asyncAfter(deadline: .now() + seconds) {
+                box.finish(fallback, continuation)
+            }
+        }
+    }
+
+    private final class OnceBox<T: Sendable>: @unchecked Sendable {
+        private let lock = NSLock()
+        private var used = false
+
+        func finish(_ value: T, _ continuation: CheckedContinuation<T, Never>) {
+            lock.lock(); defer { lock.unlock() }
+            guard !used else { return }
+            used = true
+            continuation.resume(returning: value)
+        }
+    }
+
+    private static func probeAFCOnce() -> AFCChannel {
+        guard let api = try? MobileDeviceAPI.shared(),
+              let device = try? api.firstDevice(timeout: 3),
+              (try? api.openSession(device)) != nil,
+              let afc = try? api.openAFC(device) else { return .closed }
+        let size = api.entrySize(afc, path: "/PhotoData/Photos.sqlite")
+        api.closeAFC(afc)
+        // 探针也要关会话：它跑在失败路径上，每次判断「通道通不通」都留一个会话，
+        // 连续重试三次就是三个 —— 设备会开始拒连。
+        api.stopSession(device)
+        return size > 0 ? .ok : .closed
+    }
+
+    /// 只让第一个结果生效（探针与超时谁先到）
+    private final class ProbeOnce: @unchecked Sendable {
+        private let lock = NSLock()
+        private var used = false
+
+        func finish(_ value: AFCChannel, _ continuation: CheckedContinuation<AFCChannel, Never>) {
+            lock.lock(); defer { lock.unlock() }
+            guard !used else { return }
+            used = true
+            continuation.resume(returning: value)
+        }
     }
 
     /// 子进程 stdout 的按行读取器：AFC 下载在子进程里跑，父进程只收进度
@@ -275,6 +468,9 @@ final class LibraryService {
         private var buffer = Data()
         private var shown: [String] = []
         private var sawSizeLine = false
+        /// 子进程报的「计划总字节」与「已读字节」的终值，用来对账完整性
+        private var planned: Int64 = 0
+        private var done: Int64 = 0
         var onLine: (@Sendable (String) -> Void)?
 
         init(handle: FileHandle) { self.handle = handle }
@@ -282,6 +478,11 @@ final class LibraryService {
         var sawSize: Bool {
             lock.lock(); defer { lock.unlock() }
             return sawSizeLine
+        }
+
+        func byteTotals() -> (done: Int64, planned: Int64) {
+            lock.lock(); defer { lock.unlock() }
+            return (done, planned)
         }
 
         func start() {
@@ -302,6 +503,15 @@ final class LibraryService {
                     .trimmingCharacters(in: .whitespacesAndNewlines)
                 lines.append(line)
                 if line.hasPrefix("SIZE ") { sawSizeLine = true }
+                // `SIZE 0 <total>` / `PROGRESS <done> <total>`
+                if line.hasPrefix("SIZE ") || line.hasPrefix("PROGRESS ") {
+                    let fields = line.split(separator: " ")
+                    if fields.count >= 3,
+                       let got = Int64(fields[1]), let total = Int64(fields[2]), total > 0 {
+                        planned = max(planned, total)
+                        done = max(done, got)
+                    }
+                }
                 buffer.removeSubrange(buffer.startIndex...index)
             }
             shown.append(contentsOf: lines)
@@ -507,7 +717,21 @@ final class LibraryService {
         let api = try MobileDeviceAPI.shared()
         let device = try api.firstDevice(timeout: 10)
         try api.openSession(device)
+        defer { api.stopSession(device) }
         return readStats(api: api, device: device)
+    }
+
+    /// 同上，但**不在主线程上等**，还带超时。
+    /// `fetchDeviceStats()` 是 @MainActor 的，设备管子半死时它会把整个界面冻住
+    /// （表现：门禁一直转，日志也不再出新行）。失败路径一律走这个。
+    static func deviceStatsOffMain(timeout: Double = 6) async -> DeviceStats? {
+        await withDeviceTimeout(timeout, fallback: nil) { () -> DeviceStats? in
+            guard let api = try? MobileDeviceAPI.shared(),
+                  let device = try? api.firstDevice(timeout: 3),
+                  (try? api.openSession(device)) != nil else { return nil }
+            defer { api.stopSession(device) }
+            return readStats(api: api, device: device)
+        }
     }
 
     /// 区域/型号相关的现场，写到 App Support（和电池 dump 同一个地方）

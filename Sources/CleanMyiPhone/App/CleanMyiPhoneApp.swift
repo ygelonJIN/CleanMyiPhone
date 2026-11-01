@@ -12,6 +12,12 @@ struct CleanMyiPhoneApp: App {
             Probe.runIfRequested()
             exit(0)
         }
+        // 单实例：两个 App 进程会各起一个 helper 抢同一条 AFC 通道，
+        // 结果就是「相册索引读不出来」。命令行连起两次没有 LaunchServices 拦着。
+        guard SingleInstance.acquire() else {
+            SingleInstance.activateExisting()
+            exit(0)
+        }
         Probe.runIfRequested()
         store = AppStore()
     }
@@ -56,13 +62,19 @@ struct CleanMyiPhoneApp: App {
 /// 也避免窗口被恢复到不存在的显示器上。
 final class ApplicationDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
+        // 先装信号层的清场，再装崩溃栈追踪（后者会覆盖同名 handler，所以它内部也要调 unlink）
+        PurgeGuard.install()
         CrashTracer.install()
     }
 
-    /// 退出前清场：不留痕模式开着就连缩略图和相册库快照一起删
+    /// 退出前清场：不留痕模式开着就连缩略图和相册库快照一起删。
+    /// 这是四条退出通路里最正常的一条，其余三条见 `PurgeGuard`。
     func applicationWillTerminate(_ notification: Notification) {
         AppStore.purgeOnTerminate()
     }
+
+    /// 点窗口红点也算「退出」：进程若还留着就不清场，和「不留痕」的约定对不上
+    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
 
     func applicationSupportsSecureRestorableState(_ app: NSApplication) -> Bool { true }
     func applicationShouldRestoreApplicationState(_ app: NSApplication) -> Bool { false }
@@ -157,11 +169,20 @@ struct RootView: View {
             }
         }
         .overlay {
+            // 相册索引没读完就整页盖死（左右两栏一起）：这一阶段预览开了也只能干等，
+            // 库读完自动撤。暂停态 / 未连接 / 锁屏不盖，那几种情况要能操作。
+            if store.needsLibraryGate {
+                LibraryIndexGate()
+                    .transition(.opacity)
+            }
+        }
+        .overlay {
             if store.previewID != nil {
                 PreviewOverlay()
                     .transition(.opacity)
             }
         }
+        .animation(.easeInOut(duration: 0.15), value: store.needsLibraryGate)
         .animation(.easeInOut(duration: 0.12), value: store.previewID)
         .animation(.easeInOut(duration: 0.16), value: showSidebar)
         .animation(.easeInOut(duration: 0.16), value: showInspector)

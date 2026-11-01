@@ -92,14 +92,18 @@ struct OverviewView: View {
 
     private var barSegments: [StackedBar.Segment] {
         var list: [StackedBar.Segment] = []
-        if store.mediaPhotoBytes > 0 {
-            list.append(.init(label: "照片", value: Double(store.mediaPhotoBytes), color: Theme.photo))
-        }
-        if store.mediaVideoBytes > 0 {
-            list.append(.init(label: "视频", value: Double(store.mediaVideoBytes), color: Theme.video))
-        }
-        if store.appsBytes > 0 {
-            list.append(.init(label: "应用与数据", value: Double(store.appsBytes), color: Theme.app))
+        // 库索引没就绪时，媒体两段和应用与数据都是猜的（视频偏小、应用与数据虚高），
+        // 干脆不画，只留系统 / 回收站 / 可用这些设备自己报的实数。
+        if store.mediaBytesReady {
+            if store.mediaPhotoBytes > 0 {
+                list.append(.init(label: "照片", value: Double(store.mediaPhotoBytes), color: Theme.photo))
+            }
+            if store.mediaVideoBytes > 0 {
+                list.append(.init(label: "视频", value: Double(store.mediaVideoBytes), color: Theme.video))
+            }
+            if store.appsBytes > 0 {
+                list.append(.init(label: "应用与数据", value: Double(store.appsBytes), color: Theme.app))
+            }
         }
         if store.systemBytes > 0 {
             list.append(.init(label: "系统", value: Double(store.systemBytes), color: Theme.system))
@@ -111,16 +115,27 @@ struct OverviewView: View {
         return list
     }
 
+    /// 库索引没就绪时的占位：不给数字，也不给「0 项」这种同样是骗人的读数
+    private var mediaPending: String { "读取中…" }
+
     // MARK: - 卡片
 
     private var cardGrid: some View {
         LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 10), count: 3), spacing: 10) {
-            StatCard(title: "照片", value: AppStore.sizeText(store.mediaPhotoBytes),
-                     detail: "\(store.libraryPhotoCount) 项", color: Theme.photo)
-            StatCard(title: "视频", value: AppStore.sizeText(store.mediaVideoBytes),
-                     detail: "\(store.libraryVideoCount) 项", color: Theme.video)
-            StatCard(title: "应用与数据", value: AppStore.sizeText(store.appsBytes),
-                     detail: "\(store.userAppCount) 个 App + 文稿 + 系统数据 + 缓存", color: Theme.app)
+            StatCard(title: "照片",
+                     value: store.mediaBytesReady ? AppStore.sizeText(store.mediaPhotoBytes) : mediaPending,
+                     detail: store.mediaBytesReady ? "\(store.libraryPhotoCount) 项" : "等相册索引",
+                     color: Theme.photo)
+            StatCard(title: "视频",
+                     value: store.mediaBytesReady ? AppStore.sizeText(store.mediaVideoBytes) : mediaPending,
+                     detail: store.mediaBytesReady ? "\(store.libraryVideoCount) 项" : "等相册索引",
+                     color: Theme.video)
+            StatCard(title: "应用与数据",
+                     value: store.mediaBytesReady ? AppStore.sizeText(store.appsBytes) : mediaPending,
+                     detail: store.mediaBytesReady
+                        ? "\(store.userAppCount) 个 App + 文稿 + 系统数据 + 缓存"
+                        : "等相册索引",
+                     color: Theme.app)
             StatCard(title: "系统", value: AppStore.sizeText(store.systemBytes),
                      detail: "iOS 本体（系统分区）", color: Theme.system)
             StatCard(title: "可用", value: AppStore.sizeText(store.freeBytes),

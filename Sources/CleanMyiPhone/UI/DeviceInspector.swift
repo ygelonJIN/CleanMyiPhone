@@ -88,8 +88,8 @@ struct DeviceInspector: View {
         row("总容量", AppStore.sizeText(store.deviceCapacity))
         row("已用", AppStore.sizeText(store.usedBytes))
         row("可用", AppStore.sizeText(store.freeBytes))
-        row("照片", AppStore.sizeText(store.mediaPhotoBytes))
-        row("视频", AppStore.sizeText(store.mediaVideoBytes))
+        row("照片", store.mediaBytesReady ? AppStore.sizeText(store.mediaPhotoBytes) : "—")
+        row("视频", store.mediaBytesReady ? AppStore.sizeText(store.mediaVideoBytes) : "—")
         row("回收站", AppStore.sizeText(store.trash.totalBytes))
     }
 

@@ -10,9 +10,26 @@ final class SQLiteDB {
         private let values: [String: Any]
         init(_ values: [String: Any]) { self.values = values }
 
-        func int(_ key: String) -> Int { (values[key] as? Int64).map(Int.init) ?? 0 }
-        func int64(_ key: String) -> Int64 { values[key] as? Int64 ?? 0 }
-        func double(_ key: String) -> Double { values[key] as? Double ?? 0 }
+        // **SQLite 是动态类型的**：同一列在不同行可能是 integer 也可能是 real。
+        // `ZDATECREATED` 实测就是这样（本机 2328 行 integer / 2958 行 real）——
+        // 以前 `double()` 只认 `as? Double`，于是那 2328 条资产的拍摄时间全变成 0
+        // （= 2001-01-01），排序、按时间筛选、"新照片是否让快照过期"全跟着错。
+        func int(_ key: String) -> Int { Int(int64(key)) }
+
+        func int64(_ key: String) -> Int64 {
+            if let value = values[key] as? Int64 { return value }
+            if let value = values[key] as? Double { return Int64(value) }
+            if let value = values[key] as? NSNumber { return value.int64Value }
+            return 0
+        }
+
+        func double(_ key: String) -> Double {
+            if let value = values[key] as? Double { return value }
+            if let value = values[key] as? Int64 { return Double(value) }
+            if let value = values[key] as? NSNumber { return value.doubleValue }
+            return 0
+        }
+
         func string(_ key: String) -> String? { values[key] as? String }
     }
 

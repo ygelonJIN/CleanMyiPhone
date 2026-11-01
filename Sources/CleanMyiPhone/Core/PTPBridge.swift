@@ -52,6 +52,7 @@ final class PTPBridge: NSObject, DeviceSource {
     /// 设备端缩略图连续失败几次就关掉这条捷径，别让每张图都陪跑超时
     private var thumbTimeouts = 0
     private var thumbCircuitOpen = false
+    private var thumbCircuitOpenedAt: Date?
 
     func thumbnail(for asset: Asset, maxPixel: Int) async -> NSImage? {
         // 1) 已经收到过的
@@ -65,8 +66,20 @@ final class PTPBridge: NSObject, DeviceSource {
             return NSImage(cgImage: cg, size: NSSize(width: cg.width, height: cg.height))
         }
 
-        // 设备端缩略图这条路试了几次都不回，就关掉，直接走 AFC
-        if lock.withLock({ thumbCircuitOpen }) { return nil }
+        // 设备端缩略图这条路试了几次都不回，就先让开，直接走 AFC
+        if lock.withLock({ thumbCircuitOpen }) {
+            // 熔断是「暂时别试」，不是永久关闭：30 秒后放一次请求进去探路。
+            // 否则一次设备抖动就会让整屏**视频**永久空白 —— 视频只有这一条路。
+            let cooled = lock.withLock { () -> Bool in
+                guard thumbCircuitOpen, let opened = thumbCircuitOpenedAt,
+                      Date().timeIntervalSince(opened) > 30 else { return false }
+                thumbCircuitOpen = false
+                thumbTimeouts = 0
+                thumbCircuitOpenedAt = nil
+                return true
+            }
+            if !cooled { return nil }
+        }
 
         // 3) **主动向设备要**。iMazing 就是这么做的：
         //    `-[ICCameraItem requestThumbnail]` 没有 completion，
@@ -100,7 +113,12 @@ final class PTPBridge: NSObject, DeviceSource {
                     }
                 }
             }
-            DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
+            // 超时按种类给（原来一律 1.5 秒，太短）：刚进照片页时设备还在枚举，
+            // 几百 KB 的缩略图走 PTP 单流经常要两三秒才回来。1.5 秒一超、连续三次
+            // 就熔断整条捷径，之后所有格子（尤其是只有这一条路的视频）永远空白。
+            // 照片还有 AFC 兜底，等 3 秒就够了；视频没有别的路，多给一点。
+            let wait: TimeInterval = asset.kind == .video ? 8 : 3
+            DispatchQueue.main.asyncAfter(deadline: .now() + wait) { [weak self] in
                 guard let self else { return }
                 if !once.claimed {
                     Self.debugThumbLog("超时 \(asset.fileName) \(Int(Date().timeIntervalSince(started) * 1000))ms")
@@ -112,13 +130,15 @@ final class PTPBridge: NSObject, DeviceSource {
         return image
     }
 
-    /// 连续失败 3 次就把设备端缩略图这条捷径关掉
+    /// 连续失败 8 次才把设备端缩略图这条捷径关掉。
+    /// 阈值 3 太容易踩到：设备忙起来前三个请求就会超时，之后整屏都是空的。
     private func noteThumbFailure() {
         lock.lock()
         thumbTimeouts += 1
-        if thumbTimeouts >= 3 {
+        if thumbTimeouts >= 8 {
             thumbCircuitOpen = true
-            Self.debugThumbLog("设备端缩略图连续失败 3 次，本次会话不再尝试")
+            thumbCircuitOpenedAt = Date()
+            Self.debugThumbLog("设备端缩略图连续失败 \(thumbTimeouts) 次，本次会话不再尝试")
         }
         lock.unlock()
     }
@@ -146,14 +166,21 @@ final class PTPBridge: NSObject, DeviceSource {
     /// 用 ImageCaptureCore 自己的下载接口取**原始文件**。
     /// 它按设备端的对象句柄取，不需要我们把文件名猜对 ——
     /// 之前「DCIM 里找不到」就是因为拿 PTP 的名字去 AFC 的目录索引里匹配，注定要错。
+    ///
+    /// `isCancelled`：IC 的下载没有可用的取消通路，只靠 60 秒兜底太久。
+    /// 调用方（预览）换目标 / 关预览时传进来，这里 0.2 秒问一次，一过期就掐掉。
     func downloadOriginal(for asset: Asset,
                           to directory: URL,
-                          onProgress: ((Int64, Int64) -> Void)? = nil) async -> URL? {
+                          onProgress: ((Int64, Int64) -> Void)? = nil,
+                          onFinished: ((Int64, Int64) -> Void)? = nil,
+                          isCancelled: (() -> Bool)? = nil) async -> URL? {
         guard let file = lock.withLock({ filesByID[asset.id] }) else {
+            DeviceFiles.trace("IC 没有这条资产：\(asset.fileName)")
             reenumerateIfNeeded()
             return nil
         }
         let name = asset.fileName
+        DeviceFiles.trace("IC download start \(name)")
         return await withCheckedContinuation { (continuation: CheckedContinuation<URL?, Never>) in
             var finished = false
             let finish: (URL?) -> Void = { url in
@@ -168,8 +195,14 @@ final class PTPBridge: NSObject, DeviceSource {
                 ICDownloadOption.saveAsFilename: name
             ]
             var timer: Timer?
-            let progressRef = file.requestDownload(options: options) { filename, error in
+            var cancelTimer: Timer?
+            var progressRef: Progress?
+            func stopTimers() {
                 timer?.invalidate()
+                cancelTimer?.invalidate()
+            }
+            progressRef = file.requestDownload(options: options) { filename, error in
+                stopTimers()
                 if let error {
                     Self.debugThumbLog("IC 下载失败 \(name)：\(error.localizedDescription)")
                     finish(nil)
@@ -178,12 +211,19 @@ final class PTPBridge: NSObject, DeviceSource {
                 if let filename, !filename.isEmpty {
                     let url = URL(fileURLWithPath: filename)
                     if FileManager.default.fileExists(atPath: url.path) {
+                        if let progressRef, let onFinished {
+                            onFinished(progressRef.completedUnitCount, progressRef.totalUnitCount)
+                        }
                         finish(url)
                         return
                     }
                 }
                 let fallback = directory.appendingPathComponent(name)
-                finish(FileManager.default.fileExists(atPath: fallback.path) ? fallback : nil)
+                guard FileManager.default.fileExists(atPath: fallback.path) else { finish(nil); return }
+                if let progressRef, let onFinished {
+                    onFinished(progressRef.completedUnitCount, progressRef.totalUnitCount)
+                }
+                finish(fallback)
             }
             // 有进度就报给界面：让用户看到"已取回 40%"，而不是一句干等的提示
             if let progressRef, let onProgress {
@@ -192,9 +232,21 @@ final class PTPBridge: NSObject, DeviceSource {
                     if progressRef.isFinished || progressRef.isCancelled { t.invalidate() }
                 }
             }
+            // 换目标 / 关预览：0.2 秒内掐断，别让旧视频继续独占 PTP 单流
+            if let isCancelled {
+                cancelTimer = Timer.scheduledTimer(withTimeInterval: 0.2, repeats: true) { t in
+                    guard isCancelled() else { return }
+                    t.invalidate()
+                    progressRef?.cancel()
+                    Self.debugThumbLog("IC 下载被作废 \(name)")
+                    let fallback = directory.appendingPathComponent(name)
+                    try? FileManager.default.removeItem(at: fallback)
+                    finish(nil)
+                }
+            }
             // 60 秒兜底：首屏刚打开时设备可能在忙枚举，给足时间；超过就报错
             DispatchQueue.main.asyncAfter(deadline: .now() + 60) {
-                timer?.invalidate()
+                stopTimers()
                 finish(nil)
             }
         }

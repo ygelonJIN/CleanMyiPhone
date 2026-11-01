@@ -28,6 +28,9 @@ enum CrashTracer {
                     backtrace_symbols_fd(&frames, count, crashFD)
                 }
                 crashLog("--- end ---\n")
+                // 崩溃也要尽量清场：这里会覆盖 PurgeGuard 装上的同名 handler，
+                // 所以顺手把同样的 unlink 做一次（异步信号安全）
+                PurgeGuard.unlinkSensitiveFiles()
                 _ = Darwin.signal(signalNumber, SIG_DFL)
                 raise(signalNumber)
             }

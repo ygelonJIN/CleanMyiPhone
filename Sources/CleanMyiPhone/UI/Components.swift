@@ -390,3 +390,94 @@ struct CollapseButton: View {
         .help(hint)
     }
 }
+
+/// 相册索引没读完时的全屏遮罩：盖死整个窗口内容区，什么都点不了。
+///
+/// 和启动那一层同样的做法（`.thickMaterial` 铺满 + 一块卡片）。
+/// 这一阶段预览拿不到设备上的真实路径，空格只能干等；让人看见「在等什么」，
+/// 比让人点进去发现没反应更清楚。进度只报字节，不报百分比 ——
+/// 分母是四个文件的大小之和，和真实读取量不完全对应。
+struct LibraryIndexGate: View {
+    @Environment(AppStore.self) private var store
+
+    var body: some View {
+        ZStack {
+            Rectangle()
+                .fill(.thickMaterial)
+                .ignoresSafeArea()
+                .contentShape(Rectangle())
+
+            // 读失败时必须给出口：以前这里只有转圈，库读挂了也一直转，
+            // 用户看到的就成了「读了 3 分钟还在读」。
+            if let status = store.libraryStatus {
+                failedState(status)
+            } else {
+                progressState
+            }
+        }
+        // 整块吃掉点击：底下侧栏、网格、右栏都点不到
+        .allowsHitTesting(true)
+    }
+
+    private var progressState: some View {
+        VStack(spacing: 12) {
+            ProgressView().controlSize(.large)
+            VStack(spacing: 3) {
+                Text("正在读取相册索引")
+                    .font(.system(size: 14, weight: .medium))
+                if store.libraryBytesTotal > 0 {
+                    Text("\(AppStore.sizeText(store.libraryBytesDone)) / \(AppStore.sizeText(store.libraryBytesTotal))")
+                        .font(.system(size: 16, weight: .semibold, design: .rounded))
+                        .monospacedDigit()
+                        .foregroundStyle(.secondary)
+                }
+            }
+            if store.libraryBytesTotal > 0 {
+                ProgressView(value: min(1, Double(store.libraryBytesDone) / Double(max(store.libraryBytesTotal, 1))))
+                    .progressViewStyle(.linear)
+                    .frame(width: 320)
+            }
+            Text("读完就能浏览与预览")
+                .font(.caption2)
+                .foregroundStyle(.tertiary)
+        }
+        .padding(20)
+    }
+
+    private func failedState(_ status: String) -> some View {
+        VStack(spacing: 10) {
+            Image(systemName: "exclamationmark.triangle")
+                .font(.system(size: 22))
+                .foregroundStyle(.orange)
+            Text("相册索引没读出来")
+                .font(.system(size: 14, weight: .medium))
+            Text(status)
+                .font(.caption)
+                .multilineTextAlignment(.center)
+                .foregroundStyle(.secondary)
+                .frame(maxWidth: 320)
+            if store.libraryRetrying {
+                HStack(spacing: 6) {
+                    ProgressView().controlSize(.small)
+                    Text("正在重试…")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
+            }
+            Button("重新读取") {
+                Task { await store.retryLibraryNow() }
+            }
+            .buttonStyle(.borderedProminent)
+            .controlSize(.small)
+            .disabled(store.libraryRetrying)
+            Text(store.libraryAutoRetryStopped
+                 ? "已停止自动重试（连续失败 \(store.libraryFailureCount) 次）。拔插一次数据线、必要时重启 iPhone，再点「重新读取」"
+                 : "可以先退出预览面板，插好数据线、解锁手机后再点一次")
+                .font(.caption2)
+                .multilineTextAlignment(.center)
+                .foregroundStyle(.tertiary)
+                .frame(maxWidth: 340)
+        }
+        .padding(20)
+    }
+}

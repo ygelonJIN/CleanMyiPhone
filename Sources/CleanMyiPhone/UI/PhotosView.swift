@@ -107,8 +107,10 @@ struct PhotosView: View {
         // 相册库还没读完：整页盖一层进度，读完自动撤。
         // 这段时间预览也开不了（没有库就拿不到设备上的真实路径）。
         .overlay {
-            // 只要库索引还没有，就盖一层——不管扫描是在跑还是被清空暂停了
-            if store.libraryIndex == nil, !store.usingFixture {
+            // 库索引没读完的普通情况已经由根视图那层全屏遮罩接走（`needsLibraryGate`）；
+            // 这里只留**暂停态**：「本机数据已清空」要让用户看得到，并且左下角
+            // 「重新读取」必须点得动，所以不能走那层盖死的遮罩。
+            if store.dataPaused {
                 Color.black.opacity(0.001)
                     .ignoresSafeArea()
                 libraryGate
