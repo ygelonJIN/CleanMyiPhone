@@ -208,43 +208,29 @@ extension EnvironmentValues {
     }
 }
 
-/// 每个页面自己的浮动标题行：和内容同一个左右内边距，不画分隔线、不占一条顶栏
-struct DetailHeader<Trailing: View>: View {
-    let title: String
-    var subtitle: String?
-    /// 二级栏已经显示标题时（照片页），这里就不再重复一遍
-    var showTitle: Bool = true
-    @ViewBuilder var trailing: () -> Trailing
-
-    @Environment(\.sidebarVisible) private var sidebarVisible
-    @Environment(\.inspectorVisible) private var inspectorVisible
+/// 顶栏：**没有标题**，一页只有一个控件组，永远正中对齐。
+///
+/// 2026-11 用户定的规矩：
+/// - 所有页面（概览 / 照片 / 相簿 / 回收站）都**不放标题**，原来那行大标题全删；
+/// - 控件组**永远居中**，窗口拉宽拉窄都不许往左或往右跑；
+/// - 整组 `.fixedSize` 不许被压扁，靠「内容区最小 500 − 左右内边距 36」这条预算保证
+///   放得下（见 AGENTS.md 的顶栏宽度表），不再叠一层横向 ScrollView ——
+///   那层兜底才是把右侧刷新按钮裁掉的元凶。
+struct PageToolbar<Trailing: View>: View {
+    /// 整组控件之间的间距统一 8，别每个页面自己定
+    var spacing: CGFloat = 8
+    @ViewBuilder var content: () -> Trailing
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            HStack(alignment: .center, spacing: 10) {
-                if showTitle {
-                    VStack(alignment: .leading, spacing: 1) {
-                        Text(title)
-                            .font(.system(size: 16, weight: .semibold))
-                        if let subtitle, !subtitle.isEmpty {
-                            Text(subtitle)
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-                                .lineLimit(1)
-                        }
-                    }
-                } else if let subtitle, !subtitle.isEmpty {
-                    Text(subtitle)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .lineLimit(1)
-                }
-                Spacer(minLength: 16)
-                trailing()
-            }
-            .padding(.horizontal, 18)
-            .padding(.bottom, 8)
+        HStack(spacing: spacing) {
+            content()
         }
+        .fixedSize(horizontal: true, vertical: false)
+        .frame(maxWidth: .infinity, alignment: .center)
+        // 右边多留 4pt：刷新按钮贴着边缘时最容易被裁/被滚动条压住
+        .padding(.leading, 18)
+        .padding(.trailing, 22)
+        .padding(.vertical, 8)
     }
 }
 
@@ -289,20 +275,56 @@ struct StackedBar: View {
 
     let segments: [Segment]
     var height: CGFloat = 14
+    /// 0…1：进场时让每一段从 0 长到真实宽度（概览首屏的"长出来"）
+    var progress: Double = 1
 
     var body: some View {
         GeometryReader { proxy in
             let total = max(segments.reduce(0) { $0 + $1.value }, 0.0001)
-            HStack(spacing: 2) {
+            // 段与段之间留 3pt：贴死会看成一根整条，看不出是几块拼起来的
+            HStack(spacing: 3) {
                 ForEach(segments) { segment in
                     RoundedRectangle(cornerRadius: 4, style: .continuous)
                         .fill(segment.color)
-                        .frame(width: max(2, proxy.size.width * segment.value / total))
+                        .frame(width: max(2, proxy.size.width * progress * segment.value / total))
                 }
             }
         }
         .frame(height: height)
         .clipShape(RoundedRectangle(cornerRadius: 4, style: .continuous))
+    }
+}
+
+/// 卡片底：14pt 圆角 + 极淡的顶部高光 + 1px 细边 + 很轻的投影。
+/// 概览的 6 张卡片和两张排行块都用它，口径一致、不各写一套。
+struct CardSurface: ViewModifier {
+    var radius: CGFloat = 14
+    /// 高亮描边（悬停/联动时才给颜色，平时是透明）
+    var border: Color?
+
+    func body(content: Content) -> some View {
+        content
+            .background {
+                RoundedRectangle(cornerRadius: radius, style: .continuous)
+                    .fill(.background.secondary)
+                    .overlay {
+                        // 自上而下的极淡高光：苹果那种"有一点玻璃感"的卡片
+                        LinearGradient(colors: [Color.white.opacity(0.12), .clear],
+                                       startPoint: .top, endPoint: .bottom)
+                            .clipShape(RoundedRectangle(cornerRadius: radius, style: .continuous))
+                    }
+            }
+            .overlay {
+                RoundedRectangle(cornerRadius: radius, style: .continuous)
+                    .strokeBorder(border ?? Color.primary.opacity(0.07), lineWidth: 1)
+            }
+            .shadow(color: .black.opacity(0.06), radius: 7, y: 2)
+    }
+}
+
+extension View {
+    func cardSurface(radius: CGFloat = 14, border: Color? = nil) -> some View {
+        modifier(CardSurface(radius: radius, border: border))
     }
 }
 
@@ -314,35 +336,36 @@ struct StatCard: View {
     var highlighted: Bool = false
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 5) {
-            HStack(spacing: 5) {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 7) {
                 if let color {
-                    Circle().fill(color).frame(width: 7, height: 7)
+                    RoundedRectangle(cornerRadius: 3, style: .continuous)
+                        .fill(color)
+                        .frame(width: 10, height: 10)
+                        .shadow(color: color.opacity(0.35), radius: 2, y: 1)
                 }
                 Text(title)
-                    .font(.caption)
+                    .font(.system(size: 13, weight: .semibold))
                     .foregroundStyle(.secondary)
+                    .lineLimit(1)
             }
             Text(value)
-                .font(.system(size: 21, weight: .semibold, design: .rounded))
+                .font(.system(size: 23, weight: .semibold, design: .rounded))
                 .monospacedDigit()
                 .lineLimit(1)
                 .minimumScaleFactor(0.7)
             Text(detail)
-                .font(.caption2)
+                .font(.system(size: 11))
                 .foregroundStyle(.tertiary)
                 .lineLimit(1)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
-        .padding(13)
-        .background(
-            RoundedRectangle(cornerRadius: 11, style: .continuous)
-                .fill(.background.secondary)
-        )
-        .overlay(
-            RoundedRectangle(cornerRadius: 11, style: .continuous)
-                .stroke(highlighted ? (color ?? .accentColor) : .clear, lineWidth: 2)
-        )
+        // 统一最小高度：三行文字（标题/数值/说明）本来就该有这么多，
+        // 窗口拉窄、换列数时同一行的卡片不会被压成一条
+        .frame(minHeight: 88, alignment: .leading)
+        .padding(.horizontal, 14)
+        .padding(.vertical, 13)
+        .cardSurface(border: highlighted ? (color ?? .accentColor).opacity(0.75) : nil)
     }
 }
 
@@ -391,12 +414,70 @@ struct CollapseButton: View {
     }
 }
 
+/// 窗口级键盘监听：把 keyDown 直接交给 store，**不依赖 SwiftUI 焦点**。
+///
+/// 为什么不用 `.onKeyPress`：那套要求焦点正好在根视图上。鼠标点过预览里的键帽按钮、
+/// 或者播放器拿到 first responder 之后，⌫ / ⏎ 就收不到 —— 用户报的
+/// 「预览里按退格没用」就是这个。local monitor 只看窗口，与焦点无关。
+///
+/// 输入框（搜索框）拿到焦点时**让路**，否则打字会被吞。
+struct KeyMonitor: NSViewRepresentable {
+    /// 返回 true 表示已处理（事件被吞掉）
+    let handle: (NSEvent) -> Bool
+
+    final class MonitorView: NSView {
+        var handle: ((NSEvent) -> Bool)?
+        private var monitor: Any?
+
+        override func viewDidMoveToWindow() {
+            super.viewDidMoveToWindow()
+            install()
+        }
+
+        private func install() {
+            remove()
+            guard let window else { return }
+            monitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
+                guard let self, event.window === window else { return event }
+                // 正在输入框里打字：一个键都不许抢
+                if let responder = window.firstResponder,
+                   responder is NSTextView || responder is NSTextField {
+                    return event
+                }
+                return (self.handle?(event) == true) ? nil : event
+            }
+        }
+
+        private func remove() {
+            if let monitor { NSEvent.removeMonitor(monitor) }
+            monitor = nil
+        }
+
+        deinit {
+            if let monitor { NSEvent.removeMonitor(monitor) }
+        }
+    }
+
+    func makeNSView(context: Context) -> NSView {
+        let view = MonitorView()
+        view.handle = handle
+        return view
+    }
+
+    func updateNSView(_ nsView: NSView, context: Context) {
+        (nsView as? MonitorView)?.handle = handle
+    }
+}
+
 /// 相册索引没读完时的全屏遮罩：盖死整个窗口内容区，什么都点不了。
 ///
-/// 和启动那一层同样的做法（`.thickMaterial` 铺满 + 一块卡片）。
-/// 这一阶段预览拿不到设备上的真实路径，空格只能干等；让人看见「在等什么」，
-/// 比让人点进去发现没反应更清楚。进度只报字节，不报百分比 ——
-/// 分母是四个文件的大小之和，和真实读取量不完全对应。
+/// 三条口径（2026-11）：
+/// 1. **任何页面都盖**（概览页也盖），并且**点了「重新读取」之后继续盖着读** ——
+///    用户原话「不要先进去再读取」。以前重试时 `libraryStatus` 不清、门禁又被
+///    `isDeviceLocked` 关掉，界面就掉回了正常页面。
+/// 2. 锁屏不算失败：盖着写「设备已锁屏 / 解锁后自动继续读取」，解锁由
+///    `unlockWatch` 探到后自动重读。
+/// 3. 只有「没在读 + 有失败原因」才画失败卡；重新读取期间把失败原因留成一行小字。
 struct LibraryIndexGate: View {
     @Environment(AppStore.self) private var store
 
@@ -407,29 +488,56 @@ struct LibraryIndexGate: View {
                 .ignoresSafeArea()
                 .contentShape(Rectangle())
 
-            // 读失败时必须给出口：以前这里只有转圈，库读挂了也一直转，
-            // 用户看到的就成了「读了 3 分钟还在读」。
-            if let status = store.libraryStatus {
-                failedState(status)
-            } else {
-                progressState
-            }
+            content
+                .transition(.dialog)
         }
         // 整块吃掉点击：底下侧栏、网格、右栏都点不到
         .allowsHitTesting(true)
     }
 
+    @ViewBuilder
+    private var content: some View {
+        if store.isDeviceLocked {
+            lockedState
+        } else if store.libraryReadingNow || store.libraryStatus == nil {
+            progressState
+        } else if let status = store.libraryStatus {
+            failedState(status)
+        } else {
+            progressState
+        }
+    }
+
+    /// 锁屏：不是错误，就是得等。自动探测，不用用户回来点「重新读取」。
+    private var lockedState: some View {
+        VStack(spacing: 12) {
+            Image(systemName: "lock.fill")
+                .font(.system(size: 22, weight: .medium))
+                .foregroundStyle(.orange)
+            VStack(spacing: 3) {
+                Text("设备已锁屏")
+                    .font(.system(size: 14, weight: .medium))
+                Text("解锁 iPhone 后会自动继续读取，不用回来点")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .frame(width: 320)
+            }
+            ProgressView()
+                .progressViewStyle(.linear)
+                .frame(width: 320)
+        }
+        .padding(20)
+    }
+
     /// 读取中的那一屏。
     /// **三行固定**：标题 / 正在读哪个文件 + 已读多少 / 进度条。
-    /// 以前只有「`libraryBytesTotal > 0` 才显示字节和进度条」，而总量要等子进程打出
-    /// `SIZE` 才有 —— 那之前用户只看到一个空转的圈，和「另一个遮罩」长得完全不一样。
-    /// 现在总量没到就显示进度**不确定态** + 「已读 x MB」，两种状态长得一致。
+    /// 总量要等子进程打出 `SIZE` 才有 —— 那之前进度条走不确定态，两种状态长得一致。
     private var progressState: some View {
         VStack(spacing: 12) {
             ProgressView().controlSize(.large)
 
             VStack(spacing: 3) {
-                Text("正在读取相册索引")
+                Text(store.libraryRetrying ? "正在重新读取相册索引" : "正在读取相册索引")
                     .font(.system(size: 14, weight: .medium))
                 Text(store.libraryFileStage.isEmpty
                      ? "正在等手机回包"
@@ -456,11 +564,21 @@ struct LibraryIndexGate: View {
                     .frame(width: 320)
             }
 
-            Text("读完就能浏览与预览（约 8 秒）")
-                .font(.caption2)
-                .foregroundStyle(.tertiary)
+            // 重试时把上一次失败的原因留成一行小字：既不闪回失败卡，也不丢掉线索
+            if let status = store.libraryStatus {
+                Text(status)
+                    .font(.caption2)
+                    .foregroundStyle(.tertiary)
+                    .multilineTextAlignment(.center)
+                    .frame(maxWidth: 340)
+            } else {
+                Text("读完就能浏览与预览（约 8 秒）")
+                    .font(.caption2)
+                    .foregroundStyle(.tertiary)
+            }
         }
         .padding(20)
+        .animation(Motion.fade, value: store.libraryRetrying)
     }
 
     private var byteLine: String {

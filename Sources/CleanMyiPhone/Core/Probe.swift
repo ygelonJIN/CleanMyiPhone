@@ -1,4 +1,5 @@
 import AppKit
+import AVFoundation
 import Foundation
 
 /// 真机探针：不启动界面，直接枚举一次并打印结果。
@@ -331,6 +332,23 @@ enum Probe {
         }
         if CommandLine.arguments.contains("--probe-house") {
             probeHouse()
+            return
+        }
+        if CommandLine.arguments.contains("--probe-airlock") {
+            probeAirlock()
+            return
+        }
+        if CommandLine.arguments.contains("--probe-upload") {
+            probeUpload()
+            return
+        }
+        if CommandLine.arguments.contains("--probe-livefiles") {
+            probeLiveFiles()
+            return
+        }
+        if let index = CommandLine.arguments.firstIndex(of: "--probe-livefetch"),
+           index + 1 < CommandLine.arguments.count {
+            probeLiveFetch(libraryPath: CommandLine.arguments[index + 1])
             return
         }
         guard CommandLine.arguments.contains("--probe") else { return }
@@ -1212,6 +1230,315 @@ enum Probe {
     }
 
     /// 3) House Arrest：哪些 App 的容器能打开，Documents 有多大
+    // MARK: - Airlock（电脑往设备导入照片的官方通道）
+
+    /// 只读探测：Airlock 服务在 iOS 26.7 上还开不开。
+    ///
+    /// 为什么值得单独做一条探针：往 `/DCIM` 塞文件 Phone 的照片库**不会收录**
+    /// （相册读的是 Photos.sqlite，不扫目录）。iMazing 的「Import Photos To Device」
+    /// 走的是 `Airlock` 服务（字符串表里 `Airlock` / `/Airlock/Photo/` / `13.0.5.13`
+    /// 挨在一起，是 iTunes ATH 同步通道）。这条通了，压缩版才能真的回到手机相册。
+    ///
+    /// 本探针**只读**，不写任何文件。
+    private static func probeAirlock() {
+        do {
+            let api = try MobileDeviceAPI.shared()
+            let device = try api.firstDevice()
+            try api.openSession(device)
+            let info = api.info(device)
+            say("设备：\(info.name) · \(info.productType) · iOS \(info.productVersion)")
+
+            // 对照组：com.apple.afc 一定可用，证明会话本身没问题
+            let candidates = [
+                "com.apple.afc",
+                "Airlock",
+                "com.apple.mobile.airlock",
+                "com.apple.airlock",
+                "com.apple.afc2"
+            ]
+
+            defer { api.stopSession(device) }
+
+            for name in candidates {
+                do {
+                    let afc = try api.openServiceAFC(device, name: name)
+                    defer { api.closeAFC(afc) }
+
+                    let root = (try? api.listDirectory(afc, path: "/")) ?? []
+                    say("✅ \(name)：AFC 已建立，根目录 \(root.count) 项 \(root.prefix(12))")
+
+                    // Airlock 的根下面应该能看到 Photo / Book / Media 这几种投递目录
+                    for sub in ["/Photo", "/Photo/", "/Book", "/Media", "/Airlock", "/DCIM"] {
+                        if let entries = try? api.listDirectory(afc, path: sub), !entries.isEmpty {
+                            say("    \(sub) → \(entries.count) 项 \(entries.prefix(8))")
+                        }
+                    }
+
+                    // Airlock 被禁之后的两条备选：iTunes 照片同步目录、照片修改队列
+                    if name == "com.apple.afc" {
+                        let paths = ["/Photos", "/PhotoData",
+                                     "/PhotoData/Mutations", "/PhotoData/Mutations/DCIM",
+                                     "/PhotoData/Metadata", "/PhotoData/Metadata/DCIM",
+                                     "/PhotoData/internal", "/PhotoData/OutgoingTemp"]
+                        for sub in paths {
+                            if let entries = try? api.listDirectory(afc, path: sub) {
+                                say("    [备选] \(sub) → \(entries.count) 项 \(entries.prefix(20))")
+                            } else {
+                                say("    [备选] \(sub) → 打不开")
+                            }
+                        }
+                        // Mutations/DCIM 里如果有设备自己写的样例，直接把它读出来看格式
+                        var dirs = ["/PhotoData/Mutations/DCIM", "/PhotoData/Metadata/DCIM"]
+                        if let entries = try? api.listDirectory(afc, path: "/PhotoData/Mutations/DCIM") {
+                            dirs += entries.prefix(2).map { "/PhotoData/Mutations/DCIM/" + $0 }
+                        }
+                        if let entries = try? api.listDirectory(afc, path: "/PhotoData/Metadata/DCIM") {
+                            dirs += entries.prefix(2).map { "/PhotoData/Metadata/DCIM/" + $0 }
+                        }
+                        for sub in dirs {
+                            guard let entries = try? api.listDirectory(afc, path: sub) else {
+                                say("    [深挖] \(sub) → 打不开"); continue
+                            }
+                            say("    [深挖] \(sub) → \(entries.count) 项 \(entries.prefix(8))")
+                            for e in entries.prefix(2) {
+                                let p = sub + "/" + e
+                                let size = api.entrySize(afc, path: p)
+                                say("      [文件] \(p) = \(size) 字节")
+                                if size > 0, let data = try? api.readFile(afc, path: p, limit: 8192) {
+                                    let head = data.prefix(64).map { String(format: "%02x", $0) }.joined(separator: " ")
+                                    say("         hex: \(head)")
+                                    // plist 可能整份是文本，直接打出来
+                                    let text = String(decoding: data.prefix(3000), as: UTF8.self)
+                                    let clean = text.replacingOccurrences(of: "\n", with: " ⏎ ")
+                                    say("         ascii: \(clean)")
+                                }
+                            }
+                        }
+                    }
+                } catch {
+                    say("❌ \(name)：\(error.localizedDescription)")
+                }
+            }
+        } catch {
+            say("失败：\(error.localizedDescription)")
+            exit(1)
+        }
+        exit(0)
+    }
+
+    // MARK: - 实况照片的文件布局
+
+    /// 确认实况照片的**视频分量**到底躺在哪：
+    /// 假设是「同目录、同 basename、扩展名 .MOV」，但这个必须对着真机验一次，
+    /// 否则预览播不出来时不知道该怀疑代码还是该怀疑文件名规则。
+    private static func probeLiveFiles() {
+        do {
+            let api = try MobileDeviceAPI.shared()
+            let device = try api.firstDevice()
+            try api.openSession(device)
+            let afc = try api.openAFC(device)
+            defer {
+                // 会话必须关：只 closeAFC 不 stopSession 会在设备上漏一串会话，
+                // 漏够了设备开始拒连（实测「配对校验失败」就是这么来的）
+                api.closeAFC(afc)
+                api.stopSession(device)
+            }
+
+            let folders = (try? api.listDirectory(afc, path: "/DCIM")) ?? []
+            say("DCIM 子目录 \(folders.count) 个")
+
+            var photoStems: [String: String] = [:]   // basename → 目录
+            var videoStems: [String: String] = [:]
+            var paired = 0
+            var unpairedLive = 0
+
+            for folder in folders.prefix(12) {
+                let path = "/DCIM/" + folder
+                guard let entries = try? api.listDirectory(afc, path: path) else { continue }
+                var heics: [String] = []
+                var movs: [String] = []
+                for name in entries {
+                    let ext = (name as NSString).pathExtension.uppercased()
+                    let stem = (name as NSString).deletingPathExtension
+                    if ["HEIC", "JPG", "JPEG"].contains(ext) {
+                        heics.append(name); photoStems[stem] = folder
+                    } else if ["MOV", "MP4"].contains(ext) {
+                        movs.append(name); videoStems[stem] = folder
+                    }
+                }
+                let pairs = heics.filter { (($0 as NSString).deletingPathExtension).isEmpty == false }
+                    .map { ($0 as NSString).deletingPathExtension }
+                    .filter { stem in movs.contains { ($0 as NSString).deletingPathExtension == stem } }
+                if !pairs.isEmpty {
+                    say("  \(folder)：图 \(heics.count) / 视频 \(movs.count)，同名配对 \(pairs.count) 组 → \(pairs.prefix(3))")
+                    paired += pairs.count
+                }
+            }
+
+            for (stem, folder) in photoStems where videoStems[stem] != nil {
+                _ = folder
+            }
+            unpairedLive = photoStems.keys.filter { videoStems[$0] == nil }.count
+            say("总计：同名「图+视频」配对 \(paired) 组；只有图的 stem \(unpairedLive) 个")
+            say("（配对 = 实况照片；只有图 = 普通照片）")
+        } catch {
+            say("失败：\(error.localizedDescription)")
+            exit(1)
+        }
+        exit(0)
+    }
+
+    /// 端到端验「实况预览取视频分量」这条路：
+    /// 从 `Photos.sqlite` 里拿一条真正的实况，按 `AppStore.loadLiveVideo` 的同一套规则
+    /// 拼出 `.MOV` 路径，然后问设备这个文件在不在（`AFCFileRefOpen` 返回 0 才算对）。
+    /// 拼错了这里会立刻暴露，不用等界面里"实况不动"再回头猜。
+    private static func probeLiveFetch(libraryPath: String) {
+        // `--fetch-library` 的参数就是主库的完整路径（旁边会有 -wal / -shm），
+        // 传目录时退回拼 Photos.sqlite，两种写法都能用
+        var dbPath = libraryPath
+        var isDir: ObjCBool = false
+        if FileManager.default.fileExists(atPath: libraryPath, isDirectory: &isDir), isDir.boolValue {
+            dbPath = (libraryPath as NSString).appendingPathComponent("Photos.sqlite")
+        }
+        guard let lib = PhotoLibraryIndex.load(dbPath: dbPath) else {
+            say("读不到库：\(dbPath)（先跑 --fetch-library）")
+            exit(1)
+        }
+        let lives = lib.allMeta.filter(\.isLive)
+        say("库里实况照片 \(lives.count) 条")
+
+        do {
+            let api = try MobileDeviceAPI.shared()
+            let device = try api.firstDevice()
+            try api.openSession(device)
+            let afc = try api.openAFC(device)
+            defer {
+                api.closeAFC(afc)
+                api.stopSession(device)
+            }
+
+            var hit = 0
+            var miss = 0
+            for meta in lives.prefix(20) {
+                let stem = (meta.fileName as NSString).deletingPathExtension
+                let dir = meta.directory.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+                let prefix = dir.uppercased().hasPrefix("DCIM") ? "/\(dir)" : "/DCIM/\(dir)"
+                let paths = ["MOV", "mov", "MP4", "mp4"].map { "\(prefix)/\(stem).\($0)" }
+
+                var opened: String?
+                for path in paths {
+                    var ref: UnsafeMutableRawPointer?
+                    if api.openFileStatus(afc, path: path, &ref) == 0 {
+                        api.closeFile(afc, ref!)
+                        opened = path
+                        break
+                    }
+                }
+                if let opened {
+                    hit += 1
+                    if hit <= 5 {
+                        let size = api.entrySize(afc, path: opened)
+                        say("  ✅ \(meta.fileName) → \(opened)（\(size) 字节）")
+                    }
+                } else {
+                    miss += 1
+                    if miss <= 5 {
+                        say("  ❌ \(meta.fileName) dir=\(meta.directory) 试过 \(paths.first ?? "-")")
+                    }
+                }
+            }
+            say("结果：命中 \(hit) / 未命中 \(miss)（样本 \(min(20, lives.count)) 条）")
+
+            // 光「路径对」不等于「播得出来」：再真拉一条下来，
+            // 用 AVAsset 读轨道和时长 —— 读得到，AVPlayer 才播得动。
+            if let sample = lives.first {
+                let stem = (sample.fileName as NSString).deletingPathExtension
+                let dir = sample.directory.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+                let prefix = dir.uppercased().hasPrefix("DCIM") ? "/\(dir)" : "/DCIM/\(dir)"
+                let path = "\(prefix)/\(stem).MOV"
+                say("下载一条验证播放能力：\(path)")
+                do {
+                    let data = try api.readFile(afc, path: path, limit: 32 * 1024 * 1024)
+                    let local = URL(fileURLWithPath: "/tmp/cmi-live-sample.mov")
+                    try data.write(to: local)
+                    let asset = AVURLAsset(url: local)
+                    let duration = CMTimeGetSeconds(asset.duration)
+                    let videoTracks = asset.tracks(withMediaType: .video).count
+                    let audioTracks = asset.tracks(withMediaType: .audio).count
+                    say("  下载 \(data.count) 字节 · 时长 \(String(format: "%.2f", duration))s"
+                        + " · 视频轨 \(videoTracks) · 音频轨 \(audioTracks)")
+                    if let track = asset.tracks(withMediaType: .video).first {
+                        say("  画面 \(Int(track.naturalSize.width))×\(Int(track.naturalSize.height)) · 码率 \(Int(track.estimatedDataRate / 1000)) kbps")
+                    }
+                    let playable = asset.isPlayable && videoTracks > 0 && duration > 0
+                    say(playable ? "  ✅ AVPlayer 能播" : "  ❌ AVPlayer 播不了")
+                } catch {
+                    say("  下载失败：\(error.localizedDescription)")
+                }
+            }
+        } catch {
+            say("失败：\(error.localizedDescription)")
+            exit(1)
+        }
+        exit(0)
+    }
+
+    // MARK: - 上传探针（PTP）
+
+    /// 试 `ICCameraDevice.requestUploadFile` —— 能不能把文件写回 iPhone。
+    /// 这是 Airlock 被禁之后唯一的「走协议、不是硬塞文件」的路。
+    private static func probeUpload() {
+        let bridge = PTPBridge()
+        let sem = DispatchSemaphore(value: 0)
+        var result = "没有回调"
+
+        bridge.start()
+        say("正在等设备枚举（6 秒）…")
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + 6) {
+            Task {
+                let url = makeProbeJPEG()
+                say("测试文件：\(url.path)（\(apiFileSize(url)) 字节）")
+                let message = await bridge.probeUpload(fileURL: url)
+                result = message
+                sem.signal()
+            }
+        }
+
+        while sem.wait(timeout: .now() + 0.1) == .timedOut {
+            RunLoop.main.run(until: Date().addingTimeInterval(0.1))
+        }
+        say("上传结果：\(result)")
+        bridge.stop()
+        exit(0)
+    }
+
+    /// 造一张一眼就能认出来的测试图，万一真传进去了要能立刻认出来删掉
+    private static func makeProbeJPEG() -> URL {
+        let url = URL(fileURLWithPath: "/tmp/cmi-upload-probe.jpg")
+        let size = NSSize(width: 320, height: 320)
+        let image = NSImage(size: size)
+        image.lockFocus()
+        NSColor.systemPink.setFill()
+        NSRect(origin: .zero, size: size).fill()
+        let text = "CMI PROBE" as NSString
+        text.draw(at: NSPoint(x: 60, y: 150),
+                  withAttributes: [.font: NSFont.boldSystemFont(ofSize: 28),
+                                   .foregroundColor: NSColor.white])
+        image.unlockFocus()
+
+        if let tiff = image.tiffRepresentation,
+           let rep = NSBitmapImageRep(data: tiff),
+           let data = rep.representation(using: .jpeg, properties: [.compressionFactor: 0.7]) {
+            try? data.write(to: url)
+        }
+        return url
+    }
+
+    private static func apiFileSize(_ url: URL) -> Int64 {
+        ((try? FileManager.default.attributesOfItem(atPath: url.path)[.size]) as? Int64) ?? 0
+    }
+
     private static func probeHouse() {
         do {
             let api = try MobileDeviceAPI.shared()

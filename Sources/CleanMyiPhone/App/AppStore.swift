@@ -25,6 +25,18 @@ final class AppStore {
 
     var sidebarItem: SidebarItem = .overview
 
+    /// 换页动画的 key：换页 / 换相簿 / 切网格↔列表才变。
+    /// **搜索和筛选故意不算**，否则每敲一个字整屏都重播一次淡入。
+    var pageKey: String {
+        switch sidebarItem {
+        case .overview: return "overview"
+        case .albums: return "albums"
+        case .photos(let filter): return "photos.\(filter.id).\(viewMode)"
+        case .album(let id): return "album.\(id).\(viewMode)"
+        case .trash: return "trash.\(viewMode)"
+        }
+    }
+
     var section: Section {
         switch sidebarItem {
         case .overview: return .overview
@@ -88,13 +100,22 @@ final class AppStore {
     var hoveredID: Asset.ID?
 
     let trash = TrashStore()
-    var confirmPresented = false
-    var confirmStage = 0
+    /// 清空回收站 / 彻底删除中的二次确认弹窗
+    var emptyTrashConfirmPresented = false
+    /// 弹窗里要彻底删除的那一批（空 = 全部）
+    var pendingDeleteIDs: [Asset.ID] = []
     var isPurging = false
     var purgeMessage: String?
+    /// 打完标记后底栏闪一句「已标记 N 项到回收站」，2.4 秒后自动消失
+    var provisionalMessage: String?
 
     var columns = 6
     var previewID: Asset.ID?
+    /// 正在播退出动画：预览层按它反向缩放，180 ms 后才真正拆除（不靠淡出糊过去）。
+    var isClosingPreview = false
+    /// 打开预览时那一格在 **root 坐标系**里的矩形：预览卡片从它的中心长出来。
+    /// 用 `@ObservationIgnored`：格子悬停时写、预览层读一次，不该触发任何重绘。
+    @ObservationIgnored var previewAnchorRect: CGRect?
     var previewImage: NSImage?
     /// 卡片第一行：固定文案，不随数字宽度变
     var previewLoadingHint: String {
@@ -111,6 +132,10 @@ final class AppStore {
         return min(1, Double(previewBytesDone) / Double(previewBytesTotal))
     }
     var previewVideoURL: URL?
+    /// 实况照片的**视频分量**（同目录、同 basename 的 `.MOV`）。
+    /// 真机实测：DCIM 下「图 + 同名视频」有 410 组，所以靠文件名就能配对，
+    /// 不用去啃 `ZINTERNALRESOURCE`。取到就自动循环播放，取不到就停在静态图。
+    var previewLiveVideoURL: URL?
     var previewLoading = false
     /// 卡片第二行：**只放数字**（x MB / y MB 或一句"重试中"），不再重复"正在取回视频"
     var previewProgressText = ""
@@ -130,17 +155,24 @@ final class AppStore {
     var libraryBytesDone: Int64 = 0
     var libraryBytesTotal: Int64 = 0
 
-    /// 照片页在等相册索引：整页盖死，什么都点不了（和启动那一层同样的做法）。
-    /// 这一阶段空格预览也是直接 return 的 —— 没有库就拿不到设备上的真实路径，
-    /// 让人能点、点了又没反应，比直接挡住更难受。
+    /// 相册索引没就绪就**整窗盖死**，什么都点不了。
+    ///
+    /// 三条口径（2026-11 用户定的）：
+    /// 1. **不分页面** —— 概览页也盖。以前只盖照片/相簿页，于是在概览上点「重新读取」
+    ///    看到的是"界面先进去了"，用户原话：「不要先进去再读取」。
+    /// 2. **不分锁屏** —— 锁屏时也盖着，写「设备已锁屏，解锁后自动继续读」；
+    ///    解锁由 `unlockWatch` 每 2 秒探一次，解开就自动重读，不用用户回来点。
+    /// 3. 暂停态（手动清空过）和未连接不盖：那两种要能点到「重新读取」/「重新检测」。
     var needsLibraryGate: Bool {
-        // 相簿墙也全靠库：没有库，相簿一个都列不出来
-        guard section == .photos || section == .albums else { return false }
         guard libraryIndex == nil, !usingFixture else { return false }
-        // 暂停态要能点到左下角「重新读取」；未连接 / 锁屏另有提示，不盖
-        return !dataPaused && !needsConnection && !isDeviceLocked
+        return !dataPaused && !needsConnection
     }
 
+    /// 正在读相册索引（含手动重试）。门禁按它决定画「进度」还是「失败卡」——
+    /// 点了「重新读取」之后必须**继续盖着显示在读**，不许闪回失败卡。
+    var libraryReadingNow: Bool {
+        libraryRetrying || (libraryStarted && !libraryDone)
+    }
 
     // MARK: - 读取进度（全流程只有一个进度）
 
@@ -202,7 +234,6 @@ final class AppStore {
     @ObservationIgnored private var thumbTasks: [Asset.ID: Task<Void, Never>] = [:]
     private var sessionTask: Task<Void, Never>?
     private var libraryRetryTask: Task<Void, Never>?
-    private var forceLibraryRefresh = false
     private var didBootstrap = false
 
     init() {
@@ -340,6 +371,9 @@ final class AppStore {
         case "trash": sidebarItem = .trash
         case "photos": sidebarItem = .photos(.all)
         case "albums": sidebarItem = .albums
+        // 影子资产（已隐藏 / 最近删除）排查用：这两个筛选的数据来自库而不是 PTP
+        case "hidden": sidebarItem = .photos(.hidden)
+        case "trashed": sidebarItem = .photos(.trashed)
         default: sidebarItem = .overview
         }
     }
@@ -479,11 +513,19 @@ final class AppStore {
             return
         }
         needsConnection = false
-        resetScan(skipLibrary: libraryDone)
-        forceLibraryRefresh = true
-        if !libraryDone { libraryStatus = nil }
+        // 刷新 = 重新读一遍设备。以前这里是 `resetScan(skipLibrary: libraryDone)`：
+        // 库已经读过就整段跳过，只重枚举一遍 /DCIM，缩略图还在内存里，
+        // 界面上什么都不变 —— 用户点了等于没点（连"清空"按钮都会先闪掉一下）。
+        resetScan(skipLibrary: false)
+        libraryStatus = nil
         stopPTP()
         startPTP()
+        // 以前这里只靠 PTP 的 `onDevice` 回调去触发 `beginSession()`（那条链才会读库）。
+        // 会话没真正重开时（解锁后刷新最典型：ICCamera 还挂着同一个设备，不会再报一次
+        // device）回调不会来 → 库永远不重读，界面停成
+        // 「正在读取相册索引 / 正在等手机回包 / 已读 0 KB」一直不动。
+        // 这里直接起一次会话链，不依赖回调是否还会来。
+        beginSession()
     }
 
     private func beginSession() {
@@ -599,7 +641,6 @@ final class AppStore {
         guard !usingFixture, !libraryDone, !libraryStarted else { return }
         libraryStarted = true
         recomputeProgress()
-        forceLibraryRefresh = false
 
         // 看门狗：相册库万一卡住，超时也要收尾，界面不能永远停在「正在读取」
         Task { [weak self] in
@@ -749,17 +790,22 @@ final class AppStore {
         }
     }
 
-    /// 门禁里的「重试」：绕过 started/done 标记，重新读一次库
+    /// 门禁里的「重新读取」：绕过 started/done 标记，重新读一次库。
+    ///
+    /// 点下去就把 `isDeviceLocked` 清掉：用户既然点了，就当他已经解锁。
+    /// 还锁着的话 `loadLibrary` 会再失败并重新置 true，界面上表现为
+    /// 「门禁一直盖着、又变回锁屏提示」，而不是先掉回正常界面
+    /// —— 用户报的「点了重新读取，样式就变了（进去了）」就是这里漏的这一步。
     func retryLibraryNow() async {
         libraryFailureCount = 0
         libraryAutoRetryStopped = false
+        isDeviceLocked = false
         await retryLibraryOnce(force: true)
     }
 
     private func retryLibraryOnce(force: Bool = false) async {
         guard !usingFixture else { return }
         if !force, libraryIndex != nil { return }
-        forceLibraryRefresh = true
         // 重试前先把上一轮残留的辅助进程清掉：它们不随父进程退出，
         // 几个叠在一起就会互相抢设备，读库永远起不来。
         LibraryService.killStrayHelpers()
@@ -772,14 +818,17 @@ final class AppStore {
         await releaseDeviceFiles()
         try? await Task.sleep(nanoseconds: 800_000_000)
 
+        // 从**按下那一刻**就算「在读」：让出设备 + 800 ms 静默这段也算，
+        // 否则门禁会在这半秒里画成「失败卡」，看着像又没读成。
+        libraryRetrying = true
+        defer { libraryRetrying = false }
+
         libraryStarted = false
         libraryDone = false
         libraryFraction = 0
-        // 注意：**不清 libraryStatus**。清了门禁就从「读不出来 + 原因 + 重试按钮」
-        // 退回转圈态，看着像又开始读了（用户就是这么点的），而且失败原因也没了。
-        libraryRetrying = true
+        // 注意：**不清 libraryStatus**。清了失败原因就没了；门禁按
+        // `libraryReadingNow` 决定画进度、把原因留成底下那行小字。
         await loadLibrary()
-        libraryRetrying = false
 
         if pausePTP { startPTP() }
         maybeFinishScan()
@@ -984,36 +1033,6 @@ final class AppStore {
     /// 用户应用个数（系统 / 隐藏项不算）
     var userAppCount: Int { stats.appList.filter { !$0.isSystem }.count }
 
-    /// 照片类型三行：相机拍摄 / 截屏 / 视频（互斥，合计等于媒体总量）
-    struct PhotoKindRow {
-        let title: String
-        let count: Int
-        let bytes: Int64
-        let percent: Double
-        let color: Color
-    }
-
-    var photoKindRows: [PhotoKindRow] {
-        let shots = screenshotAssets
-        let shotBytes = sum(shots)
-        let photoOnly = max(0, mediaPhotoBytes - shotBytes)
-        let videos = mediaVideoBytes
-        let total = max(photoOnly + shotBytes + videos, 1)
-        return [
-            .init(title: "照片（不含截屏）",
-                  count: max(0, libraryPhotoCount - shots.count),
-                  bytes: photoOnly, percent: Double(photoOnly) / Double(total) * 100,
-                  color: Theme.photo),
-            .init(title: "截屏", count: shots.count,
-                  bytes: shotBytes, percent: Double(shotBytes) / Double(total) * 100,
-                  color: Theme.screenshot),
-            .init(title: "视频",
-                  count: libraryVideoCount,
-                  bytes: videos, percent: Double(videos) / Double(total) * 100,
-                  color: Theme.video)
-        ]
-    }
-
     struct Slice: Identifiable {
         let id = UUID()
         let title: String
@@ -1023,20 +1042,6 @@ final class AppStore {
 
 
 
-
-
-    // MARK: - 饼图数据（概览与应用页共用同一套口径）
-
-    /// 截图（相机截图，subtype 10 或 PTP 标签）
-    private var screenshotAssets: [Asset] {
-        assets.filter { tagSet($0).contains(.screenshot) }
-    }
-
-    private func sum(_ list: [Asset]) -> Int64 { list.reduce(0) { $0 + $1.byteSize } }
-
-
-    /// 通用「某一类 / 其他」两段饼
-    
 
 
 
@@ -1066,6 +1071,21 @@ final class AppStore {
         }
         albumByteCache[albumID] = total
         return total
+    }
+
+    /// 类型排行（体积降序）：概览「照片类型」用它，和侧栏那套分类完全一致
+    /// （相机 / 照片 / 视频 / 收藏 / 截图 / 实况 / RAW / 已隐藏 / 最近删除）。
+    /// 「全部照片」不算类型，不进排行。
+    var typeRanking: [(filter: LibraryFilter, count: Int, bytes: Int64)] {
+        guard metricsReady else { return [] }
+        return LibraryFilter.displayOrder
+            .filter { $0 != .all }
+            .compactMap { filter -> (LibraryFilter, Int, Int64)? in
+                guard let metric = filterMetrics[filter],
+                      metric.count > 0, metric.bytes > 0 else { return nil }
+                return (filter, metric.count, metric.bytes)
+            }
+            .sorted { $0.2 > $1.2 }
     }
 
     /// 相簿排行（体积降序，含张数）：概览和相簿栏共用
@@ -1322,7 +1342,6 @@ final class AppStore {
         switch sortKey {
         case .date: result.sort { $0.createdAt < $1.createdAt }
         case .size: result.sort { $0.byteSize < $1.byteSize }
-        case .name: result.sort { $0.fileName.localizedStandardCompare($1.fileName) == .orderedAscending }
         }
         if !ascending { result.reverse() }
         return result
@@ -1355,6 +1374,12 @@ final class AppStore {
     }
 
     func toggle(_ asset: Asset) {
+        // 已标记 → 先**撤销标记**回到正常；再点一下才是选中（2026-11 用户定的节奏）。
+        // 所以取消标记不再需要单独一颗按钮：再点一次就是取消。
+        if pendingDeletions.contains(asset.id) {
+            unmark([asset.id])
+            return
+        }
         if selection.contains(asset.id) {
             selection.remove(asset.id)
         } else {
@@ -1373,14 +1398,29 @@ final class AppStore {
             return
         }
         let range = start <= end ? start...end : end...start
-        selection = Set(list[range].map(\.id))
+        // 已标记的项不进选中集合（和 toggle / selectAll 保持同一口径）
+        selection = Set(list[range].map(\.id)).subtracting(pendingDeletions)
     }
 
-    func selectAll() { selection = Set(visibleAssets.map(\.id)) }
+    /// 全选：跳过已标记回收的（它们已经在待删名单里了）
+    func selectAll() {
+        selection = Set(visibleAssets.map(\.id)).subtracting(pendingDeletions)
+    }
 
     func clearSelection() {
         selection = []
         anchorID = nil
+    }
+
+    /// 框选：把框住的并进已选。
+    /// 口径按用户定的来 —— **框住的直接并入**，不做「只选框中」，
+    /// 免得框一小块之前误点中的东西还得先手动取消。
+    func mergeSelection(_ ids: Set<Asset.ID>) {
+        guard !ids.isEmpty else { return }
+        let merged = selection.union(ids)
+        guard merged != selection else { return }
+        selection = merged
+        if anchorID == nil { anchorID = ids.first }
     }
 
     func move(dx: Int = 0, dy: Int = 0, extend: Bool) {
@@ -1417,19 +1457,29 @@ final class AppStore {
         if active { hoveredID = id }
     }
 
+    /// 记下当前这一格在 root 坐标系里的矩形：预览卡片从它的中心长出来。
+    /// 只在鼠标进入时写一次，不挂 preference —— 5000 张的网格经不起滚动重算。
+    func setPreviewAnchor(_ rect: CGRect) {
+        previewAnchorRect = rect
+    }
+
     // MARK: - 待删 / 回收站
 
-    /// 预览里点按钮删除当前这一项
+    /// 预览里给当前这一项打回收标记。
+    /// **不自动跳到下一张**（2026-11 用户明确要求）：标记 / 取消标记 / 选中都是
+    /// 就地改状态，画面留在原地 —— 顶栏的状态胶囊会立刻变成「已标记回收」，
+    /// 反馈已经够了；自动跳走反而让人不知道刚才那一下动的是哪张。
+    /// 想换下一张就 ← → 或点顶栏的「下一张」。
     func trashCurrentPreview() {
         guard let id = previewID, let asset = assets.first(where: { $0.id == id }) else { return }
         trash.add([asset], deviceID: device?.id ?? "unknown")
         selection.remove(id)
-        stepPreview(1)
     }
 
-    /// 预览里切换「当前这一项」的选中状态
+    /// 预览里切换「当前这一项」的选中状态。
+    /// **已经标记回收的不许再选中** —— 它已经在待删名单里了，再打勾只会自相矛盾。
     func togglePreviewSelection() {
-        guard let id = previewID else { return }
+        guard let id = previewID, !pendingDeletions.contains(id) else { return }
         if selection.contains(id) {
             selection.remove(id)
         } else {
@@ -1438,22 +1488,62 @@ final class AppStore {
         }
     }
 
-    func presentDeleteConfirm() {
-        guard !selection.isEmpty else { return }
-        confirmStage = 1
-        confirmPresented = true
+    /// 取消标记（把这一项从待删名单里拿回来）
+    func unmarkCurrentPreview() {
+        guard let id = previewID else { return }
+        trash.remove(ids: [id])
     }
 
-    func confirmDelete() {
-        let chosen = selectedAssets
-        guard !chosen.isEmpty else {
-            confirmPresented = false
-            return
+    /// 框选落到已选 / 已标记的块上：反过来把标记撤掉
+    func unmark(_ ids: Set<Asset.ID>) {
+        guard !ids.isEmpty else { return }
+        trash.remove(ids: ids)
+    }
+
+    /// 框选结果怎么落到状态里（模式在拖拽开始时按"按住的那一格"定好）。
+    /// **框选不再能取消标记**（2026-11 用户定的）：取消标记只能人工点格子右上角的叉，
+    /// 或者预览里按 ⌫。框到已标记的项就当没框到 —— 已标记的不进选中集合。
+    func marqueeApply(_ hits: Set<Asset.ID>, mode: MarqueeMode) {
+        guard !hits.isEmpty else { return }
+        switch mode {
+        case .select:
+            let addable = hits.subtracting(pendingDeletions)
+            guard !addable.isEmpty else { return }
+            mergeSelection(addable)
+        case .deselect:
+            selection.subtract(hits)
         }
+    }
+
+    /// 「标记回收」：一步到位，**不弹二次确认**。
+    /// 回收站本身就是那道保险 —— 标记只是打记号，真正的删除还要再走一次
+    /// 「彻底删除」，一共两层，够了。再叠一层确认等于三次点击才动到一张照片。
+    func markSelectedForRecycle() {
+        let chosen = selectedAssets
+        guard !chosen.isEmpty else { return }
         trash.add(chosen, deviceID: device?.id ?? "unknown")
         clearSelection()
-        confirmPresented = false
-        confirmStage = 1
+        flash("已标记 \(chosen.count) 项到回收站")
+    }
+
+    /// 回收站里单独几条「彻底删除」：和清空走同一台引擎，只是范围小
+    func deleteFromTrash(ids: [Asset.ID]) async {
+        let set = Set(ids)
+        let entries = trash.entries.filter { set.contains($0.id) }
+        guard !entries.isEmpty, !isPurging else { return }
+        await purge(entries)
+    }
+
+    /// 底栏那句一次性提示（2.4 秒后消失），不写进 purgeMessage
+    private var provisionalMessageTask: Task<Void, Never>?
+    func flash(_ text: String) {
+        provisionalMessage = text
+        provisionalMessageTask?.cancel()
+        provisionalMessageTask = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: 2_400_000_000)
+            guard !Task.isCancelled else { return }
+            self?.provisionalMessage = nil
+        }
     }
 
     func restoreFromTrash(ids: [Asset.ID]) {
@@ -1461,7 +1551,11 @@ final class AppStore {
     }
 
     func emptyTrash() async {
-        let entries = trash.entries
+        await purge(trash.entries)
+    }
+
+    /// 真删：只有这一个地方会动设备。清空回收站、回收站里删选中的几条，都走它。
+    private func purge(_ entries: [TrashStore.Entry]) async {
         guard !entries.isEmpty, !isPurging else { return }
         isPurging = true
         defer { isPurging = false }
@@ -1499,17 +1593,38 @@ final class AppStore {
         guard !dataPaused else { return }
         guard libraryIndex != nil || usingFixture else { return }
         guard let target = previewTarget else { return }
+        // 退出动画还没播完就又要打开：把待拆的任务作废，直接换目标
+        closeTask?.cancel()
+        closeTask = nil
+        isClosingPreview = false
         previewID = target
         loadPreviewImage(for: target)
     }
 
+    /// 请求关闭：**先播 180 ms 的退出动画，再拆**。
+    /// 只做透明度淡出的话，缩略图是"凭空消失"；原生 Quick Look 会缩回原位。
     func closePreview() {
-        // 正在取回的那次立刻作废：不掐掉的话，关掉预览后它还会一直占着
-        // 那条串行下载通道跑到收尾，下一次空格的新视频只能排在它后面干等。
+        guard previewID != nil, !isClosingPreview else { return }
+        isClosingPreview = true
+        // 取回立刻作废，不等动画：不掐掉的话它还会占着那条串行下载通道跑到收尾
         DeviceFiles.shared.cancelPreviewDownload()
         DeviceFiles.shared.setPreviewWaiting(false)
         previewWaitNotice?.cancel()
         previewWaitNotice = nil
+        closeTask?.cancel()
+        closeTask = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: 180_000_000)
+            guard !Task.isCancelled else { return }
+            self?.teardownPreview()
+        }
+    }
+
+    @ObservationIgnored private var closeTask: Task<Void, Never>?
+
+    /// 真正拆除预览状态（播放器、缓存引用、进度数字全部归零）
+    private func teardownPreview() {
+        closeTask = nil
+        isClosingPreview = false
         previewID = nil
         previewImage = nil
         previewVideoURL = nil
@@ -1540,7 +1655,8 @@ final class AppStore {
 
     func stepPreview(_ delta: Int) {
         let list = visibleAssets
-        guard let previewID, let index = list.firstIndex(where: { $0.id == previewID }) else { return }
+        guard !isClosingPreview,
+              let previewID, let index = list.firstIndex(where: { $0.id == previewID }) else { return }
         let next = min(max(0, index + delta), list.count - 1)
         self.previewID = list[next].id
         anchorID = list[next].id
@@ -1604,6 +1720,7 @@ final class AppStore {
         // 先用网格里已有的 480px 立刻显示，再后台换大图，切换不空屏
         previewImage = thumbnails[id]
         previewVideoURL = nil
+        previewLiveVideoURL = nil
         guard let asset = asset(withID: id) else { return }
 
         if asset.kind == .video {
@@ -1702,6 +1819,11 @@ final class AppStore {
             previewLoading = previewImage == nil
             previewError = nil
             let token = DeviceFiles.shared.previewToken()
+            // 实况照片：另起一条任务取视频分量，不挡静态图。
+            // 静态图先出来，视频到了预览自己动起来 —— 这是 iPhone 相册的手感。
+            if isLivePhoto(asset) {
+                loadLiveVideo(for: asset, id: id, token: token)
+            }
             Task {
                 // 预览要原图：整份下载 → 原生尺寸解码，不降采样、不重编码。
                 var cg: CGImage?
@@ -1724,6 +1846,53 @@ final class AppStore {
                 self.previewLoading = false
                 if cg == nil { self.previewError = "取不到这张图（设备没回数据）" }
             }
+        }
+    }
+
+    // MARK: - 实况照片
+
+    /// 是不是实况照片。库索引最准（`subtype == 2 && playbackStyle == 3`，
+    /// 那条口径把「拍的时候关了实况」的 4 条 subtype=2 排除掉了）；
+    /// 库还没到、或者这条匹配不上时，退 PTP 的 groupUUID 标记。
+    func isLivePhoto(_ asset: Asset) -> Bool {
+        if let meta = meta(asset) { return meta.isLive }
+        return asset.tags.contains(.live)
+    }
+
+    /// 取实况照片的视频分量。
+    ///
+    /// 文件布局是真机实测出来的：**同目录、同 basename、扩展名 `.MOV`**
+    /// （`--probe-livefiles`：DCIM 下 410 组「图 + 同名视频」）。
+    /// 所以不需要去解析 `ZINTERNALRESOURCE`，按名字拼路径就行。
+    ///
+    /// 走预览通道，和原图那条**串行**：原图先出、视频随后，
+    /// 用户看到的是「静态图 → 自己动起来」，两条不会互相抢带宽。
+    private func loadLiveVideo(for asset: Asset, id: Asset.ID, token: Int) {
+        guard let meta = meta(asset) else { return }
+        let stem = (meta.fileName as NSString).deletingPathExtension
+        guard !stem.isEmpty else { return }
+
+        let dir = meta.directory.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+        let prefix = dir.uppercased().hasPrefix("DCIM") ? "/\(dir)" : "/DCIM/\(dir)"
+        // 实况的视频分量固定是 .MOV；再把小写和 .MP4 兜上，
+        // 老机器/导入来源偶尔会不一样
+        let candidates = ["MOV", "mov", "MP4", "mp4"].map { "\(prefix)/\(stem).\($0)" }
+        DeviceFiles.trace("ui live video \(asset.fileName) 试 \(candidates.first ?? "-")")
+
+        Task { [weak self] in
+            guard let self else { return }
+            for path in candidates {
+                guard self.previewID == id,
+                      !DeviceFiles.shared.isPreviewCancelled(token) else { return }
+                if let hit = await DeviceFiles.shared.downloadByDevicePath([path],
+                                                                           to: Self.previewDirectory) {
+                    guard self.previewID == id else { return }
+                    self.previewLiveVideoURL = hit.url
+                    DeviceFiles.trace("ui live video 到手 \(hit.url.lastPathComponent) \(hit.received)B")
+                    return
+                }
+            }
+            DeviceFiles.trace("ui live video 取不到：\(asset.fileName)")
         }
     }
 
@@ -2036,18 +2205,22 @@ final class AppStore {
     }
 
     /// 手动恢复：解除暂停并**真的重新读一遍**设备（现在没有快照可用了）
+    /// 左下角那颗「重新读取」：**任何状态都能点**（2026-11 用户定的）。
+    /// - 清空过（暂停态）→ 解除暂停、丢掉内存里那份，从头读；
+    /// - 没清空过 → 等价于点一次刷新（重扫照片目录 + 重读相册索引）。
     func resumeReading() {
-        guard dataPaused else { return }
-        dataPaused = false
-        purgeMessage = nil
-        libraryIndex = nil
-        libraryAlbums = []
-        libraryStarted = false
-        libraryDone = false
-        libraryStatus = nil
-        forceLibraryRefresh = true
-        bumpThumbEpoch()
-        Task { await startScan() }
+        guard !isScanning else { return }
+        if dataPaused {
+            dataPaused = false
+            purgeMessage = nil
+            libraryIndex = nil
+            libraryAlbums = []
+            libraryStarted = false
+            libraryDone = false
+            libraryStatus = nil
+            bumpThumbEpoch()
+        }
+        Task { await refreshDevice() }
     }
 
     // MARK: - 缩略图缓存
@@ -2072,60 +2245,54 @@ final class AppStore {
     
     // MARK: - 键盘
 
-    static let handledKeys: Set<KeyEquivalent> = [
-        .upArrow, .downArrow, .leftArrow, .rightArrow,
-        .space, .delete, .return, .escape,
-        KeyEquivalent("a"), KeyEquivalent("A"),
-        KeyEquivalent("s"), KeyEquivalent("S")
-    ]
-
+    /// 窗口级 keyDown（`KeyMonitor` 挂的 local monitor 送进来）。返回 true = 已处理、事件被吞。
+    ///
+    /// 不再用 `.onKeyPress`：那套要求焦点正好落在根视图上，鼠标点过预览里的键帽按钮、
+    /// 或者视频播放器拿到 first responder 之后就收不到键 —— 用户报的
+    /// 「预览里按退格没反应」就是这个。这里与焦点无关。
     @discardableResult
-    func handleKey(_ press: KeyPress) -> KeyPress.Result {
-        let shift = press.modifiers.contains(.shift)
-        let command = press.modifiers.contains(.command)
+    func handleKeyEvent(_ event: NSEvent) -> Bool {
+        let shift = event.modifierFlags.contains(.shift)
+        let command = event.modifierFlags.contains(.command)
+        let chars = event.charactersIgnoringModifiers?.lowercased() ?? ""
 
+        if command, chars == "a" { selectAll(); return true }
+
+        // 预览开着：只认预览那几个键，别的都不管
         if previewID != nil {
-            switch press.key {
-            case .leftArrow: stepPreview(-1); return .handled
-            case .rightArrow: stepPreview(1); return .handled
-            case .space:
-                // 预览开着时空格就是「关」，鼠标停在哪不再影响结果
+            switch event.keyCode {
+            case 51, 117:                       // ⌫ / ⌦：标记 ↔ 取消标记，原地不动
+                if let id = previewID, pendingDeletions.contains(id) {
+                    unmarkCurrentPreview()
+                } else {
+                    trashCurrentPreview()
+                }
+                return true
+            case 36, 76:                        // ⏎：选中 ↔ 取消选中
+                togglePreviewSelection()
+                return true
+            case 49:                            // 空格：关
                 closePreview()
-                return .handled
-            case .delete:
-                // 预览里直接打删除标记，不关预览
-                togglePreviewSelection()
-                trashCurrentPreview()
-                return .handled
-            case KeyEquivalent("s"), KeyEquivalent("S"):
-                // 预览里也能选中 / 取消选中，再切下一张继续选
-                togglePreviewSelection()
-                stepPreview(1)
-                return .handled
-            case .return:
-                togglePreviewSelection()
-                return .handled
-            case .escape: closePreview(); return .handled
+                return true
+            case 123: stepPreview(-1); return true
+            case 124: stepPreview(1); return true
+            case 53:                            // Esc
+                closePreview()
+                return true
             default: break
             }
+            if chars == "s" { togglePreviewSelection(); return true }
+            return false
         }
 
-        switch press.key {
-        case .leftArrow: move(dx: -1, extend: shift); return .handled
-        case .rightArrow: move(dx: 1, extend: shift); return .handled
-        case .upArrow: move(dy: -1, extend: shift); return .handled
-        case .downArrow: move(dy: 1, extend: shift); return .handled
-        case .space, .return: openPreview(); return .handled
-        case .delete:
-            return .ignored
-        case .escape:
-            if previewID != nil { closePreview() } else { clearSelection() }
-            return .handled
-        case KeyEquivalent("a"), KeyEquivalent("A"):
-            if command { selectAll(); return .handled }
-            return .ignored
-        default:
-            return .ignored
+        switch event.keyCode {
+        case 123: move(dx: -1, extend: shift); return true
+        case 124: move(dx: 1, extend: shift); return true
+        case 126: move(dy: -1, extend: shift); return true
+        case 125: move(dy: 1, extend: shift); return true
+        case 49, 36, 76: openPreview(); return true
+        case 53: clearSelection(); return true
+        default: return false
         }
     }
 }
@@ -2168,17 +2335,14 @@ extension AppStore {
         for asset in visibleAssets {
             let parts = calendar.dateComponents([.year, .month, .day], from: asset.createdAt)
             let key: String
-            let title: String
+            // 标题不在这里拼：统一由 `bucketTitle(key)` 从 key 反推，少一份重复代码
             switch dateGrouping {
             case .day:
                 key = String(format: "%04d-%02d-%02d", parts.year ?? 0, parts.month ?? 0, parts.day ?? 0)
-                title = "\(parts.year ?? 0)年\(parts.month ?? 0)月\(parts.day ?? 0)日"
             case .month:
                 key = String(format: "%04d-%02d", parts.year ?? 0, parts.month ?? 0)
-                title = "\(parts.year ?? 0)年\(parts.month ?? 0)月"
             case .year:
                 key = String(format: "%04d", parts.year ?? 0)
-                title = "\(parts.year ?? 0)年"
             }
             if buckets[key] == nil { order.append(key) }
             buckets[key, default: []].append(asset)

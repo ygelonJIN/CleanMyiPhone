@@ -70,7 +70,7 @@
 - 点选只负责「选中」，不碰预览；空格预览的是**鼠标悬停**的那一项（`hoveredID`），没悬停才退回已选。
 - 鼠标离开格子时不要立刻清 `hoveredID`：预览层盖上来会触发 leave，清了空格就失效。只在新格子 hover 时覆盖。
 - 预览层放在 `NavigationSplitView` 外层（`ZStack` 或 `.overlay`），不要在页面内部再放一份，否则会渲染两层。
-- 预览里 ←→ 切项、空格关，删完自动跳下一张；预览不改选中集合。
+- 预览里 ←→ 切项、⏎/S 选中、⌫ 标记 / 取消标记、空格关；**标记和选中都不自动翻页**，状态胶囊当场变就是反馈。预览不改选中集合之外的任何东西。
 
 ## 八、环形图悬停与指向线
 
@@ -100,3 +100,30 @@
 - **别在 `body` 求值路径上做文件 IO**：`computeVisible()` 里写日志、遍历目录这类操作会被每次重排调用，白白拖慢滚动。
 - **别在 view update 期间改被观察的集合**：把 `[Asset.ID: Task]` 这类簿记属性标 `@ObservationIgnored`，否则在 `.onChange` 里改它会把 Observation 的注册表写坏（实测崩溃栈落在 `ObservationRegistrar.registerTracking` / `_NativeSet.resize`）。
 - 加载中/进度的数字必须**等宽字体 + 固定宽度**，否则 `1 MB` → `100 MB` 位数变化会把整个卡片撑开、来回跳。
+
+## 十二、动效（2026-11 定的做法）
+
+**常量只放一处**：`UI/Motion.swift` 的 `Motion.page / fade / pop / sheet / reveal / thumb`，加三个转场 `.badge / .cellRemove / .dialog`。以前各处随手写 `easeOut(0.14/0.16/0.18)`，同一种"出现"在三个页面上手感都不一样。
+
+### 12.1 换页淡入：别在同一帧里落回起点
+`withAnimation { shown = false }` 紧接着 `withAnimation { shown = true }`，SwiftUI 只会看到最终值，等于没动。要**先无动画落回起点、下一帧再放**：
+
+```swift
+var instant = Transaction(); instant.disablesAnimations = true
+withTransaction(instant) { shown = false }
+DispatchQueue.main.async { withAnimation(Motion.page) { shown = true } }
+```
+
+`key` 只放"换页"级别的量（侧栏项 / 相簿 id / 网格↔列表），**搜索和筛选不要算进去**，否则每敲一个字整屏闪一次。
+
+### 12.2 不做逐格错峰
+5000 张的网格逐格 `delay(index * 0.01)` = 一次几十秒的连续重绘，直接卡死。整块动一次（淡入 + 0.985→1 微缩）已经够"不是直接出现"。
+
+### 12.3 缩略图到位要淡入
+`if let image = …` 这种结构切换不会自己淡入。两头都要给：内容上 `.transition(.opacity)`，容器上 `.animation(Motion.thumb, value: hasThumbnail)`。只给 animation 没有 transition，图还是"啪"地出现。
+
+### 12.4 角标用 scale+opacity 转场
+勾 / 垃圾桶 / 叉都是条件渲染，`.transition(.badge)`（`scale 0.55 → 1` + 淡入）配 `Motion.pop`，才像苹果那种"弹出来"，而不是干巴巴地换颜色。
+
+### 12.5 门禁类遮罩：重试期间必须继续盖着
+`needsLibraryGate` 只判「库没好 + 不是暂停态 + 不是未连接」。**锁屏也盖**（卡片写"解锁后自动继续读取"），用户点「重新读取」时先清 `isDeviceLocked` 并把 `libraryRetrying` 置真，用 `libraryReadingNow` 决定画进度还是失败卡 —— 否则重试那一瞬间门禁条件为假，界面直接掉回正常页面，用户看到的就是"点了重新读取，界面先进去了"。

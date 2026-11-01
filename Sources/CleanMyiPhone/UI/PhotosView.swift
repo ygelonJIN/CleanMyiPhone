@@ -10,83 +10,60 @@ struct PhotosView: View {
         @Bindable var store = store
 
         VStack(spacing: 0) {
-            // 标题不放在这里：搜索框左边只留搜索框。
-            // 之前放相簿名（如「微信」），窗口一窄就被挤成竖排两个字。
-            DetailHeader(title: "", subtitle: nil, showTitle: false) {
-                // 顶栏（搜索 + 排序 + 升降序 + 分组 + 视图 + 刷新）整块不换行、不压缩：
-                // 宽度不够就**在自己这块里横向滚动**，绝不溢出到左边栏那边去。
-                ScrollView(.horizontal, showsIndicators: false) {
-                HStack(spacing: 10) {
-                    SearchField(prompt: "搜索照片", text: $store.searchText, width: 112)
+            // 顶栏没有标题，控件组整条居中；每个控件都收窄过（升降序改成文字），
+            // 合计 ≤ 452pt，配内容区最小宽 500 任何窗口尺寸都不裁。
+            // 那层横向 ScrollView 已经删掉：宽度本来就够，兜底那层反而是裁刷新按钮的元凶。
+            PageToolbar {
+                SearchField(prompt: "搜索照片", text: $store.searchText, width: 100)
 
-                    // 主打功能：排序与视图都放大、放显眼
-                    HStack(spacing: 6) {
-                        Picker("排序", selection: $store.sortKey) {
-                            ForEach(SortKey.allCases) { key in
-                                Text(key.label).tag(key)
-                            }
-                        }
-                        .pickerStyle(.segmented)
-                        .labelsHidden()
-                        .frame(width: 150)
-                        .help("排序方式：按时间 / 按大小 / 按文件名")
-
-                        Button {
-                            store.ascending.toggle()
-                        } label: {
-                            HStack(spacing: 3) {
-                                Image(systemName: store.ascending ? "arrow.up" : "arrow.down")
-                                    .font(.system(size: 10, weight: .bold))
-                                Text(store.ascending ? "升序" : "降序")
-                                    .font(.caption.weight(.medium))
-                            }
-                            .frame(width: 58)
-                        }
-                        .buttonStyle(.bordered)
-                        .help("点一下切换升序 / 降序")
+                // 主打功能：排序与视图都放大、放显眼
+                Picker("排序", selection: $store.sortKey) {
+                    ForEach(SortKey.allCases) { key in
+                        Text(key.label).tag(key)
                     }
+                }
+                .pickerStyle(.segmented)
+                .labelsHidden()
+                .frame(width: 100)
+                .help("排序方式：按时间 / 按大小")
 
-                    if store.showsDateSections {
-                        Picker("分组", selection: $store.dateGrouping) {
-                            ForEach(AppStore.DateGrouping.allCases) { mode in
-                                Text(mode.label).tag(mode)
-                            }
-                        }
-                        .pickerStyle(.segmented)
-                        .labelsHidden()
-                        .frame(width: 104)
-                        .help("按日 / 按月 / 按年分组显示")
-                    }
+                // 升 / 降序用**文字**，不用箭头（用户定的）
+                Button {
+                    store.ascending.toggle()
+                } label: {
+                    Text(store.ascending ? "升序" : "降序")
+                        .font(.system(size: 11.5, weight: .medium))
+                        .frame(width: 44, height: 20)
+                }
+                .buttonStyle(.bordered)
+                .help(store.ascending ? "当前升序 · 点一下改为降序" : "当前降序 · 点一下改为升序")
 
-                    Picker("视图", selection: $store.viewMode) {
-                        ForEach(ViewMode.allCases) { mode in
-                            Image(systemName: mode.symbol).tag(mode)
+                if store.showsDateSections {
+                    Picker("分组", selection: $store.dateGrouping) {
+                        ForEach(AppStore.DateGrouping.allCases) { mode in
+                            Text(mode.label).tag(mode)
                         }
                     }
                     .pickerStyle(.segmented)
                     .labelsHidden()
                     .frame(width: 84)
-                    .help("缩略图视图 / 列表视图")
+                    .help("按日 / 按月 / 按年分组显示")
+                }
 
-                    Button {
-                        Task { await store.refreshDevice() }
-                    } label: {
-                        Image(systemName: "arrow.clockwise")
+                Picker("视图", selection: $store.viewMode) {
+                    ForEach(ViewMode.allCases) { mode in
+                        Image(systemName: mode.symbol).tag(mode)
                     }
-                    .buttonStyle(.borderless)
-                    .help("重新读取设备")
-                    .disabled(store.isScanning)
                 }
-                .fixedSize(horizontal: true, vertical: false)
-                .padding(.trailing, 2)
-                }
-                // 最小宽度：比这个窄就滚动，不挤压、不出框
-                .frame(minWidth: 260, maxWidth: .infinity, alignment: .trailing)
-                .clipped()
+                .pickerStyle(.segmented)
+                .labelsHidden()
+                .frame(width: 68)
+                .help("缩略图视图 / 列表视图")
+
+                refreshButton
             }
 
             Divider()
-                .padding(.top, 4)
 
             HStack(spacing: 0) {
                 if store.section == .albums {
@@ -98,6 +75,8 @@ struct PhotosView: View {
                     // 最小宽度只保证「两列」：再窄宁可窗口不放行，也不裁图
                     .frame(minWidth: 260, maxWidth: .infinity, maxHeight: .infinity)
                     .layoutPriority(1)
+                    // 换页（侧栏 / 相簿 / 视图）时整块淡入 + 微缩，不是"啪"地出现
+                    .pageReveal(store.pageKey)
             }
 
             Divider()
@@ -157,16 +136,6 @@ struct PhotosView: View {
         .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
     }
 
-    private var subtitle: String {
-        if store.isScanning {
-            return "\(store.visibleAssets.count) 项 · \(store.scanStageTitle)"
-        }
-        return "\(store.visibleAssets.count) 项 · \(AppStore.sizeText(store.visibleBytes))"
-    }
-
-    // MARK: - 工具栏
-
-    /// 排序做成看得见的状态：按钮上直接写「时间 ↓」，不是一个小箭头
     // MARK: - 内容
 
     @ViewBuilder
@@ -205,6 +174,30 @@ struct PhotosView: View {
 
     // MARK: - 底栏
 
+    /// 刷新：真的重读设备（目录 + 相册索引）。读取中换成小转圈，别让人连点。
+    @ViewBuilder
+    private var refreshButton: some View {
+        Button {
+            Task { await store.refreshDevice() }
+        } label: {
+            if store.isScanning {
+                ProgressView()
+                    .controlSize(.mini)
+                    .frame(width: 16, height: 16)
+            } else {
+                Image(systemName: "arrow.clockwise")
+                    .font(.system(size: 12, weight: .medium))
+                    .frame(width: 16, height: 16)
+            }
+        }
+        .buttonStyle(.borderless)
+        // 右侧多留一点：这一颗最靠边，最容易被裁掉/被滚动条压住
+        .frame(minWidth: 22, minHeight: 20)
+        .contentShape(Rectangle())
+        .help(store.isScanning ? "正在重新读取设备…" : "重新读取设备（重扫照片目录 + 重读相册索引，约 10 秒）")
+        .disabled(store.isScanning)
+    }
+
     private var bottomBar: some View {
         HStack(spacing: 12) {
             Text("\(store.visibleAssets.count) 项 · \(AppStore.sizeText(store.visibleBytes))")
@@ -216,32 +209,77 @@ struct PhotosView: View {
                 Button {
                     store.select(.trash)
                 } label: {
-                    Label("待释放 \(AppStore.sizeText(store.trash.totalBytes))",
+                    Label("已标记 \(store.trash.count) 项 · \(AppStore.sizeText(store.trash.totalBytes))",
                           systemImage: "trash")
                         .font(.callout)
                         .foregroundStyle(.orange)
                 }
                 .buttonStyle(.plain)
+                .help("打开回收站；在那里「彻底删除」才会真正动设备上的照片")
             }
 
-            Spacer()
+            if let message = store.provisionalMessage {
+                Text(message)
+                    .font(.callout.weight(.medium))
+                    .foregroundStyle(.orange)
+                    // 提示再长也不许把底栏顶出窗口
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+                    .layoutPriority(-2)
+                    .transition(.opacity)
+            }
+
+            Spacer(minLength: 12)
 
             if store.selection.isEmpty {
-                Text("⌘ 点加选 · ⇧ 点连选 · 空格看大图 · S 在预览里选中")
-                    .font(.caption2)
-                    .foregroundStyle(.tertiary)
+                hintChip
             } else {
                 Text("已选 \(store.selection.count) 项 · \(AppStore.sizeText(store.selectedBytes))")
-                    .font(.callout.weight(.medium))
+                    .font(.callout.weight(.semibold))
                     .monospacedDigit()
 
-                Button("删除…") { store.presentDeleteConfirm() }
+                // 标记不二次确认：回收站本身就是那道保险
+                Button {
+                    store.markSelectedForRecycle()
+                } label: {
+                    Label("标记回收", systemImage: "trash")
+                }
+                .controlSize(.small)
+                .help("打上回收标记（不需要二次确认），到回收站点「彻底删除」才真正从 iPhone 上删掉")
+
                 Button("取消选择") { store.clearSelection() }
+                    .controlSize(.small)
             }
         }
         .padding(.horizontal, 18)
-        .padding(.vertical, 8)
+        // 底栏高度**钉死**：换提示 / 换选中态时不许自己长高或缩矮。
+        // 内容一律按小号控件排，保证 38pt 装得下，不会有任何东西把这一条顶高。
+        .frame(height: 38)
         .background(.bar)
+        .animation(.easeInOut(duration: 0.16), value: store.selection.isEmpty)
+        .animation(.easeInOut(duration: 0.18), value: store.provisionalMessage)
+    }
+
+    /// 底栏右下角的操作提示：以前是一行 tertiary 小字，几乎看不见。
+    /// 现在包一层胶囊、字号提到 caption、颜色从 tertiary 提到 secondary。
+    private var hintChip: some View {
+        HStack(spacing: 5) {
+            Image(systemName: "cursorarrow.click.2")
+                .font(.system(size: 10, weight: .medium))
+            Text("单击选中 · ⇧ 连选 · 拖动框选 · 空格预览")
+                .font(.caption)
+                // 窗口窄的时候先截这句，不许把胶囊顶出窗口
+                .lineLimit(1)
+                .truncationMode(.tail)
+                .layoutPriority(-1)
+        }
+        .foregroundStyle(.secondary)
+        .padding(.horizontal, 9)
+        .padding(.vertical, 3)
+        .fixedSize(horizontal: false, vertical: true)
+        .background(Capsule().fill(Color.secondary.opacity(0.10)))
+        .overlay(Capsule().strokeBorder(Color.secondary.opacity(0.16), lineWidth: 1))
+        .help("⌘A 全选 · Esc 取消选择 · ⌘R 重新读取设备")
     }
 }
 

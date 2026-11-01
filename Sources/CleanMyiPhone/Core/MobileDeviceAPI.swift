@@ -551,6 +551,32 @@ final class MobileDeviceAPI {
         return afc
     }
 
+    /// 启动任意服务，并把它的 socket 当成 AFC 通道打开。
+    ///
+    /// 给 **Airlock**（电脑往设备导入照片/音乐/书籍的官方通道）这类服务用：
+    /// 它 StartService 之后直接就是一条 AFC，根目录挂在 `/var/mobile/Media/Airlock/`。
+    /// 和 `com.apple.afc` 的区别只在于根目录，协议完全一样。
+    ///
+    /// 探针 `--probe-airlock` 用它；写入通路的正式实现也走这里。
+    func openServiceAFC(_ device: UnsafeMutableRawPointer, name: String) throws -> UnsafeMutableRawPointer {
+        var service: UnsafeMutableRawPointer?
+        let status = startService(device, name as CFString, nil, &service)
+        guard status == 0, let service else {
+            throw NSError(domain: "cleanmyiphone", code: 71,
+                          userInfo: [NSLocalizedDescriptionKey: "启动服务 \(name) 失败（status=\(status)）"])
+        }
+        let socket = serviceGetSocket(service)
+        guard socket > 0 else {
+            throw NSError(domain: "cleanmyiphone", code: 72,
+                          userInfo: [NSLocalizedDescriptionKey: "服务 \(name) 没有可用 socket"])
+        }
+        guard let afc = afcCreate(nil, socket, 0, nil, nil) else {
+            throw NSError(domain: "cleanmyiphone", code: 73,
+                          userInfo: [NSLocalizedDescriptionKey: "\(name) 的 AFCConnectionCreate 失败"])
+        }
+        return afc
+    }
+
     /// 优雅关掉 AFC 连接。
     /// 先 invalidate（让另一条线程里阻塞中的 `AFCFileRefOpen/Read` 立刻返回），
     /// 再 close（发 CLOSE 包并释放）。顺序反了会在阻塞线程里 UAF。

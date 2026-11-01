@@ -18,6 +18,8 @@ final class PTPBridge: NSObject, DeviceSource {
 
     private let browser = ICDeviceBrowser()
     private var camera: ICCameraDevice?
+    /// 上传探针的回调落点（一次一条）
+    private var uploadResult: ((String) -> Void)?
 
     private let lock = NSLock()
     private var filesByID: [String: ICCameraFile] = [:]
@@ -360,6 +362,53 @@ final class PTPBridge: NSObject, DeviceSource {
         publish()
 
         return (succeeded, failed)
+    }
+
+    // MARK: - 上传探针（能不能把文件写回设备）
+
+    /// 试 `ICCameraDevice.requestUploadFile`。
+    ///
+    /// 头文件里这个方法被标成：
+    /// `IC_DEPRECATED("Sandbox restrictions prohibit writing directly to device hardware", macos(10.4,14.0))`
+    /// —— 只是 deprecated 不是 unavailable，所以还有必要实测一次：
+    /// 本 App 是 ad-hoc 签名的非沙盒程序，可能不受 Apple 那把锁影响。
+    /// 结果决定「压缩版能不能自动回手机相册」，是整条方案的最后一块拼图。
+    func probeUpload(fileURL: URL, timeout: TimeInterval = 20) async -> String {
+        guard let camera else { return "设备没连上" }
+        return await withCheckedContinuation { (continuation: CheckedContinuation<String, Never>) in
+            var finished = false
+            let box = NSLock()
+            let finish: (String) -> Void = { message in
+                box.lock()
+                let first = !finished
+                finished = true
+                box.unlock()
+                if first { continuation.resume(returning: message) }
+            }
+            self.uploadResult = finish
+
+            camera.requestUploadFile(fileURL,
+                                     options: [:],
+                                     uploadDelegate: self,
+                                     didUploadSelector: #selector(PTPBridge.uploadDidFinish(_:error:contextInfo:)),
+                                     contextInfo: nil)
+
+            DispatchQueue.main.asyncAfter(deadline: .now() + timeout) {
+                finish("超时：\(Int(timeout)) 秒没有回调（设备大概率不认这条命令）")
+            }
+        }
+    }
+
+    @objc private func uploadDidFinish(_ fileURL: URL,
+                                       error: Error?,
+                                       contextInfo: UnsafeMutableRawPointer?) {
+        let sink = uploadResult
+        uploadResult = nil
+        if let error {
+            sink?("失败：\(error.localizedDescription)")
+        } else {
+            sink?("成功：\(fileURL.lastPathComponent) 已上传")
+        }
     }
 
     private static func message(forDelete key: ICDeleteError) -> String {

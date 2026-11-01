@@ -103,12 +103,13 @@ struct MainSidebarView: View {
         .tag(AppStore.SidebarItem.albums)
     }
 
-    /// 左下角：读取结束后才出现。别的页面（全屏预览、锁屏提示）不该出现这两个按钮。
+    /// 左下角：**读取中也一直显示**。
+    /// 以前是 `if !store.isScanning { purgeButton }` —— 点顶栏刷新时这块整个消失，
+    /// 扫完又冒回来，用户看到的就是"清空按钮不见了，可它也没刷新"。
+    /// 现在只把按钮置灰、上面加一行"正在读取"，位置不动。
     private var cacheBar: some View {
         VStack(alignment: .leading, spacing: 6) {
-            if !store.isScanning {
-                purgeButton
-            }
+            purgeButton
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .padding(.horizontal, 10)
@@ -120,6 +121,16 @@ struct MainSidebarView: View {
     /// 而且关掉它等于允许硬盘上留一份 296 MB 的照片库复印件。
     private var purgeButton: some View {
         VStack(alignment: .leading, spacing: 6) {
+            if store.isScanning {
+                HStack(spacing: 6) {
+                    ProgressView().controlSize(.mini)
+                    Text(store.scanStageTitle)
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                }
+            }
+
             Text("退出即清空 · 本机不留缓存")
                 .font(.caption)
                 .foregroundStyle(.secondary)
@@ -131,6 +142,7 @@ struct MainSidebarView: View {
                 }
                 .buttonStyle(.bordered)
                 .controlSize(.small)
+                .disabled(store.isScanning)
                 .help("立刻删掉缩略图、临时原图/原视频、相册库中转文件；清完不会自动重建")
 
                 Button("重新读取", systemImage: "arrow.clockwise") {
@@ -138,8 +150,10 @@ struct MainSidebarView: View {
                 }
                 .buttonStyle(.bordered)
                 .controlSize(.small)
-                .disabled(!store.dataPaused)
-                .help("清空之后用它重新读一遍设备")
+                // 正常状态下也**永远可点**（2026-11 用户定的）：以前只在暂停态可点，
+                // 没清空过就等于摆着看。清空过时 resumeReading 顺手解除暂停，没清空时就是重读一遍。
+                .disabled(store.isScanning)
+                .help("重新读取设备（重扫照片目录 + 重读相册索引）")
             }
 
             if store.purgeLeftovers.isEmpty, let message = store.purgeMessage {

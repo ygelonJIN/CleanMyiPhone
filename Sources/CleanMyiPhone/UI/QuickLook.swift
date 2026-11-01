@@ -3,29 +3,59 @@ import SwiftUI
 
 /// 独立预览层（类似 Quick Look）：盖住整个内容区，不改变选中项。
 /// 打开目标由「鼠标悬停」决定：悬停哪一项，空格就预览哪一项。
+///
+/// 动画按 Quick Look 那套做：卡片从**被悬停那一格的中心**长出来（spring，0.34s），
+/// 关闭时缩回去、缩完才真正拆状态（`store.isClosingPreview` 负责那 180 ms）。
 struct PreviewOverlay: View {
     @Environment(AppStore.self) private var store
     @State private var player: AVPlayer?
+    /// 实况照片的视频分量播放器（和整段视频的 `player` 分开：
+    /// 一个是"这张照片在动"，一个是"这是个视频"，生命周期和位置都不同）
+    @State private var livePlayer: AVPlayer?
+    /// 播完观察者令牌，换目标时必须撤掉
+    @State private var liveEndToken: NSObjectProtocol?
+    /// 实况视频当前是不是在画面上。**不循环**：放一次就停，
+    /// 用户点左上角「实况」才再放一次。
+    @State private var livePlaying = false
+    /// 进场 / 退场：只驱动缩放和透明度，不参与任何数据
+    @State private var presented = false
 
     private var asset: Asset? { store.previewAsset }
 
     var body: some View {
-        ZStack {
-            // 全屏预览要盖死底下的界面：ultraThin 是半透明的，
-            // 侧栏的勾选框会透上来（用户看到的"勾选框浮在预览上"就是它）。
-            Rectangle()
-                .fill(.thickMaterial)
-                .ignoresSafeArea()
-                .contentShape(Rectangle())
-                .onTapGesture { store.closePreview() }
+        GeometryReader { proxy in
+            let anchor = anchorPoint(in: proxy.size)
 
-            VStack(spacing: 0) {
-                topBar
-                media
-                infoBar
+            ZStack {
+                // 全屏预览要盖死底下的界面：ultraThin 是半透明的，
+                // 侧栏的勾选框会透上来（用户看到的"勾选框浮在预览上"就是它）。
+                Rectangle()
+                    .fill(.thickMaterial)
+                    .ignoresSafeArea()
+                    .contentShape(Rectangle())
+                    .opacity(presented ? 1 : 0)
+                    .onTapGesture { store.closePreview() }
+
+                VStack(spacing: 0) {
+                    topBar
+                    media
+                        // 从缩略图那一格长出来：锚点就是那一格的中心
+                        .scaleEffect(presented ? 1 : 0.72, anchor: anchor)
+                        .opacity(presented ? 1 : 0)
+                    infoBar
+                        .opacity(presented ? 1 : 0)
+                }
+                .padding(.horizontal, 28)
+                .padding(.vertical, 20)
             }
-            .padding(.horizontal, 28)
-            .padding(.vertical, 20)
+            .frame(width: proxy.size.width, height: proxy.size.height)
+        }
+        .onAppear {
+            withAnimation(.spring(response: 0.34, dampingFraction: 0.86)) { presented = true }
+        }
+        .onChange(of: store.isClosingPreview) { _, closing in
+            guard closing else { return }
+            withAnimation(.easeIn(duration: 0.17)) { presented = false }
         }
         .onChange(of: store.previewVideoURL) { _, url in
             // 换目标时 loadPreviewImage 会先把 url 置空：这时必须把播放器一起放掉，
@@ -34,49 +64,175 @@ struct PreviewOverlay: View {
             player = url.map { AVPlayer(url: $0) }
             player?.play()
         }
+        .onChange(of: store.previewLiveVideoURL) { _, url in
+            // 实况分量到了：盖在静态图上**放一次**。
+            // 不放第二次 —— 想再看就点左上角那个「实况」。
+            stopLivePlayback()
+            guard let url else { return }
+            let live = AVPlayer(url: url)
+            live.isMuted = true
+            // 播完只把画面撤掉，player 留着：再点时 seek 回 0 就能立刻放，
+            // 不用重新建、不用重新解码
+            if let item = live.currentItem {
+                liveEndToken = NotificationCenter.default.addObserver(
+                    forName: .AVPlayerItemDidPlayToEndTime,
+                    object: item,
+                    queue: .main
+                ) { _ in
+                    livePlaying = false
+                }
+            }
+            livePlayer = live
+            livePlaying = true
+            live.play()
+        }
         .onChange(of: store.previewID) { _, _ in
             // 直接从一个视频跳到另一个（← →）也要停掉旧的，别让上一段在旁边接着放
             player?.pause()
             player = nil
+            stopLivePlayback()
         }
-        .onDisappear { player?.pause() }
+        .onDisappear {
+            player?.pause()
+            stopLivePlayback()
+        }
+    }
+
+    /// 停掉实况播放并撤掉播完观察者。
+    /// 观察者必须显式 remove：`addObserver(forName:object:queue:using:)` 的 block 版
+    /// 不会随 object 释放自动注销，留着就是每次换目标多一个常驻回调。
+    private func stopLivePlayback() {
+        livePlayer?.pause()
+        livePlayer = nil
+        livePlaying = false
+        if let token = liveEndToken {
+            NotificationCenter.default.removeObserver(token)
+            liveEndToken = nil
+        }
+    }
+
+    /// 点「实况」：从头再放一次
+    private func replayLive() {
+        guard let live = livePlayer else { return }
+        live.seek(to: .zero)
+        livePlaying = true
+        live.play()
+    }
+
+    /// 缩放锚点：悬停那一格在 root 坐标系里的中心，归一化成 UnitPoint。
+    /// 拿不到（用键盘开预览、从回收站开）就居中，不硬猜。
+    private func anchorPoint(in size: CGSize) -> UnitPoint {
+        guard let rect = store.previewAnchorRect,
+              rect.width > 1, rect.height > 1,
+              size.width > 1, size.height > 1 else { return .center }
+        return UnitPoint(x: min(max(rect.midX / size.width, 0), 1),
+                         y: min(max(rect.midY / size.height, 0), 1))
     }
 
     // MARK: - 顶栏
 
     private var topBar: some View {
-        HStack(spacing: 12) {
-            Button {
-                store.closePreview()
-            } label: {
-                Image(systemName: "xmark")
-                    .font(.system(size: 11, weight: .bold))
-                    .frame(width: 24, height: 24)
-                    .background(Circle().fill(.quaternary))
-            }
-            .buttonStyle(.plain)
-            .help("关闭（Esc）")
-
-            Spacer(minLength: 0)
-
-            if let asset {
-                VStack(spacing: 1) {
+        ZStack {
+            // 标题居中，两侧各自独立，窄窗口下只截标题、不截提示
+            VStack(spacing: 1) {
+                if let asset {
                     Text(asset.fileName)
-                        .font(.headline)
+                        .font(.system(size: 15, weight: .semibold))
                         .lineLimit(1)
-                    // 取回进度只在中间那张卡片里显示，标题下面保持干净
-                    Text("\(indexText) · \(asset.kind.label)")
-                        .font(.caption.monospacedDigit())
-                        .foregroundStyle(.secondary)
+                        .truncationMode(.middle)
+                    HStack(spacing: 6) {
+                        Text("\(indexText) · \(asset.kind.label)")
+                            .font(.caption.monospacedDigit())
+                            .foregroundStyle(.secondary)
+                        statePill
+                    }
                 }
             }
+            .padding(.horizontal, 340)
 
-            Spacer(minLength: 0)
+            HStack(spacing: 0) {
+                Button {
+                    store.closePreview()
+                } label: {
+                    Image(systemName: "xmark")
+                        .font(.system(size: 11, weight: .bold))
+                        .frame(width: 24, height: 24)
+                        .background(Circle().fill(.quaternary))
+                }
+                .buttonStyle(.plain)
+                .help("关闭（Esc / 空格）")
 
-            // 和左侧关闭按钮对称，保证标题真居中
-            Color.clear.frame(width: 24, height: 24)
+                Spacer(minLength: 0)
+
+                // 提示从右下角搬到顶部，而且**本身就是按钮** ——
+                // 既能看快捷键，也能直接点着用。
+                HStack(spacing: 6) {
+                    hintButton("空格", "关闭") { store.closePreview() }
+                    hintButton("← →", "下一张") { store.stepPreview(1) }
+                    // 已标记回收的项不许再选中：它已经在待删名单里了
+                    hintButton("⏎", isSelected ? "取消选中" : "选中",
+                               enabled: !isPending) { store.togglePreviewSelection() }
+                    hintButton("⌫", isPending ? "取消标记" : "标记回收") {
+                        if isPending { store.unmarkCurrentPreview() }
+                        else { store.trashCurrentPreview() }
+                    }
+                }
+            }
         }
         .padding(.bottom, 12)
+    }
+
+    /// 当前这一项的状态胶囊：选中 / 已标记回收
+    @ViewBuilder
+    private var statePill: some View {
+        if isPending {
+            pill("已标记回收", symbol: "trash.fill", tint: .orange)
+        } else if isSelected {
+            pill("已选中", symbol: "checkmark.circle.fill", tint: .accentColor)
+        }
+    }
+
+    private func pill(_ text: String, symbol: String, tint: Color) -> some View {
+        Label(text, systemImage: symbol)
+            .font(.system(size: 10, weight: .semibold))
+            .foregroundStyle(tint)
+            .padding(.horizontal, 7)
+            .padding(.vertical, 2)
+            .background(Capsule().fill(tint.opacity(0.14)))
+            .overlay(Capsule().strokeBorder(tint.opacity(0.35), lineWidth: 1))
+    }
+
+    /// 键帽 + 文字，整个是一颗按钮：键帽告诉你快捷键，点它直接执行
+    private func hintButton(_ key: String,
+                            _ label: String,
+                            enabled: Bool = true,
+                            action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            HStack(spacing: 5) {
+                Text(key)
+                    .font(.system(size: 12, weight: .semibold, design: .rounded))
+                    .frame(minWidth: 26)
+                    .padding(.horizontal, 5)
+                    .padding(.vertical, 3)
+                    .background(
+                        RoundedRectangle(cornerRadius: 5, style: .continuous)
+                            .fill(.quaternary)
+                    )
+                Text(label)
+                    .font(.system(size: 12.5, weight: .medium))
+            }
+            .padding(.horizontal, 7)
+            .padding(.vertical, 3)
+            .background(
+                RoundedRectangle(cornerRadius: 8, style: .continuous)
+                    .fill(Color.secondary.opacity(enabled ? 0.10 : 0.04))
+            )
+            .contentShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+        }
+        .buttonStyle(.plain)
+        .disabled(!enabled)
+        .opacity(enabled ? 1 : 0.45)
+        .help(enabled ? "\(key) · \(label)" : "已标记回收的项不能选中")
     }
 
     private var indexText: String {
@@ -91,14 +247,9 @@ struct PreviewOverlay: View {
         ZStack {
             if let asset, asset.kind == .video {
                 if let player {
-                    PlayerSurface(player: player)
-                        .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
-                        .shadow(color: .black.opacity(0.28), radius: 24, y: 8)
+                    framed(PlayerSurface(player: player))
                 } else if let image = store.previewImage {
-                    Image(nsImage: image)
-                        .resizable()
-                        .aspectRatio(contentMode: .fit)
-                        .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+                    framed(Image(nsImage: image).resizable().aspectRatio(contentMode: .fit))
                         .overlay { videoOverlay }
                 } else {
                     // 还没缩略图、也还没起播：这一格以前是**全空**，
@@ -108,11 +259,15 @@ struct PreviewOverlay: View {
                         .overlay { videoOverlay }
                 }
             } else if let image = store.previewImage {
-                Image(nsImage: image)
-                    .resizable()
-                    .aspectRatio(contentMode: .fit)
-                    .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
-                    .shadow(color: .black.opacity(0.28), radius: 24, y: 8)
+                framed(Image(nsImage: image).resizable().aspectRatio(contentMode: .fit))
+                    // 实况：视频分量直接盖在静态图上，静态图永远是打底的
+                    // （视频没到、解析失败、循环卡住时，看到的还是这张照片本身）
+                    .overlay { liveLayer }
+                    .overlay(alignment: .topLeading) {
+                        if let asset, store.isLivePhoto(asset) {
+                            liveBadge
+                        }
+                    }
                     .overlay(alignment: .bottom) {
                         // 原图没取到时界面里只剩缩略图，必须说清楚，别让人以为看到的就是原图
                         if let error = store.previewError {
@@ -132,6 +287,68 @@ struct PreviewOverlay: View {
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+
+    /// 实况的视频分量。盖在静态图上，不接鼠标事件（点击/缩放都归下层那张图）。
+    @ViewBuilder
+    private var liveLayer: some View {
+        if let livePlayer, livePlaying {
+            PlayerSurface(player: livePlayer, showsControls: false)
+                .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+                .allowsHitTesting(false)
+        }
+    }
+
+    /// 左上角「实况」角标，**同时是重播按钮**。
+    /// 放一次就停（不循环）——想再看就点它，不点就一直停在静态图上。
+    private var liveBadge: some View {
+        Button {
+            replayLive()
+        } label: {
+            HStack(spacing: 4) {
+                Image(systemName: livePlaying ? "livephoto.play" : "livephoto")
+                    .font(.system(size: 9, weight: .semibold))
+                Text(liveBadgeText)
+                    .font(.system(size: 10, weight: .semibold))
+                    .monospacedDigit()
+            }
+            .padding(.horizontal, 7)
+            .padding(.vertical, 3)
+            .background(.black.opacity(liveCanReplay ? 0.62 : 0.5), in: Capsule())
+            .foregroundStyle(.white)
+        }
+        .buttonStyle(.plain)
+        .disabled(!liveCanReplay)
+        .help(liveCanReplay ? "播一遍实况" : (livePlaying ? "正在播放" : "实况片段还在取回"))
+        .padding(10)
+        .animation(Motion.fade, value: livePlaying)
+    }
+
+    private var liveBadgeText: String {
+        if livePlaying { return "实况" }
+        if store.previewLiveVideoURL == nil { return "实况 · 正在取回" }
+        return "实况 · 点击播放"
+    }
+
+    private var liveCanReplay: Bool {
+        store.previewLiveVideoURL != nil && !livePlaying
+    }
+
+    /// 图片外框：圆角 + 状态描边（选中 = 强调色，标记 = 橙色）+ 投影
+    private func framed<V: View>(_ content: V) -> some View {
+        content
+            .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+            .overlay {
+                RoundedRectangle(cornerRadius: 10, style: .continuous)
+                    .strokeBorder(stateBorderColor, lineWidth: 3)
+            }
+            .shadow(color: .black.opacity(0.28), radius: 24, y: 8)
+    }
+
+    private var stateBorderColor: Color {
+        if isPending { return .orange }
+        if isSelected { return .accentColor }
+        return .clear
     }
 
     private var videoOverlay: some View {
@@ -210,7 +427,7 @@ struct PreviewOverlay: View {
                 Divider().frame(height: 30)
 
                 HStack(spacing: 20) {
-                    infoItem("类型", asset.kind.label)
+                    infoItem("类型", store.isLivePhoto(asset) ? "实况照片" : asset.kind.label)
                     infoItem("格式", asset.fileExtension)
                     infoItem("相簿", asset.folder)
                     if asset.isCloudOnly {
@@ -220,35 +437,24 @@ struct PreviewOverlay: View {
 
                 Spacer()
 
-                // 预览里就能选中 / 标记 / 删，不用退出去再点一遍
-                Button {
-                    store.togglePreviewSelection()
-                } label: {
-                    Label(isSelected ? "取消选中" : "选中",
-                          systemImage: isSelected ? "checkmark.circle.fill" : "circle")
-                }
-                .controlSize(.regular)
-                .help("把当前这一项加入 / 移出选择（S）")
-
-                Button {
-                    store.togglePreviewSelection()
-                    store.trashCurrentPreview()
-                } label: {
-                    Label("收进回收站", systemImage: "trash")
-                }
-                .controlSize(.regular)
-                .help("打上删除标记并跳到下一项（⌫）")
-
+                // 选中 / 标记的入口都在顶栏那一排键帽上（可点），
+                // 这里只留状态读数，不再重复放两个按钮。
                 VStack(alignment: .trailing, spacing: 1) {
-                    Text("空格关闭 · ← → 切换")
-                        .font(.caption2)
-                        .foregroundStyle(.tertiary)
-                    if !store.selection.isEmpty {
+                    if store.selection.isEmpty {
+                        Text("未选中任何项")
+                            .font(.caption2)
+                            .foregroundStyle(.tertiary)
+                    } else {
+                        // 预览里也要看到「已选几项 · 占多少空间」
                         Text("已选 \(store.selection.count) 项")
-                            .font(.caption2.monospacedDigit())
+                            .font(.caption.monospacedDigit())
                             .foregroundStyle(.secondary)
+                        Text(AppStore.sizeText(store.selectedBytes))
+                            .font(.system(size: 15, weight: .semibold, design: .rounded))
+                            .monospacedDigit()
                     }
                 }
+                .frame(minWidth: 96, alignment: .trailing)
             }
         }
         .padding(.top, 14)
@@ -257,6 +463,11 @@ struct PreviewOverlay: View {
     private var isSelected: Bool {
         guard let asset else { return false }
         return store.selection.contains(asset.id)
+    }
+
+    private var isPending: Bool {
+        guard let asset else { return false }
+        return store.pendingDeletions.contains(asset.id)
     }
 
     private func infoItem(_ title: String, _ value: String) -> some View {
@@ -275,10 +486,12 @@ struct PreviewOverlay: View {
 /// 用 AppKit 的 AVPlayerView 播放，避开 SwiftUI VideoPlayer 在当前系统上的崩溃
 struct PlayerSurface: NSViewRepresentable {
     let player: AVPlayer
+    /// 实况照片的视频分量盖在静态图上，不能带播放控件（3 秒的片段弹一排按钮很怪）
+    var showsControls = true
 
     func makeNSView(context: Context) -> AVPlayerView {
         let view = AVPlayerView()
-        view.controlsStyle = .inline
+        view.controlsStyle = showsControls ? .inline : .none
         view.videoGravity = .resizeAspect
         view.player = player
         return view

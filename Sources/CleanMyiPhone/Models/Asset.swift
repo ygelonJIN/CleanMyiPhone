@@ -86,15 +86,16 @@ struct Asset: Identifiable, Hashable {
 
 // MARK: - 排序
 
+/// 只有两种排序。按文件名排没有用处（PTP 报的名字常常是随机的、和磁盘上的
+/// 对不上），2026-11 删掉。
 enum SortKey: String, CaseIterable, Identifiable {
-    case date, size, name
+    case date, size
 
     var id: String { rawValue }
     var label: String {
         switch self {
         case .date: return "时间"
         case .size: return "大小"
-        case .name: return "文件名"
         }
     }
 }

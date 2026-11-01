@@ -88,16 +88,15 @@ extension Notification.Name {
 
 struct RootView: View {
     @Environment(AppStore.self) private var store
-    @FocusState private var keyFocus: Bool
     @State private var showSidebar = true
     @State private var showInspector = true
 
     private func toggleSidebar() {
-        withAnimation(.easeInOut(duration: 0.18)) { showSidebar.toggle() }
+        withAnimation(.easeInOut(duration: 0.4)) { showSidebar.toggle() }
     }
 
     private func toggleInspector() {
-        withAnimation(.easeInOut(duration: 0.16)) { showInspector.toggle() }
+        withAnimation(.easeInOut(duration: 0.36)) { showInspector.toggle() }
     }
 
     var body: some View {
@@ -106,7 +105,10 @@ struct RootView: View {
         // 自己排三列：NavigationSplitView 的折叠状态不可控，
         // 出现过"点了按钮不收"的情况，干脆不用它。
         HStack(spacing: 0) {
-            if showSidebar && store.previewID == nil {
+            // 预览时**不再收起左右两栏**：一收 window 内容区变宽，LazyVGrid 会重排列数，
+            // 空格开预览再关掉，底下的网格整体跳一下 —— 用户说的"视图位置会变、
+            // 会缩一下、会划走"就是这个。预览层本来就整窗盖死，收不收栏看不出来。
+            if showSidebar {
                 MainSidebarView()
                     // 左栏定宽 + 最小宽度：窗口再窄也不许把它挤扁或裁掉文字
                     .frame(minWidth: 236, idealWidth: 236, maxWidth: 236)
@@ -115,11 +117,13 @@ struct RootView: View {
                 Divider()
             }
 
+            // 500 是顶栏要的最小宽度：6 个控件收窄后合计 444 + 左右内边距 36 = 480。
+            // 低于这个数顶栏就只能横向滚，"如图标视图/日月年按钮被裁掉"就是这么来的。
             page
-                .frame(minWidth: 460, maxWidth: .infinity, maxHeight: .infinity)
+                .frame(minWidth: 500, maxWidth: .infinity, maxHeight: .infinity)
                 .layoutPriority(1)
 
-            if showInspector && store.previewID == nil {
+            if showInspector {
                 Divider()
                 DeviceInspector()
                     // 右栏同样定宽 + 最小宽度
@@ -128,60 +132,56 @@ struct RootView: View {
                     .transition(.move(edge: .trailing))
             }
         }
-        .frame(minWidth: 900, minHeight: 620)
+        // 236 + 1 + 500 + 1 + 180 = 918：窗口最小宽度必须盖住三栏 + 顶栏，
+        // 否则顶栏右边那几个控件会被裁掉（2026-11 用户报的就是这个）。
+        .frame(minWidth: 920, minHeight: 620)
+        .coordinateSpace(name: PreviewAnchorSpace.root)
         .background(WindowOnScreenGuard())
         .toolbar(removing: .sidebarToggle)
         .environment(\.toggleSidebar, toggleSidebar)
         .environment(\.toggleInspector, toggleInspector)
         .environment(\.sidebarVisible, showSidebar)
         .environment(\.inspectorVisible, showInspector)
-        .focusable()
-        .focusEffectDisabled()
-        .focused($keyFocus)
-        .onAppear { keyFocus = true }
-        .onKeyPress(keys: AppStore.handledKeys) { press in
-            store.handleKey(press)
-        }
-        // 点过格子之后焦点可能跑到滚动视图上，空格就失效了。
-        // 选择一变就把键盘焦点抢回来。
-        .onChange(of: store.selection) { _, _ in keyFocus = true }
-        .onChange(of: store.previewID) { _, _ in keyFocus = true }
+        // 键盘走窗口级监听（`KeyMonitor`）：不再靠 SwiftUI 焦点，
+        // 鼠标点过预览键帽 / 播放器抢走 first responder 之后照样收得到 ⌫ ⏎ 空格 ←→。
+        .background(KeyMonitor { event in store.handleKeyEvent(event) })
         .onReceive(NotificationCenter.default.publisher(for: .toggleInspector)) { _ in
             toggleInspector()
         }
         .onReceive(NotificationCenter.default.publisher(for: .toggleSidebar)) { _ in
             toggleSidebar()
         }
-        .sheet(isPresented: $store.confirmPresented) {
-            ConfirmSheet().environment(store)
+        // 二次确认只剩一处：回收站里的「彻底删除」（真的动设备）
+        .sheet(isPresented: $store.emptyTrashConfirmPresented) {
+            EmptyTrashSheet().environment(store)
         }
         .overlay {
-            // 全流程只用**一个**读取中遮罩（`LibraryIndexGate`）：
-            // 以前这里是另一套「转圈 + 一行字」，和照片页那套字体/进度条都不一样，
-            // 同一个动作在两处长得不同 —— 现在统一成同一个组件。
-            if !store.needsLibraryGate, store.isScanning, store.assets.isEmpty {
+            // 全流程只用**一个**遮罩组件（`LibraryIndexGate`），而且只有这一层：
+            // 1) 相册索引没就绪 —— 任何页面都盖（含概览），点了「重新读取」也继续盖着读；
+            // 2) 库好了、照片目录还在枚举 —— 盖到第一批资产出来为止。
+            if store.needsLibraryGate {
                 LibraryIndexGate()
                     .transition(.opacity)
-            }
-        }
-        .overlay {
-            // 相册索引没读完就整页盖死（左右两栏一起）：这一阶段预览开了也只能干等，
-            // 库读完自动撤。暂停态 / 未连接 / 锁屏不盖，那几种情况要能操作。
-            if store.needsLibraryGate {
+            } else if store.isScanning, store.assets.isEmpty, !store.needsConnection {
                 LibraryIndexGate()
                     .transition(.opacity)
             }
         }
         .overlay {
             if store.previewID != nil {
+                // 预览自己的进出场动画（从缩略图长出来 / 缩回去）在 PreviewOverlay 里，
+                // 这里不能给 transition：否则会和缩放叠成"缩放 + 淡入"两个动作。
                 PreviewOverlay()
-                    .transition(.opacity)
+                    .transition(.identity)
             }
         }
-        .animation(.easeInOut(duration: 0.15), value: store.needsLibraryGate)
-        .animation(.easeInOut(duration: 0.12), value: store.previewID)
-        .animation(.easeInOut(duration: 0.16), value: showSidebar)
-        .animation(.easeInOut(duration: 0.16), value: showInspector)
+        .onChange(of: store.emptyTrashConfirmPresented) { _, shown in
+            // 弹窗被 Esc / 点外面关掉时，别把待删名单留在内存里
+            if !shown { store.pendingDeleteIDs = [] }
+        }
+        .animation(.easeInOut(duration: 0.3), value: store.needsLibraryGate)
+        .animation(.easeInOut(duration: 0.36), value: showSidebar)
+        .animation(.easeInOut(duration: 0.36), value: showInspector)
     }
 
     @ViewBuilder
