@@ -55,8 +55,11 @@ macOS 上的 iPhone 空间清理工具（SwiftUI，零外部依赖）。个人�
 | `Sources/CleanMyiPhone/` | 全部源码（App / Core / Models / UI） |
 | `Resources/Info.plist` | App 包信息 |
 | `scripts/make-app.sh` | 打包 `.app` + ad-hoc 签名 |
-| `Package.swift` / `Makefile` | SwiftPM 与常用命令 |
+| `scripts/make-dmg.sh` | 发给别人用：arm64 + x86_64 各编一次 → 通用二进制 → `.app` → 同时出「文件夹 / zip / DMG」三份同内容包（每份都是 App + `首次打开.command` + `使用说明.txt` + `/Applications` 快捷方式） |
+| `scripts/dmg/` | DMG 里那两个给人看的文件（`首次打开.command` / `使用说明.txt`），改文案只改这里 |
+| `Package.swift` / `Makefile` | SwiftPM 与常用命令（`make app` / `make dmg`） |
 | `build/` | 产物（`.app`），不提交 |
+| `dist/` | 打出来的三种同内容产物：`cleanmyiphone-<ver>/`（文件夹，直接发）、`.zip`（压缩发）、`-universal.dmg`（最稳），不提交 |
 | `方案讨论.md` / `执行方案.md` / `界面改版讨论.md` / `源码评估与精简.md` / `决策清单.md` | **历史设计稿**（文件头有标记）：看思路可以，别当现状——界面细节已过时，以本文件与源码为准 |
 | `经验文档/` | 领域经验，见下 |
 | `不推送/` | 本地私人物件，永不提交 |
@@ -99,8 +102,9 @@ macOS 上的 iPhone 空间清理工具（SwiftUI，零外部依赖）。个人�
   | `kill -9` / 断电 | `bootstrap()` 第一步的 `purgeLocalDataOnDisk()` | 全清 |
   **崩溃那一刻拿不到目录列表**（`readdir` 不是异步信号安全的），所以每写一个文件就 `TraceRegistry.registerTrace(url)`（固定容量 8192 个 C 字符串，存指针再 `+= count`），handler 只做 `remove()`。信号上下文里**不能调 Foundation**，固定名路径在 `install()` 时用 `prepareSignalSafePaths()` 预先 `strdup` 好。
   `CMI_TRACE_DIR` 可以把整棵数据目录挪到临时位置（测试崩溃清场用，不动真数据）。自检：`CleanMyiPhone --trace-selftest`。
-  **实测**（2026-11-01，真机）：启动/退出后 `ls -A ~/Library/Application Support/cleanmyiphone` 空、`$TMPDIR` 无残留、`.ips` 29→0、`/tmp` 调试日志无；只留 `~/Library/Preferences/local.cleanmyiphone.plist`（862 B，窗口位置）。SIGSEGV 实测：崩溃前目录里有四件套，崩后目录空。
+  **实测**（2026-11-01，真机）：启动/退出后 `ls -A ~/Library/Application Support/cleanmyiphone` 空、`$TMPDIR` 无残留、`.ips` 29→0、`/tmp` 调试日志无。**2026-11-01 又补了两处（发给别人用之前必须干净）**：① `~/Library/Preferences/local.cleanmyiphone.plist`（窗口位置 + 屏幕尺寸）和由它派生的 `savedState` / `Caches` 现在也删 —— 但 cfprefsd 是**退出那一刻**才刷盘的，进程内删不掉，所以 `purgeOnTerminate()` 末尾调 `TraceRegistry.schedulePostExitSweep()`，起一个脱离自己的 `/bin/sh`：`sleep 1.2` → 删偏好 + 空掉的整个数据目录（**目录里只剩 `instance.lock` 才删**，避免刚退出又被打开时误删新实例的东西）。② 裸二进制跑出来的 `CleanMyiPhone.plist` 也算同一份痕迹，`preferenceDomains` 把 bundle id、固定 `local.cleanmyiphone`、可执行文件名三个域都列进去。实测退出 3 秒后：数据目录整个不存在、`Preferences` 里两个 plist 都没了、`$TMPDIR` 无残留。**③ 中转文件 `Photos.sqlite.new` / `.new-wal` / `.new-shm` 原来不在清单里**（清单只写了转正后的 `Photos.sqlite`）：退出那一刻正在下库时，几十上百 MB 的中转文件会留在盘上、目录也就删不掉（2026-11-01 打包后复测才发现）。现在这三个名字进了 `fileNames`，退出后那个 sweep 也会先 `rm -f` 再判目录是否可删。**实测**：起 App → 读到只差一半（目录里只有 `Photos.sqlite.new`）→ `kill -TERM` → 4 秒后数据目录整个不存在。SIGSEGV 实测：崩溃前目录里有四件套，崩后目录空。
   **手动清空（`purgeLocalData`）现在连内存一起清**：库索引、相册列表、assets、缩略图、回收站全丢，界面真的空着；点「重新读取」才重新读设备。侧栏不再有「自动清空」勾选框（开关本身就是痕迹，且关掉它等于允许留 296 MB 复印件），改成一行文案「退出即清空 · 本机不留缓存」。
+- **分发（2026-11-01 新做：发给别人用的安装包）**：`make dmg` 一次出三份**内容完全一致**的产物 —— `dist/cleanmyiphone-0.1.0/`（文件夹：App + `首次打开.command` + `使用说明.txt` + `/Applications` 快捷方式，直接 AirDrop）、`dist/cleanmyiphone-0.1.0.zip`（`ditto -c -k --keepParent` 打，保留可执行位，微信/邮件用）、`dist/cleanmyiphone-0.1.0-universal.dmg`（3.0 MB，最稳）。arm64 / x86_64 各编一次再 `lipo` 合成通用二进制（两片实测 `minos 14.0`，Intel 和 Apple 芯片的 Mac 都能跑）；没有 Developer ID，只能 ad-hoc 签名，`spctl -a` 必判 `rejected` —— 所以 DMG 里带 `首次打开.command`（`xattr -dr com.apple.quarantine` 再 `open`）和 `使用说明.txt`（源文件在 `scripts/dmg/`，改文案只改那里）。三件事实测过：解除隔离后能正常起、挂载态 `codesign --verify --deep --strict` 仍 `valid on disk`、退出 3 秒后数据目录与偏好 plist 全部消失。朋友端要求只有 macOS 14+ 和一根数据线，**不需要装任何依赖**。细节见 `经验文档/构建与调试.md` 第七节。
 - 区域（2026-11 修）：`RegionInfo` 在不同读数上会**时有时无、且可能是字符串 `CH/A` 而不是字典**，两种形态都要认；`MQ0W3` 这种无尾码的型号只能靠 RegionInfo。
 - 锁屏→解锁（2026-11）：锁屏时开 `unlockWatch`，每 2 秒问一次，解锁即自动重读。**`startScan()` 必须自己调一次 `beginSession()`**：以前只靠 PTP 的 `onDevice` 回调去触发读库，而会话没真正重开时（ICCamera 还挂着同一个设备）回调不会再来 → 库永远不重读，界面停成「正在读取相册索引 / 正在等手机回包 / 已读 0 KB」一动不动（2026-11 用户报的就是这个）。
 - **一个相簿里的「张数」必须三处一致**（2026-11 修）：二级栏、网格项数、底栏是三个来源，以前会差几十条。现在：① 相簿视图**按成员名去重**（成员集合本身就是 `Set<String>`，见 `computeVisible` 的 `albumCovered`），一张照片只算一项；② 体积统一走 `totalBytes(of:)`（`meta.resourceBytes`，含编辑版与 Live Photo 视频分量），拿不到才退 PTP 大小。实测「微信」：库里成员 615 条 → 归一化去重 613；PTP 枚举 666（原件/编辑版/同名各来一条）→ 去重后 613；体积 877.9 MB ↔ 底栏 878 MB。
@@ -131,7 +135,7 @@ macOS 上的 iPhone 空间清理工具（SwiftUI，零外部依赖）。个人�
 
 **构建与调试.md**
 - 什么时候读：编译失败、要打包、要跑真机探针、要清空本地数据、要验零痕迹。
-- 包含什么：外置卷 + 沙箱下必须带的构建参数、`make-app.sh`、探针开关与环境变量、`--fetch-library` 子进程、崩溃报告与截图调试习惯；**清空本地数据**（App 内入口 + 命令行 + 沙箱里 rm 会被拒的两种绕法）；**零痕迹验收**（退出后四条命令必须为空、`--trace-selftest` 验崩溃清场、`CMI_TRACE_DIR` 隔离测试）。
+- 包含什么：外置卷 + 沙箱下必须带的构建参数、`make-app.sh`、探针开关与环境变量、`--fetch-library` 子进程、崩溃报告与截图调试习惯；**清空本地数据**（App 内入口 + 命令行 + 沙箱里 rm 会被拒的两种绕法）；**零痕迹验收**（退出后命令必须全空、`--trace-selftest` 验崩溃清场、`CMI_TRACE_DIR` 隔离测试）；**第七节：发给别人用的 DMG**（`make dmg`、为什么要分两次编译、ad-hoc 签名与 Gatekeeper、`首次打开.command` 干什么、DMG 权限按 a+rX 摆、hdiutil 在沙箱里跑不了）。
 - 不用读：日常改业务代码时。
 
 ## 文档同步（改完功能顺手做）

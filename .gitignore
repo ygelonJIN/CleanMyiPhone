@@ -6,3 +6,4 @@ build/
 *.xcuserstate
 .DS_Store
 不推送/
+dist/

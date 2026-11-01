@@ -1815,8 +1815,15 @@ final class AppStore {
                 }
             }
         } else {
-            // 已有小图就先把 loading 关掉；大图在后台换
-            previewLoading = previewImage == nil
+            // **有缩略图也照样保持 loading**：用户看到的是一张 480px 的糊图，
+            // 原图动辄 5–20 MB，中间那段必须有交代 —— 跟视频取回时一样报字节。
+            // 以前这里是 `previewLoading = previewImage == nil`，有缩略图时进度直接关了，
+            // 屏幕上就是糊图晾着，看不出在等什么、还要多久。
+            previewLoading = true
+            previewProgressText = ""
+            previewBytesDone = 0
+            previewBytesTotal = 0
+            previewStageText = libraryIndex == nil ? "正在读取相册索引" : "正在取回原尺寸"
             previewError = nil
             let token = DeviceFiles.shared.previewToken()
             // 实况照片：另起一条任务取视频分量，不挡静态图。
@@ -1827,10 +1834,22 @@ final class AppStore {
             Task {
                 // 预览要原图：整份下载 → 原生尺寸解码，不降采样、不重编码。
                 var cg: CGImage?
-                if let got = await self.downloadOriginal(for: asset,
-                                                         to: DeviceFiles.previewPhotoDirectory,
-                                                         isCancelled: { DeviceFiles.shared.isPreviewCancelled(token) }),
-                   let decoded = DeviceFiles.decodeOriginal(got.url, asset: asset) {
+                if let got = await self.downloadOriginal(
+                    for: asset,
+                    to: DeviceFiles.previewPhotoDirectory,
+                    isCancelled: { DeviceFiles.shared.isPreviewCancelled(token) },
+                    onProgress: { done, total in
+                        Task { @MainActor in
+                            // 进度必须归属到发起它的那次预览（换目标后旧数字会串台）
+                            guard self.previewID == id else { return }
+                            self.previewBytesDone = done
+                            self.previewBytesTotal = total
+                            self.previewProgressText = total > 0
+                                ? "\(Self.sizeText(done)) / \(Self.sizeText(total))"
+                                : Self.sizeText(done)
+                        }
+                    }
+                ), let decoded = DeviceFiles.decodeOriginal(got.url, asset: asset) {
                     cg = decoded
                 } else {
                     // IC 取不到才退回 AFC
@@ -1844,6 +1863,9 @@ final class AppStore {
                                                 size: NSSize(width: cg.width, height: cg.height))
                 }
                 self.previewLoading = false
+                self.previewProgressText = ""
+                self.previewBytesDone = 0
+                self.previewBytesTotal = 0
                 if cg == nil { self.previewError = "取不到这张图（设备没回数据）" }
             }
         }
@@ -2160,6 +2182,9 @@ final class AppStore {
     /// 退出回调里拿不到 store 实例，用这个静态入口。**无条件清**。
     nonisolated static func purgeOnTerminate() {
         purgeLocalDataOnDisk()
+        // 偏好 plist 是 cfprefsd 在退出那一刻才写盘的，进程内删不掉 ——
+        // 挂一个退出后的一次性清理（见 `TraceRegistry.schedulePostExitSweep`）
+        TraceRegistry.schedulePostExitSweep()
     }
 
     /// 立即清空。**磁盘 + 内存一起清**：清完界面是真的空着，不是"还记得但看不到"。

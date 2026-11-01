@@ -34,6 +34,10 @@ enum TraceRegistry {
     /// 数据根目录下**名字固定**的文件（崩溃信号里也能按固定路径删掉）
     static let fileNames: [String] = [
         "Photos.sqlite", "Photos.sqlite-wal", "Photos.sqlite-shm",
+        // 中转文件（`fetchOnMain` 先抓成 `.new`，成功才转正）。
+        // **退出时正在下载**的那一份就躺在这里 —— 它可能是几十上百 MB 的相册库，
+        // 不列进清单就会在被 kill / 强退时留在盘上（2026-11-01 实测踩到）。
+        "Photos.sqlite.new", "Photos.sqlite.new-wal", "Photos.sqlite.new-shm",
         "thumbnailConfiguration", "thumb-log.txt", "trash.json",
         // 这两个只有机型和键名（没有照片），但按「零痕迹」的标准一并删；
         // 要排查时用 CMI_DEBUG 重新生成即可。
@@ -76,6 +80,83 @@ enum TraceRegistry {
     /// 崩溃报告的文件名前缀（`cleanmyiphone-2026-11-01-171359.ips`）
     static var diagnosticReportPrefix: String {
         (Bundle.main.executableURL?.lastPathComponent ?? "cleanmyiphone") + "-"
+    }
+
+    // MARK: - 系统偏好域（进程退出时才会被写，得退出去之后删）
+
+    /// 应用自己的偏好域：只存窗口位置 / 屏幕尺寸，没有任何照片数据。
+    /// 但在一台**不是自己的电脑**上，一个 `local.cleanmyiphone.plist` 本身就是
+    /// 「这台机器用过它」的证据，所以按零痕迹的标准一并删。
+    ///
+    /// 两个域都要删：打包成 `.app` 启动时域是 bundle id（`local.cleanmyiphone`）；
+    /// 直接跑裸二进制（开发时的 `swift run`、`--probe*`）时没有 Info.plist，
+    /// 系统退化成用可执行文件名（`CleanMyiPhone`）。
+    static var preferenceDomains: [String] {
+        var domains: [String] = []
+        func add(_ value: String?) {
+            guard let value, !value.isEmpty, !domains.contains(value) else { return }
+            domains.append(value)
+        }
+        add(Bundle.main.bundleIdentifier)
+        add("local.cleanmyiphone")
+        add(Bundle.main.executableURL?.lastPathComponent)
+        return domains
+    }
+
+    /// 偏好域对应的落盘位置：plist、窗口状态、缓存目录。
+    static func preferencePaths() -> [String] {
+        var paths: [String] = []
+        let home = FileManager.default.homeDirectoryForCurrentUser.path
+        for domain in preferenceDomains {
+            paths.append("\(home)/Library/Preferences/\(domain).plist")
+            paths.append("\(home)/Library/Saved Application State/\(domain).savedState")
+            paths.append("\(home)/Library/Caches/\(domain)")
+        }
+        return paths
+    }
+
+    /// 退出前挂一个**脱离自己**的一次性清理。
+    ///
+    /// 为什么不能在进程内删：plist 由 cfprefsd 代写，进程退出那一刻它才刷盘，
+    /// 自己删自己会被它再写回来。所以起一个独立的 `/bin/sh`，等进程真的退出、
+    /// 偏好写完（1.2 秒）再删；父进程死了它照样跑完，不留守护进程。
+    ///
+    /// 只删自己这个偏好域和数据目录，不碰别的 App 的任何东西。
+    static func schedulePostExitSweep() {
+        let home = FileManager.default.homeDirectoryForCurrentUser.path
+        var targets = preferencePaths().map(shellQuote)
+        // ByHost 那份名字里带硬件 UUID，只能通配
+        for domain in preferenceDomains {
+            targets.append(shellQuote("\(home)/Library/Preferences/ByHost/\(domain).") + "*")
+        }
+        // 数据目录本身也是痕迹（目录名就写着用过什么）。但**只在整个目录只剩
+        // 「注定是瞬态」的东西**才删 —— 万一刚退出又立刻被重新打开，新实例正在用的
+        // 东西不能被顺手删掉。允许留下的是：
+        //   instance.lock（单实例锁，下一个实例自己重建）
+        //   Photos.sqlite.new*（退出那一刻还在下中转文件，helper 收尾后就是垃圾）
+        let base = shellQuote(dataDirectory.path)
+        let script = """
+        sleep 1.2
+        rm -rf \(targets.joined(separator: " ")) >/dev/null 2>&1
+        if [ -d \(base) ]; then
+          rm -f \(base)/Photos.sqlite.new \(base)/Photos.sqlite.new-wal \(base)/Photos.sqlite.new-shm >/dev/null 2>&1
+          rest=$(ls -A \(base) 2>/dev/null | grep -v '^instance\\.lock$')
+          if [ -z "$rest" ]; then rm -rf \(base) >/dev/null 2>&1; fi
+        fi
+        exit 0
+        """
+        let shell = Process()
+        shell.executableURL = URL(fileURLWithPath: "/bin/sh")
+        shell.arguments = ["-c", script]
+        // 不 wait：父进程退出后它被 launchd 收养，跑完自己就没了
+        shell.standardInput = FileHandle.nullDevice
+        shell.standardOutput = FileHandle.nullDevice
+        shell.standardError = FileHandle.nullDevice
+        try? shell.run()
+    }
+
+    private static func shellQuote(_ path: String) -> String {
+        "'" + path.replacingOccurrences(of: "'", with: "'\\''") + "'"
     }
 
     // MARK: - 已写文件的登记（崩溃那一刻靠它）
@@ -160,6 +241,11 @@ enum TraceRegistry {
             try? fm.removeItem(at: base.appendingPathComponent(name))
         }
         for path in absoluteFileNames {
+            try? fm.removeItem(atPath: path)
+        }
+        // 偏好域：这次运行时还删得干净（退出时 cfprefsd 会再写一遍，
+        // 那一次由 `schedulePostExitSweep` 收尾）。这里管的是「上次被 kill -9 / 断电」留下的那份。
+        for path in preferencePaths() {
             try? fm.removeItem(atPath: path)
         }
         for dir in temporaryDirectories {
