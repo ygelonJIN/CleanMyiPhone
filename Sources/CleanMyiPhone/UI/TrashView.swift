@@ -32,6 +32,14 @@ struct TrashView: View {
         }
         .animation(Motion.fade, value: store.trash.count)
         .task(id: store.trash.count) { requestThumbs() }
+        // 删完（或删了一部分）之后，选中集合里可能有已经不在回收站的 id：
+        // 不清掉的话底栏会显示「已选 3 项」但框里一个都没有
+        .onChange(of: store.trash.entries) { _, entries in
+            let alive = Set(entries.map(\.id))
+            if !selection.isSubset(of: alive) {
+                selection = selection.intersection(alive)
+            }
+        }
     }
 
     // MARK: - 顶栏
@@ -323,11 +331,20 @@ struct TrashView: View {
                 .foregroundStyle(.secondary)
                 .monospacedDigit()
 
-            if let message = store.purgeMessage {
+            if store.isPurging {
+                HStack(spacing: 5) {
+                    ProgressView().controlSize(.mini)
+                    Text("正在删除 \(store.purgeProgress?.processed ?? 0) / \(store.purgeProgress?.total ?? 0) 项…")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .monospacedDigit()
+                }
+            } else if let message = store.purgeMessage {
                 Text(message)
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
+                    .help(message)
             }
 
             Spacer(minLength: 12)

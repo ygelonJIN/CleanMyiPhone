@@ -127,3 +127,20 @@ DispatchQueue.main.async { withAnimation(Motion.page) { shown = true } }
 
 ### 12.5 门禁类遮罩：重试期间必须继续盖着
 `needsLibraryGate` 只判「库没好 + 不是暂停态 + 不是未连接」。**锁屏也盖**（卡片写"解锁后自动继续读取"），用户点「重新读取」时先清 `isDeviceLocked` 并把 `libraryRetrying` 置真，用 `libraryReadingNow` 决定画进度还是失败卡 —— 否则重试那一瞬间门禁条件为假，界面直接掉回正常页面，用户看到的就是"点了重新读取，界面先进去了"。
+### 12.6 「确认弹窗之后还有一段长过程」不要用第二个 sheet
+回收站的彻底删除是三段：确认 sheet（`EmptyTrashSheet`）→ 删除中（几十秒）→ 结果单。
+后两段**不能用 sheet**，两个坑：
+
+1. **同一个视图上两个 sheet 会打架**：确认 sheet 刚 `dismiss` 就 present 下一个，
+   SwiftUI 会把它顶掉 —— 现象是「点了删除，弹窗消失，然后什么都没发生」，用户完全不知道删没删。
+2. 删除中必须**盖死整窗**（不许点侧栏、不许按 ⌫ 又去标记一张、不许开预览）。
+
+所以后两段走 `RootView` 的 `.overlay`：`Rectangle().fill(.thickMaterial)` 整窗 + 卡片
+（`UI/PurgeStatusOverlay.swift`，和 `LibraryIndexGate` 同一套视觉）。位置**排在预览层之后**，
+否则设备卡住时用户还能点到预览。`Group { if progress … else if report … }` 两个分支各自
+`.transition(.dialog)`，切分支时自然有弹入。
+
+**遮罩期间的键盘规则**：`handleKeyEvent` 顶部直接拦（那时光标还在，⌫/空格/⌘A 都会误伤），
+但 **Esc / ⏎ 必须返回 false 放行** —— 结果单那两个按钮靠 `.keyboardShortcut(.cancelAction)` /
+`.defaultAction` 接，`KeyMonitor` 吞掉事件按钮就全废了（`KeyMonitor` 是「返回 true → 事件置 nil」）。
+

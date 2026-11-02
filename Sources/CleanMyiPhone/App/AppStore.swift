@@ -85,6 +85,11 @@ final class AppStore {
     var screenImage: NSImage?
     var stats = LibraryService.DeviceStats()
 
+    // 压缩 / 转换（批量）
+    var conversionRunning = false
+    var conversionProgress: PhotoConversionEngine.Progress?
+    var conversionResult: PhotoConversionEngine.Result?
+
     var sortKey: SortKey = .date
     var dateGrouping: DateGrouping = .month
     var ascending = false
@@ -105,6 +110,10 @@ final class AppStore {
     /// 弹窗里要彻底删除的那一批（空 = 全部）
     var pendingDeleteIDs: [Asset.ID] = []
     var isPurging = false
+    /// 删除中弹窗的数据源：非 nil 就盖一层「正在删除」（跟着设备回执一格格走）
+    var purgeProgress: PurgeProgress?
+    /// 删完的结果单：非 nil 就弹结果弹窗（成功几条、失败几条、每条为什么）
+    var purgeReport: PurgeReport?
     var purgeMessage: String?
     /// 打完标记后底栏闪一句「已标记 N 项到回收站」，2.4 秒后自动消失
     var provisionalMessage: String?
@@ -399,6 +408,25 @@ final class AppStore {
             self.assets = (try? await (self.source as? FixtureDevice)?.load()) ?? []
             self.invalidateCounts()
             self.finishScan()
+            self.runPurgeDemoIfRequested()
+        }
+    }
+
+    /// 只给模拟设备用的界面回归入口：`CMI_PURGE_DEMO=<条数>` 启动，
+    /// 自动把前 N 项标进回收站并点一次「彻底删除」，用来截图看
+    /// 「正在删除」和结果单（真机路径不会走到这里）。
+    private func runPurgeDemoIfRequested() {
+        guard usingFixture,
+              let raw = ProcessInfo.processInfo.environment["CMI_PURGE_DEMO"],
+              let count = Int(raw), count > 0 else { return }
+        let chosen = Array(assets.prefix(count))
+        guard !chosen.isEmpty else { return }
+        trash.add(chosen, deviceID: device?.id ?? "fixture")
+        sidebarItem = .trash
+        Task { [weak self] in
+            try? await Task.sleep(nanoseconds: 900_000_000)
+            guard let self else { return }
+            await self.deleteFromTrash(ids: chosen.map(\.id))
         }
     }
 
@@ -495,6 +523,60 @@ final class AppStore {
             return
         }
         await startScan()
+    }
+
+    /// 批量压缩/转换：先把 App 自己的两条 AFC 让开，再让引擎独占一条连接。
+    /// 引擎会在改库前重新抓一份当前库，所以批次跑得久也不会丢新照片。
+    func startConversion(items: [ConversionItem], profile: ConversionProfile) {
+        guard !conversionRunning, !items.isEmpty else { return }
+        conversionRunning = true
+        conversionResult = nil
+        conversionProgress = PhotoConversionEngine.Progress(
+            phase: "准备", completed: 0, total: items.count, current: "")
+
+        let udid = stats.udid
+        let workDir = URL(fileURLWithPath: "/tmp/cmi-convert-\(UUID().uuidString)",
+                          isDirectory: true)
+
+        Task {
+            await releaseDeviceFiles()
+            stopPTP()
+            do {
+                let engine = try PhotoConversionEngine(udid: udid, workDir: workDir)
+                let result = await Task.detached { [weak self] in
+                    engine.run(items: items, profile: profile) { progress in
+                        Task { @MainActor in
+                            self?.conversionProgress = progress
+                        }
+                    }
+                }.value
+                conversionResult = result
+                conversionRunning = false
+                await refreshDevice()
+                markConvertedOriginals(result)
+            } catch {
+                var result = PhotoConversionEngine.Result()
+                result.failures = [("转换", error.localizedDescription)]
+                conversionResult = result
+                conversionRunning = false
+                await refreshDevice()
+            }
+        }
+    }
+
+    /// 转换成功后，把原图按现有「标记回收」流程放进回收站（橙色），
+    /// 用户到回收站点「彻底删除」才真正从手机删。
+    private func markConvertedOriginals(_ result: PhotoConversionEngine.Result) {
+        guard !result.records.isEmpty else { return }
+        let pks = Set(result.records.map(\.originalPK))
+        let originals = visibleAssets.filter { asset in
+            guard let meta = meta(asset) else { return false }
+            return pks.contains(meta.pk)
+        }
+        guard !originals.isEmpty else { return }
+        trash.add(originals, deviceID: device?.id ?? "unknown")
+        clearSelection()
+        flash("已压缩 \(result.records.count) 张，原图已标记到回收站")
     }
 
     func startScan() async {
@@ -1154,6 +1236,19 @@ final class AppStore {
         return value
     }
 
+    /// 原图/压缩副本的配对信息。原图查副本，副本查原图，都是 O(1)。
+    func compressionDisplay(for asset: Asset) -> CompressionDisplay? {
+        guard let index = libraryIndex, let meta = meta(asset) else { return nil }
+        let key = PhotoLibraryIndex.normalize(meta.fileName)
+        if let copy = index.compressedByOriginal[key] {
+            return CompressionDisplay(role: .original, original: meta, copy: copy)
+        }
+        guard meta.importedBy.hasPrefix("local.cleanmyiphone"),
+              !meta.originalFileName.isEmpty,
+              let original = index.meta(for: meta.originalFileName) else { return nil }
+        return CompressionDisplay(role: .copy, original: original, copy: meta)
+    }
+
     private func resolveMeta(_ asset: Asset) -> PhotoLibraryIndex.Meta? {
         guard let index = libraryIndex else { return nil }
         // 1) 名字一样（最常见）
@@ -1345,6 +1440,32 @@ final class AppStore {
             }
         }
 
+        // 我们自己写的压缩副本：PTP 不会枚举它们，但库里有。
+        // 不补进 result，用户就看不到新的“压缩版”格子。
+        if let index = libraryIndex, !index.isEmpty {
+            var known = Set(result.map { PhotoLibraryIndex.normalize($0.fileName) })
+            for shadow in index.shadowAssets {
+                let key = PhotoLibraryIndex.normalize(shadow.fileName)
+                guard !known.contains(key) else { continue }
+                guard let meta = index.meta(for: shadow.fileName),
+                      meta.importedBy == "local.cleanmyiphone" else { continue }
+                switch libraryFilter {
+                case .hidden where !meta.isHidden: continue
+                case .trashed where !meta.isTrashed: continue
+                case .favorites where !meta.isFavorite: continue
+                case .screenshots where meta.subtype != 10: continue
+                case .camera where !meta.isCameraCaptured: continue
+                case .live where !meta.isLive: continue
+                case .raw where !meta.isRaw: continue
+                default: break
+                }
+                if let albumFiles = albumFilter.map({ index.files(inAlbum: $0) }),
+                   !albumFiles.contains(key) { continue }
+                result.append(shadow)
+                known.insert(key)
+            }
+        }
+
         // 去重：**同一张照片只算一项**。
         // 目录枚举（PTP）里同一张照片可能来两条：一条是原件 `IMG_1234.HEIC`、
         // 一条是编辑版 `IMG_E1234.HEIC`，两条都归到库里同一条资产；也可能同一个
@@ -1380,7 +1501,39 @@ final class AppStore {
         case .size: result.sort { $0.byteSize < $1.byteSize }
         }
         if !ascending { result.reverse() }
+        result = pairCompressedCopies(result)
         return result
+    }
+
+    /// 把压缩副本排到原图后面一格（用户要的「原图后一格」）。
+    /// 副本的 `ZORIGINALFILENAME` 指向原图，按这个配对。
+    private func pairCompressedCopies(_ list: [Asset]) -> [Asset] {
+        guard libraryIndex != nil else { return list }
+        var copyByOriginal: [String: Asset] = [:]
+        for asset in list {
+            guard let meta = meta(asset),
+                  !meta.originalFileName.isEmpty,
+                  meta.originalFileName.caseInsensitiveCompare(meta.fileName) != .orderedSame
+            else { continue }
+            copyByOriginal[PhotoLibraryIndex.normalize(meta.originalFileName)] = asset
+        }
+        guard !copyByOriginal.isEmpty else { return list }
+
+        var consumed = Set<Asset.ID>()
+        var paired: [Asset] = []
+        paired.reserveCapacity(list.count)
+        for asset in list {
+            if consumed.contains(asset.id) { continue }
+            paired.append(asset)
+            consumed.insert(asset.id)
+            guard let meta = meta(asset) else { continue }
+            let key = PhotoLibraryIndex.normalize(meta.fileName)
+            if let copy = copyByOriginal[key], !consumed.contains(copy.id) {
+                paired.append(copy)
+                consumed.insert(copy.id)
+            }
+        }
+        return paired
     }
 
     /// 体积统一口径：优先用库里的「资产全部资源合计」（`resourceBytes`，含编辑版与
@@ -1591,25 +1744,69 @@ final class AppStore {
     }
 
     /// 真删：只有这一个地方会动设备。清空回收站、回收站里删选中的几条，都走它。
+    ///
+    /// 全流程**看得见**（2026-11 用户要求）：
+    /// 1. `purgeProgress` 非 nil → 盖一层「正在删除」弹窗，跟着设备回执更新；
+    /// 2. 删完 `purgeReport` 非 nil → 弹结果单，成功/失败各多少，**失败的逐条给出原因**；
+    /// 3. 底栏再留一句短的，弹窗关了也看得到。
     private func purge(_ entries: [TrashStore.Entry]) async {
         guard !entries.isEmpty, !isPurging else { return }
         isPurging = true
-        defer { isPurging = false }
+        purgeReport = nil
+        purgeProgress = PurgeProgress(
+            total: entries.count,
+            bytesTotal: entries.reduce(0) { $0 + $1.byteSize },
+            currentName: entries.first?.fileName ?? "",
+            batchFrom: 1,
+            batchTo: min(PurgeEngine.batchSize, entries.count)
+        )
 
         let engine = PurgeEngine(trash: trash, source: { [self] in source })
-        let outcome = await engine.purge(entries)
+        let outcome = await engine.purge(entries) { [weak self] progress in
+            self?.purgeProgress = progress
+        }
+        isPurging = false
+        purgeProgress = nil
 
         let removed = Set(outcome.succeeded)
         assets.removeAll { removed.contains($0.id) }
         invalidateCounts()
         thumbnails = thumbnails.filter { !removed.contains($0.key) }
 
-        if outcome.failed.isEmpty {
-            purgeMessage = "已释放 \(ByteCountFormatter.string(fromByteCount: outcome.succeededBytes, countStyle: .file))"
+        purgeReport = PurgeReport(
+            total: outcome.total,
+            succeededIDs: outcome.succeeded,
+            succeededBytes: outcome.succeededBytes,
+            failures: outcome.failures,
+            aborted: outcome.aborted,
+            skipped: outcome.skipped
+        )
+
+        if outcome.failures.isEmpty {
+            purgeMessage = "已彻底删除 \(outcome.succeeded.count) 项，释放 "
+                + ByteCountFormatter.string(fromByteCount: outcome.succeededBytes, countStyle: .file)
         } else {
-            let first = outcome.failed.first?.message ?? "未知原因"
-            purgeMessage = "\(outcome.summary)，\(first)"
+            let first = outcome.failures.first?.reason ?? "未知原因"
+            purgeMessage = "\(outcome.summary)：\(first)"
         }
+    }
+
+    /// 结果单里那个「重试失败的 N 项」：失败项一直留在回收站，直接再删一遍
+    func retryFailedPurge() async {
+        guard let report = purgeReport, !report.failures.isEmpty, !isPurging else { return }
+        let ids = Set(report.failures.map(\.id))
+        let entries = trash.entries.filter { ids.contains($0.id) }
+        guard !entries.isEmpty else {
+            purgeReport = nil
+            flash("这些项已经不在回收站里了")
+            return
+        }
+        purgeReport = nil
+        await purge(entries)
+    }
+
+    func dismissPurgeReport() {
+        purgeReport = nil
     }
 
     // MARK: - 预览
@@ -2313,6 +2510,17 @@ final class AppStore {
     /// 「预览里按退格没反应」就是这个。这里与焦点无关。
     @discardableResult
     func handleKeyEvent(_ event: NSEvent) -> Bool {
+        // 删除中 / 结果单开着：键盘一律让给那两块遮罩。否则删到一半按一下 ⌫
+        // 又去标记一张，状态全乱。
+        // **Esc / ⏎ 必须放行**（返回 false 不吞）：结果单上「关闭」「重试」两个按钮
+        // 靠 `.keyboardShortcut(.cancelAction / .defaultAction)` 接，这里吞掉就全废了。
+        if purgeProgress != nil || purgeReport != nil {
+            switch event.keyCode {
+            case 53, 36, 76: return false
+            default: return true
+            }
+        }
+
         let shift = event.modifierFlags.contains(.shift)
         let command = event.modifierFlags.contains(.command)
         let chars = event.charactersIgnoringModifiers?.lowercased() ?? ""

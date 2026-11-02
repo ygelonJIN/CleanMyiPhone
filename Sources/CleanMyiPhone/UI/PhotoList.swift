@@ -55,6 +55,8 @@ struct PhotoRow: View {
 
     private var isSelected: Bool { store.selection.contains(asset.id) }
     private var isPending: Bool { store.pendingDeletions.contains(asset.id) }
+    private var compression: CompressionDisplay? { store.compressionDisplay(for: asset) }
+    private var isCompressedCopy: Bool { compression?.role == .copy }
     private var hasThumbnail: Bool { store.thumbnails[asset.id] != nil }
 
     var body: some View {
@@ -82,6 +84,14 @@ struct PhotoRow: View {
                     .font(.caption2.weight(.medium))
                     .foregroundStyle(.orange)
                     .labelStyle(.titleAndIcon)
+                    .transition(.badge)
+            }
+            if let compression, compression.role == .copy {
+                Text("已压缩 · \(compression.detailLabel)")
+                    .font(.caption2)
+                    .foregroundStyle(.green)
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.75)
                     .transition(.badge)
             }
 
@@ -112,6 +122,7 @@ struct PhotoRow: View {
         .animation(Motion.fade, value: hovering)
         .animation(Motion.pop, value: isSelected)
         .animation(Motion.pop, value: isPending)
+        .animation(Motion.pop, value: isCompressedCopy)
         .animation(Motion.pop, value: hasThumbnail)
         .onTapGesture {
             // 单击就是勾选 / 取消勾选，累积多选；⇧ 连选
@@ -122,7 +133,8 @@ struct PhotoRow: View {
                 store.toggle(asset)
             }
         }
-        .help("\(asset.fileName)\n\(asset.dateText)\n\(asset.sizeText) · \(asset.resolutionText)")
+        .help("\(asset.fileName)\n\(asset.dateText)\n\(asset.sizeText) · \(asset.resolutionText)"
+              + (compression.map { "\n\($0.label)" } ?? ""))
     }
 
     private var background: some View {
@@ -135,6 +147,7 @@ struct PhotoRow: View {
     private var fillColor: Color {
         if isSelected { return Color.accentColor.opacity(0.16) }
         if isPending { return Color.orange.opacity(0.12) }
+        if isCompressedCopy { return Color.green.opacity(0.10) }
         if hovering { return Color.secondary.opacity(0.08) }
         return .clear
     }
@@ -162,7 +175,9 @@ struct PhotoRow: View {
         .clipShape(RoundedRectangle(cornerRadius: 5, style: .continuous))
         .overlay {
             RoundedRectangle(cornerRadius: 5, style: .continuous)
-                .strokeBorder(isPending ? Color.orange.opacity(0.8) : .clear, lineWidth: 1.5)
+                .strokeBorder(isPending ? Color.orange.opacity(0.8)
+                              : (isCompressedCopy ? Color.green.opacity(0.8) : .clear),
+                              lineWidth: 1.5)
         }
     }
 }

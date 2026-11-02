@@ -4,7 +4,14 @@ import Foundation
 struct PhotoLibraryIndex {
 
     struct Meta {
+        let pk: Int
+        let uuid: String
         let fileName: String
+        /// 压缩副本会把它指向原图文件名；普通资产为空或和 fileName 相同。
+        let originalFileName: String
+        /// 导入来源 bundle id。我们自己的压缩副本会写成 `local.cleanmyiphone`，
+        /// 普通照片是相机/微信/夸克等，用它区分“我们的副本”和普通照片。
+        let importedBy: String
         let directory: String
         let createdAt: Date
         let isHidden: Bool
@@ -23,6 +30,8 @@ struct PhotoLibraryIndex {
         let playbackStyle: Int
         /// `ZADDITIONALASSETATTRIBUTES.ZCAMERACAPTUREDEVICE`：1 = 相机拍的（不是从 App 存的）
         let isCameraCaptured: Bool
+        /// `ZASSET.ZISDETECTEDSCREENSHOT`：系统认定的截图（subtype 可能是 0）
+        let isScreenshot: Bool
         /// `ZUNIFORMTYPEIDENTIFIER`：RAW 判定用（`public.adobe.raw-image` 之类）
         let typeIdentifier: String
 
@@ -132,6 +141,8 @@ struct PhotoLibraryIndex {
     /// 库里的**每一行**（不做文件名去重）。`metaByFile` 是按归一化文件名做键的，
     /// 两个不同目录下的同名文件会互相覆盖 —— 侧栏统计必须用这一份，否则少算。
     var allMeta: [Meta] = []
+    /// 原图归一化文件名 → 压缩副本。压缩副本的 `ZORIGINALFILENAME` 指向原图。
+    var compressedByOriginal: [String: Meta] = [:]
 
     var isEmpty: Bool { metaByFile.isEmpty }
 
@@ -143,10 +154,12 @@ struct PhotoLibraryIndex {
 
         // 资产
         let assetRows = db.rows("""
-            SELECT a.Z_PK, a.ZFILENAME, a.ZDIRECTORY, a.ZDATECREATED, a.ZHIDDEN, a.ZFAVORITE,
+            SELECT a.Z_PK, a.ZUUID, a.ZFILENAME, a.ZDIRECTORY, a.ZDATECREATED, a.ZHIDDEN, a.ZFAVORITE,
                    a.ZTRASHEDSTATE, a.ZKIND, a.ZKINDSUBTYPE, a.ZWIDTH, a.ZHEIGHT, a.ZDURATION,
-                   a.ZPLAYBACKSTYLE, a.ZUNIFORMTYPEIDENTIFIER,
+                   a.ZPLAYBACKSTYLE, a.ZUNIFORMTYPEIDENTIFIER, a.ZISDETECTEDSCREENSHOT,
                    b.ZORIGINALFILESIZE AS ZSIZE,
+                   b.ZORIGINALFILENAME AS ZORIGINALFILENAME,
+                   b.ZIMPORTEDBYBUNDLEIDENTIFIER AS ZIMPORTEDBY,
                    b.ZCAMERACAPTUREDEVICE AS ZCAMCAPTURED
             FROM ZASSET a
             LEFT JOIN ZADDITIONALASSETATTRIBUTES b ON b.ZASSET = a.Z_PK
@@ -164,7 +177,11 @@ struct PhotoLibraryIndex {
         for row in assetRows {
             guard let name = row.string("ZFILENAME"), !name.isEmpty else { continue }
             let meta = Meta(
+                pk: row.int("Z_PK"),
+                uuid: row.string("ZUUID") ?? "",
                 fileName: name,
+                originalFileName: row.string("ZORIGINALFILENAME") ?? "",
+                importedBy: row.string("ZIMPORTEDBY") ?? "",
                 directory: row.string("ZDIRECTORY") ?? "",
                 createdAt: Date(timeIntervalSinceReferenceDate: row.double("ZDATECREATED")),
                 isHidden: row.int("ZHIDDEN") == 1,
@@ -179,6 +196,7 @@ struct PhotoLibraryIndex {
                 resourceBytes: resourceByPK[row.int("Z_PK")] ?? row.int64("ZSIZE"),
                 playbackStyle: row.int("ZPLAYBACKSTYLE"),
                 isCameraCaptured: row.int("ZCAMCAPTURED") == 1,
+                isScreenshot: row.int("ZISDETECTEDSCREENSHOT") == 1,
                 typeIdentifier: row.string("ZUNIFORMTYPEIDENTIFIER") ?? ""
             )
             let key = Self.normalize(name)
@@ -196,6 +214,19 @@ struct PhotoLibraryIndex {
             // 拍摄时间索引：PTP 名字随机、体积又不准时，靠它兜底
             let second = Int(meta.createdAt.timeIntervalSinceReferenceDate.rounded())
             index.metaBySecond[second, default: []].append(meta)
+        }
+
+        // 压缩副本：`ZORIGINALFILENAME` 指向原图，且必须是我们自己导入的
+        // （`ZIMPORTEDBYBUNDLEIDENTIFIER == local.cleanmyiphone`）。
+        // 普通照片的 `ZORIGINALFILENAME` 也会是相机/微信/夸克的原始文件名，
+        // 只看这一列会把一千多张普通照片误判成“压缩版”。
+        for meta in index.allMeta {
+            guard meta.importedBy.hasPrefix("local.cleanmyiphone") else { continue }
+            let original = meta.originalFileName
+            if !original.isEmpty,
+               original.caseInsensitiveCompare(meta.fileName) != .orderedSame {
+                index.compressedByOriginal[Self.normalize(original)] = meta
+            }
         }
 
         // 影子资产：库里有、PTP 不一定枚举得到的那些（已隐藏 / 最近删除 / 云端项）

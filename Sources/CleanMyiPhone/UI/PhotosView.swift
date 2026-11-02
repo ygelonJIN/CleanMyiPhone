@@ -5,6 +5,7 @@ import SwiftUI
 /// 相簿不再挂在这一页的左边 —— 它自己是一页（`AlbumsView`），这里只放「返回相簿」。
 struct PhotosView: View {
     @Environment(AppStore.self) private var store
+    @State private var showConversion = false
 
     var body: some View {
         @Bindable var store = store
@@ -98,6 +99,9 @@ struct PhotosView: View {
                     .ignoresSafeArea()
                 libraryGate
             }
+        }
+        .sheet(isPresented: $showConversion) {
+            ConversionSheet()
         }
     }
 
@@ -230,6 +234,15 @@ struct PhotosView: View {
             }
 
             Spacer(minLength: 12)
+
+            Button {
+                showConversion = true
+            } label: {
+                Label("压缩", systemImage: "arrow.down.right.and.arrow.up.left")
+            }
+            .controlSize(.small)
+            .disabled(store.selection.isEmpty)
+            .help(store.selection.isEmpty ? "先选照片，再压缩/转换" : "批量压缩/转换选中项")
 
             if store.selection.isEmpty {
                 hintChip

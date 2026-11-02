@@ -98,6 +98,8 @@ struct PhotoCell: View {
 
     private var isSelected: Bool { store.selection.contains(asset.id) }
     private var isPending: Bool { store.pendingDeletions.contains(asset.id) }
+    private var compression: CompressionDisplay? { store.compressionDisplay(for: asset) }
+    private var isCompressedCopy: Bool { compression?.role == .copy }
     /// 缩略图到了没有：新的一帧图要淡入，不能"啪"地出现
     private var hasThumbnail: Bool { store.thumbnails[asset.id] != nil }
 
@@ -121,6 +123,13 @@ struct PhotoCell: View {
                 if isPending {
                     RoundedRectangle(cornerRadius: corner, style: .continuous)
                         .fill(Color.orange.opacity(0.18))
+                }
+            }
+            // 压缩副本：绿色，沿用选中/标记的圆环+铺色+角标语言。
+            .overlay {
+                if isCompressedCopy {
+                    RoundedRectangle(cornerRadius: corner, style: .continuous)
+                        .fill(Color.green.opacity(0.12))
                 }
             }
             .overlay(alignment: .topLeading) { leadingBadges }
@@ -159,6 +168,7 @@ struct PhotoCell: View {
             // 选中 / 标记 / 取消标记：苹果那种弹一下，不是干巴巴地换颜色
             .animation(Motion.pop, value: isSelected)
             .animation(Motion.pop, value: isPending)
+            .animation(Motion.pop, value: isCompressedCopy)
             .animation(Motion.thumb, value: hasThumbnail)
             // 两个入口都要：
             // `.task` 管首次出现；`onAppear` 管「切排序/换筛选后被复用回来的格子」——
@@ -176,7 +186,9 @@ struct PhotoCell: View {
                     store.toggle(asset)
                 }
             }
-            .help("\(asset.fileName)\n\(asset.dateText)\n\(asset.sizeText) · \(asset.resolutionText)\n空格预览 · 拖动框选 · ⇧ 点连选")
+            .help("\(asset.fileName)\n\(asset.dateText)\n\(asset.sizeText) · \(asset.resolutionText)"
+                  + (compression.map { "\n\($0.label)" } ?? "")
+                  + "\n空格预览 · 拖动框选 · ⇧ 点连选")
     }
 
     // MARK: - 描边
@@ -184,6 +196,7 @@ struct PhotoCell: View {
     private var ringColor: Color {
         if isSelected { return .accentColor }
         if isPending { return .orange }
+        if isCompressedCopy { return .green }
         if hovering { return Color.white.opacity(0.92) }
         return .clear
     }
@@ -191,6 +204,7 @@ struct PhotoCell: View {
     private var ringWidth: CGFloat {
         if isSelected { return 3 }
         if isPending { return 2.5 }
+        if isCompressedCopy { return 2.5 }
         if hovering { return 2 }
         return 0
     }
@@ -242,8 +256,19 @@ struct PhotoCell: View {
                     .shadow(color: .black.opacity(0.3), radius: 2, y: 1)
                     .transition(.badge)
             }
+            if isCompressedCopy {
+                Text("已压缩")
+                    .font(.system(size: 8, weight: .bold))
+                    .padding(.horizontal, 4)
+                    .padding(.vertical, 1.5)
+                    .background(Capsule().fill(Color.green))
+                    .foregroundStyle(.white)
+                    .shadow(color: .black.opacity(0.25), radius: 1, y: 0.5)
+                    .transition(.badge)
+            }
         }
         .animation(Motion.pop, value: isPending)
+        .animation(Motion.pop, value: isCompressedCopy)
         .padding(6)
     }
 
@@ -276,14 +301,34 @@ struct PhotoCell: View {
         }
     }
 
+    @ViewBuilder
     private var sizeBadge: some View {
-        Text(asset.sizeText)
-            .font(.system(size: 9, weight: .semibold))
-            .padding(.horizontal, 4)
-            .padding(.vertical, 1)
-            .background(Capsule().fill(.black.opacity(0.55)))
+        if let compression, compression.role == .copy {
+            // 跟“选中/标记”一样用角标，不做整条底栏；两行小字，放不下自动缩。
+            VStack(alignment: .leading, spacing: 0) {
+                Text(compression.formatPercentLabel)
+                Text(compression.qualitySizeLabel)
+            }
+            .font(.system(size: 7.5, weight: .semibold))
+            .lineLimit(1)
+            .minimumScaleFactor(0.7)
             .foregroundStyle(.white)
+            .padding(.horizontal, 5)
+            .padding(.vertical, 2)
+            .background(
+                RoundedRectangle(cornerRadius: 4, style: .continuous)
+                    .fill(Color.green.opacity(0.92))
+            )
             .padding(6)
+        } else {
+            Text(asset.sizeText)
+                .font(.system(size: 9, weight: .semibold))
+                .padding(.horizontal, 4)
+                .padding(.vertical, 1)
+                .background(Capsule().fill(.black.opacity(0.55)))
+                .foregroundStyle(.white)
+                .padding(6)
+        }
     }
 
     private func iconBadge(_ symbol: String,

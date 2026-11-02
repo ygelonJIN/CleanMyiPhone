@@ -37,6 +37,8 @@ final class MobileDeviceAPI {
     private typealias AFCFileSeekFn = @convention(c) (UnsafeMutableRawPointer?, UnsafeMutableRawPointer?, Int64, Int32) -> Int32
     private typealias AFCFileTellFn = @convention(c) (UnsafeMutableRawPointer?, UnsafeMutableRawPointer?, UnsafeMutablePointer<UInt64>?) -> Int32
     private typealias AFCRemovePathFn = @convention(c) (UnsafeMutableRawPointer?, UnsafePointer<CChar>) -> Int32
+    private typealias AFCFileWriteFn = @convention(c) (UnsafeMutableRawPointer?, UnsafeMutableRawPointer?, UnsafeRawPointer?, UInt32) -> Int32
+    private typealias AFCRenamePathFn = @convention(c) (UnsafeMutableRawPointer?, UnsafePointer<CChar>, UnsafePointer<CChar>) -> Int32
     // 收尾用：不走这套就退出，设备侧的 afcd 会留半截连接，
     // 之后所有 AFC 连接都被设备直接关掉（实测 `--probe-afc` 连三次全是「连接被关闭」）
     private typealias AFCConnectionCloseFn = @convention(c) (UnsafeMutableRawPointer?) -> Int32
@@ -63,6 +65,8 @@ final class MobileDeviceAPI {
     private let afcFileSeek: AFCFileSeekFn?
     private let afcFileTell: AFCFileTellFn?
     private let afcRemovePath: AFCRemovePathFn?
+    private let afcFileWrite: AFCFileWriteFn?
+    private let afcRenamePath: AFCRenamePathFn?
     private let afcClose: AFCConnectionCloseFn?
     private let afcInvalidate: AFCConnectionInvalidateFn?
     private let stopSessionFn: StopSessionFn?
@@ -103,6 +107,8 @@ final class MobileDeviceAPI {
         afcFileSeek = dlsym(handle, "AFCFileRefSeek").map { unsafeBitCast($0, to: AFCFileSeekFn.self) }
         afcFileTell = dlsym(handle, "AFCFileRefTell").map { unsafeBitCast($0, to: AFCFileTellFn.self) }
         afcRemovePath = dlsym(handle, "AFCRemovePath").map { unsafeBitCast($0, to: AFCRemovePathFn.self) }
+        afcFileWrite = dlsym(handle, "AFCFileRefWrite").map { unsafeBitCast($0, to: AFCFileWriteFn.self) }
+        afcRenamePath = dlsym(handle, "AFCRenamePath").map { unsafeBitCast($0, to: AFCRenamePathFn.self) }
         afcClose = dlsym(handle, "AFCConnectionClose").map { unsafeBitCast($0, to: AFCConnectionCloseFn.self) }
         afcInvalidate = dlsym(handle, "AFCConnectionInvalidate").map { unsafeBitCast($0, to: AFCConnectionInvalidateFn.self) }
         stopSessionFn = dlsym(handle, "AMDeviceStopSession").map { unsafeBitCast($0, to: StopSessionFn.self) }
@@ -188,6 +194,9 @@ final class MobileDeviceAPI {
             productVersion: string(device, "ProductVersion")
         )
     }
+
+    /// 会话是不是已经开着（转换引擎据此决定退出时要不要 stopSession）
+    var isSessionOpen: Bool { sessionOpened }
 
     /// 幂等：一个进程只连一次、只开一次会话。重复调用直接返回。
     func openSession(_ device: UnsafeMutableRawPointer) throws {
@@ -757,6 +766,66 @@ final class MobileDeviceAPI {
             FileHandle.standardError.write(Data("[afc] end total=\(total) zeroReads=\(zeroReads) status=\(lastReadStatus)\n".utf8))
         }
         return total
+    }
+
+    /// 往设备写文件（新建 / 覆盖）。AFC_FOPEN_WRONLY = 3。
+    /// `AFCFileRefWrite` 的返回值是状态码（0 成功），不是字节数，所以按块自己累计。
+    func writeFile(_ afc: UnsafeMutableRawPointer, path: String, data: Data) throws -> Int64 {
+        guard let afcFileWrite else {
+            throw NSError(domain: "cleanmyiphone", code: 13,
+                          userInfo: [NSLocalizedDescriptionKey: "AFCFileRefWrite 不可用"])
+        }
+        apiLock.lock(); defer { apiLock.unlock() }
+        var ref: UnsafeMutableRawPointer?
+        let status = afcFileOpen(afc, path, 3, &ref)
+        guard status == 0, let ref else {
+            throw NSError(domain: "cleanmyiphone", code: 14,
+                          userInfo: [NSLocalizedDescriptionKey: "写打开失败 \(path)（\(status)）"])
+        }
+        defer { _ = afcFileClose(afc, ref) }
+
+        var written: Int64 = 0
+        try data.withUnsafeBytes { raw in
+            guard let base = raw.baseAddress else { return }
+            var offset = 0
+            while offset < raw.count {
+                let chunk = min(256 * 1024, raw.count - offset)
+                let rc = afcFileWrite(afc, ref, base.advanced(by: offset), UInt32(chunk))
+                if rc != 0 {
+                    throw NSError(domain: "cleanmyiphone", code: 15,
+                                  userInfo: [NSLocalizedDescriptionKey: "写入失败 \(path)（\(rc)）"])
+                }
+                written += Int64(chunk)
+                offset += chunk
+            }
+        }
+        return written
+    }
+
+    func removePath(_ afc: UnsafeMutableRawPointer, path: String) throws {
+        guard let afcRemovePath else {
+            throw NSError(domain: "cleanmyiphone", code: 16,
+                          userInfo: [NSLocalizedDescriptionKey: "AFCRemovePath 不可用"])
+        }
+        apiLock.lock(); defer { apiLock.unlock() }
+        let rc = afcRemovePath(afc, path)
+        guard rc == 0 else {
+            throw NSError(domain: "cleanmyiphone", code: 17,
+                          userInfo: [NSLocalizedDescriptionKey: "删除失败 \(path)（\(rc)）"])
+        }
+    }
+
+    func renamePath(_ afc: UnsafeMutableRawPointer, from: String, to: String) throws {
+        guard let afcRenamePath else {
+            throw NSError(domain: "cleanmyiphone", code: 18,
+                          userInfo: [NSLocalizedDescriptionKey: "AFCRenamePath 不可用"])
+        }
+        apiLock.lock(); defer { apiLock.unlock() }
+        let rc = afcRenamePath(afc, from, to)
+        guard rc == 0 else {
+            throw NSError(domain: "cleanmyiphone", code: 19,
+                          userInfo: [NSLocalizedDescriptionKey: "改名失败 \(from) → \(to)（\(rc)）"])
+        }
     }
 
     func listDirectory(_ afc: UnsafeMutableRawPointer, path: String) throws -> [String] {

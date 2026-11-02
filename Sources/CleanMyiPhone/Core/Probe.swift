@@ -1,6 +1,8 @@
 import AppKit
 import AVFoundation
 import Foundation
+import ImageIO
+import UniformTypeIdentifiers
 
 /// 真机探针：不启动界面，直接枚举一次并打印结果。
 /// 用法：`cleanmyiphone --probe`
@@ -349,6 +351,46 @@ enum Probe {
         if let index = CommandLine.arguments.firstIndex(of: "--probe-livefetch"),
            index + 1 < CommandLine.arguments.count {
             probeLiveFetch(libraryPath: CommandLine.arguments[index + 1])
+            return
+        }
+        if CommandLine.arguments.contains("--probe-verify2046") {
+            probeVerify2046()
+            return
+        }
+        if CommandLine.arguments.contains("--probe-verify") {
+            probeVerify()
+            return
+        }
+        if CommandLine.arguments.contains("--probe-db-write") {
+            probeDbWrite()
+            return
+        }
+        if CommandLine.arguments.contains("--probe-reboot") {
+            probeReboot()
+            return
+        }
+        if CommandLine.arguments.contains("--probe-write") {
+            probeWrite()
+            return
+        }
+        if CommandLine.arguments.contains("--probe-check") {
+            probeCheck()
+            return
+        }
+        if CommandLine.arguments.contains("--probe-daemon") {
+            probeDaemon()
+            return
+        }
+        if CommandLine.arguments.contains("--convert-batch") {
+            convertBatch()
+            return
+        }
+        if CommandLine.arguments.contains("--probe-convert2046") {
+            probeConvert2046()
+            return
+        }
+        if CommandLine.arguments.contains("--probe-convert") {
+            probeConvert()
             return
         }
         guard CommandLine.arguments.contains("--probe") else { return }
@@ -1591,6 +1633,453 @@ enum Probe {
         } catch {
             say("失败：\(error.localizedDescription)")
             exit(1)
+        }
+        exit(0)
+    }
+
+    // MARK: - 写入探针（AFC 写 DCIM）
+
+    /// 先验证「能不能往 DCIM 写文件」。写一个纯文本，读回来，再删掉，
+    /// 不碰任何照片。通过之后才谈照片写回。
+    private static func probeWrite() {
+        do {
+            let api = try MobileDeviceAPI.shared()
+            let device = try api.firstDevice(timeout: 10)
+            try api.openSession(device)
+            let afc = try api.openAFC(device)
+            defer { api.closeAFC(afc); api.stopSession(device) }
+
+            let dir = "/DCIM/142APPLE"
+            let test = dir + "/cmi-write-test.txt"
+            let data = Data("cleanmyiphone write probe\n".utf8)
+            let written = try api.writeFile(afc, path: test, data: data)
+            say("写入 \(written) 字节 → \(test)")
+
+            let names = (try? api.listDirectory(afc, path: dir)) ?? []
+            say("目录里能看到：\(names.contains("cmi-write-test.txt"))")
+
+            let back = (try? api.readFile(afc, path: test, limit: 4096)) ?? Data()
+            say("读回：\(String(decoding: back, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines))")
+
+            let test2 = dir + "/cmi-write-test-2.txt"
+            do {
+                try api.renamePath(afc, from: test, to: test2)
+                let after = (try? api.listDirectory(afc, path: dir)) ?? []
+                say("改名成功：\(after.contains("cmi-write-test-2.txt"))")
+                try? api.removePath(afc, path: test2)
+            } catch {
+                say("改名失败：\(error.localizedDescription)")
+                try? api.removePath(afc, path: test)
+            }
+            say("测试文件已清理")
+
+            let pdDir = "/PhotoData"
+            let pdTest = pdDir + "/cmi-write-test.txt"
+            do {
+                let n = try api.writeFile(afc, path: pdTest, data: data)
+                say("PhotoData 写入 \(n) 字节")
+                let names = (try? api.listDirectory(afc, path: pdDir)) ?? []
+                say("PhotoData 能看到：\(names.contains("cmi-write-test.txt"))")
+                try? api.removePath(afc, path: pdTest)
+                say("PhotoData 测试文件已清理")
+
+            let a = dir + "/cmi-replace-a.txt"
+            let b = dir + "/cmi-replace-b.txt"
+            _ = try? api.writeFile(afc, path: a, data: Data("A".utf8))
+            _ = try? api.writeFile(afc, path: b, data: Data("B".utf8))
+            do {
+                try api.renamePath(afc, from: a, to: b)
+                let back = (try? api.readFile(afc, path: b, limit: 16)) ?? Data()
+                say("替换测试：\(String(decoding: back, as: UTF8.self))（期望 A）")
+            } catch {
+                say("替换测试失败：\(error.localizedDescription)")
+            }
+            try? api.removePath(afc, path: a)
+            try? api.removePath(afc, path: b)
+            } catch {
+                say("PhotoData 写入失败：\(error.localizedDescription)")
+            }
+        } catch {
+            say("失败：\(error.localizedDescription)")
+            exit(1)
+        }
+        exit(0)
+    }
+
+    /// 换格式试验：把指定的 PNG 取回本地 → 转成 HEIC（保留元数据）→
+    /// 写到同一 DCIM 目录下的新文件名，不覆盖原图。
+    private static func probeConvert() {
+        do {
+            let api = try MobileDeviceAPI.shared()
+            let device = try api.firstDevice(timeout: 10)
+            try api.openSession(device)
+            let afc = try api.openAFC(device)
+            defer { api.closeAFC(afc); api.stopSession(device) }
+
+            let srcPath = "/DCIM/142APPLE/IMG_2045.PNG"
+            let dir = "/DCIM/142APPLE"
+            let dstName = "IMG_2045 (1).HEIC"
+            let dstPath = dir + "/" + dstName
+
+            let work = URL(fileURLWithPath: "/tmp/cmi-exp", isDirectory: true)
+            try? FileManager.default.createDirectory(at: work, withIntermediateDirectories: true)
+            let local = work.appendingPathComponent("IMG_2045.PNG")
+            if !FileManager.default.fileExists(atPath: local.path) {
+                let n = try api.downloadFile(afc, path: srcPath, to: local)
+                say("下载 \(n) 字节 → \(local.path)")
+            }
+
+            guard let source = CGImageSourceCreateWithURL(local as CFURL, nil),
+                  CGImageSourceGetCount(source) > 0 else {
+                say("ImageIO 打不开原图")
+                exit(1)
+            }
+            var props = (CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as NSDictionary?) as? [CFString: Any] ?? [:]
+            guard let image = CGImageSourceCreateImageAtIndex(source, 0, nil) else {
+                say("解码失败")
+                exit(1)
+            }
+
+            let out = work.appendingPathComponent("IMG_2045 (1).HEIC")
+            try? FileManager.default.removeItem(at: out)
+            guard let dest = CGImageDestinationCreateWithURL(out as CFURL,
+                                                             UTType.heic.identifier as CFString, 1, nil) else {
+                say("建输出失败")
+                exit(1)
+            }
+            props[kCGImageDestinationLossyCompressionQuality] = 0.8
+            CGImageDestinationAddImage(dest, image, props as CFDictionary)
+            guard CGImageDestinationFinalize(dest) else {
+                say("编码失败")
+                exit(1)
+            }
+            let outSize = ((try? FileManager.default.attributesOfItem(atPath: out.path))?[.size] as? NSNumber)?.int64Value ?? 0
+            let srcSize = ((try? FileManager.default.attributesOfItem(atPath: local.path))?[.size] as? NSNumber)?.int64Value ?? 0
+            say("转换完成：\(srcSize) → \(outSize) 字节（\(out.path)）")
+
+            let written = try api.writeFile(afc, path: dstPath, data: try Data(contentsOf: out))
+            say("写入设备 \(written) 字节 → \(dstPath)")
+            let names = (try? api.listDirectory(afc, path: dir)) ?? []
+            say("目录里能看到：\(names.contains(dstName))")
+            say("下一步：打开手机「照片」，看这张新图有没有被收进相册；没有就说明只写 DCIM 不够。")
+        } catch {
+            say("失败：\(error.localizedDescription)")
+            exit(1)
+        }
+        exit(0)
+    }
+
+    /// 把改好的 Photos.sqlite 写回手机：先写 .new，再原子替换，最后清掉旧 WAL/SHM。
+    /// 目标库来自 /tmp/cmi-exp/db/Photos.sqlite（已经 checkpoint 成单文件）。
+    private static func probeDbWrite() {
+        do {
+            let url = URL(fileURLWithPath: "/tmp/cmi-exp/db/Photos.sqlite")
+            let data = try Data(contentsOf: url)
+            say("待写 \(data.count) 字节")
+            let api = try MobileDeviceAPI.shared()
+            let device = try api.firstDevice(timeout: 10)
+            try api.openSession(device)
+            let afc = try api.openAFC(device)
+            defer { api.closeAFC(afc); api.stopSession(device) }
+
+            let tmp = "/PhotoData/Photos.sqlite.new"
+            try? api.removePath(afc, path: tmp)
+            let written = try api.writeFile(afc, path: tmp, data: data)
+            say("写入 \(written) 字节 → \(tmp)")
+            try api.renamePath(afc, from: tmp, to: "/PhotoData/Photos.sqlite")
+            say("已替换 Photos.sqlite")
+            try? api.removePath(afc, path: "/PhotoData/Photos.sqlite-wal")
+            try? api.removePath(afc, path: "/PhotoData/Photos.sqlite-shm")
+            say("已清理旧 WAL/SHM")
+        } catch {
+            say("失败：\(error.localizedDescription)")
+            exit(1)
+        }
+        exit(0)
+    }
+
+    /// 通过 diagnostics_relay 重启手机，让 photolibraryd 重新加载数据库。
+    private static func probeReboot() {
+        do {
+            let api = try MobileDeviceAPI.shared()
+            let device = try api.firstDevice(timeout: 10)
+            try api.openSession(device)
+            guard let service = try? api.openService(device, name: "com.apple.mobile.diagnostics_relay") else {
+                say("diagnostics_relay 打不开")
+                exit(1)
+            }
+            let response = api.serviceRequest(service, ["Request": "Restart"])
+            say("重启请求已发送：\(response)")
+        } catch {
+            say("失败：\(error.localizedDescription)")
+            exit(1)
+        }
+        exit(0)
+    }
+
+    /// 验收：新文件在不在、多大、缩略图有没有生成。
+    private static func probeVerify() {
+        do {
+            let api = try MobileDeviceAPI.shared()
+            let device = try api.firstDevice(timeout: 10)
+            try api.openSession(device)
+            let afc = try api.openAFC(device)
+            defer { api.closeAFC(afc); api.stopSession(device) }
+
+            let file = "/DCIM/142APPLE/IMG_2045 (1).HEIC"
+            say("文件大小：\(api.entrySize(afc, path: file)) 字节")
+            let thumbDir = "/PhotoData/Thumbnails/V2/DCIM/142APPLE/IMG_2045 (1).HEIC"
+            let names = (try? api.listDirectory(afc, path: thumbDir)) ?? []
+            say("缩略图目录：\(names.count) 项 \(names.prefix(8))")
+            for n in names where n.lowercased().hasSuffix(".jpg") {
+                say("  \(n) = \(api.entrySize(afc, path: thumbDir + "/" + n)) 字节")
+            }
+            let original = "/DCIM/142APPLE/IMG_2045.PNG"
+            say("原图大小：\(api.entrySize(afc, path: original)) 字节")
+        } catch {
+            say("失败：\(error.localizedDescription)")
+        }
+        exit(0)
+    }
+
+    /// IMG_2046 换格式：实况 HEIC 静态帧 → JPEG，写到同目录新文件名。
+    private static func probeConvert2046() {
+        do {
+            let api = try MobileDeviceAPI.shared()
+            let device = try api.firstDevice(timeout: 10)
+            try api.openSession(device)
+            let afc = try api.openAFC(device)
+            defer { api.closeAFC(afc); api.stopSession(device) }
+
+            let srcPath = "/DCIM/142APPLE/IMG_2046.HEIC"
+            let dir = "/DCIM/142APPLE"
+            let dstName = "IMG_2046 (1).JPG"
+            let dstPath = dir + "/" + dstName
+
+            let work = URL(fileURLWithPath: "/tmp/cmi-exp", isDirectory: true)
+            try? FileManager.default.createDirectory(at: work, withIntermediateDirectories: true)
+            let local = work.appendingPathComponent("IMG_2046.HEIC")
+            if !FileManager.default.fileExists(atPath: local.path) {
+                let n = try api.downloadFile(afc, path: srcPath, to: local)
+                say("下载 \(n) 字节 → \(local.path)")
+            }
+
+            guard let source = CGImageSourceCreateWithURL(local as CFURL, nil),
+                  CGImageSourceGetCount(source) > 0 else {
+                say("ImageIO 打不开原图")
+                exit(1)
+            }
+            var props = (CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as NSDictionary?) as? [CFString: Any] ?? [:]
+            guard let image = CGImageSourceCreateImageAtIndex(source, 0, nil) else {
+                say("解码失败")
+                exit(1)
+            }
+
+            let out = work.appendingPathComponent(dstName)
+            try? FileManager.default.removeItem(at: out)
+            guard let dest = CGImageDestinationCreateWithURL(out as CFURL,
+                                                             UTType.jpeg.identifier as CFString, 1, nil) else {
+                say("建输出失败")
+                exit(1)
+            }
+            props[kCGImageDestinationLossyCompressionQuality] = 0.7
+            CGImageDestinationAddImage(dest, image, props as CFDictionary)
+            guard CGImageDestinationFinalize(dest) else {
+                say("编码失败")
+                exit(1)
+            }
+            let outSize = ((try? FileManager.default.attributesOfItem(atPath: out.path))?[.size] as? NSNumber)?.int64Value ?? 0
+            let srcSize = ((try? FileManager.default.attributesOfItem(atPath: local.path))?[.size] as? NSNumber)?.int64Value ?? 0
+            let orientation = (props[kCGImagePropertyOrientation] as? NSNumber)?.intValue ?? 1
+            say("转换完成：HEIC \(srcSize) → JPG \(outSize) 字节，像素 \(image.width)×\(image.height)，orientation=\(orientation)")
+
+            let written = try api.writeFile(afc, path: dstPath, data: try Data(contentsOf: out))
+            say("写入设备 \(written) 字节 → \(dstPath)")
+            let names = (try? api.listDirectory(afc, path: dir)) ?? []
+            say("目录里能看到：\(names.contains(dstName))")
+        } catch {
+            say("失败：\(error.localizedDescription)")
+            exit(1)
+        }
+        exit(0)
+    }
+
+    /// 验收 IMG_2046 的 JPEG 和缩略图。
+    private static func probeVerify2046() {
+        do {
+            let api = try MobileDeviceAPI.shared()
+            let device = try api.firstDevice(timeout: 10)
+            try api.openSession(device)
+            let afc = try api.openAFC(device)
+            defer { api.closeAFC(afc); api.stopSession(device) }
+
+            let file = "/DCIM/142APPLE/IMG_2046 (1).JPG"
+            say("文件大小：\(api.entrySize(afc, path: file)) 字节")
+            let thumbDir = "/PhotoData/Thumbnails/V2/DCIM/142APPLE/IMG_2046 (1).JPG"
+            let names = (try? api.listDirectory(afc, path: thumbDir)) ?? []
+            say("缩略图目录：\(names.count) 项 \(names.prefix(8))")
+            for n in names where n.lowercased().hasSuffix(".jpg") {
+                say("  \(n) = \(api.entrySize(afc, path: thumbDir + "/" + n)) 字节")
+            }
+        } catch {
+            say("失败：\(error.localizedDescription)")
+        }
+        exit(0)
+    }
+
+    // MARK: - 批量转换 CLI
+
+    private static func convertBatch() {
+        let arguments = CommandLine.arguments
+        func value(_ key: String) -> String? {
+            guard let index = arguments.firstIndex(of: key), index + 1 < arguments.count else { return nil }
+            return arguments[index + 1]
+        }
+        guard let dbPath = value("--db"), let udid = value("--udid") else {
+            say("用法：--convert-batch --db <Photos.sqlite> --udid <UDID> [--ids 1,2] [--limit 8] [--ratio 0.6] [--format heic|jpeg|png] [--quality 0.8] [--dry-run]")
+            exit(1)
+        }
+
+        let ids = value("--ids")?.split(separator: ",").compactMap { Int($0) }
+        let limit = Int(value("--limit") ?? "") ?? (ids?.count ?? 8)
+        let ratio = Double(value("--ratio") ?? "") ?? 0.6
+        let quality = Double(value("--quality") ?? "") ?? 0.8
+        let format = ConversionProfile.Format(rawValue: value("--format") ?? "") ?? .heic
+        let dryRun = arguments.contains("--dry-run")
+
+        let items = loadConversionItems(dbPath: dbPath, ids: ids, limit: limit)
+        guard !items.isEmpty else {
+            say("没有可转换的图片（db=\(dbPath)）")
+            exit(1)
+        }
+        say("待转换 \(items.count) 张 · \(Int((ratio * 100).rounded()))% · \(format.displayName) · Q\(Int((quality * 100).rounded()))\(dryRun ? " · dry-run（不写设备、不改库）" : "")")
+
+        do {
+            let engine = try PhotoConversionEngine(
+                udid: udid,
+                workDir: URL(fileURLWithPath: "/tmp/cmi-convert", isDirectory: true))
+            let result = engine.run(
+                items: items,
+                profile: ConversionProfile(ratio: ratio, format: format, quality: quality),
+                writeFiles: !dryRun,
+                writeDB: !dryRun,
+                restartDaemon: !dryRun
+            ) { progress in
+                say("[\(progress.phase)] \(progress.completed)/\(progress.total) \(progress.current)")
+            }
+            say("完成 \(result.records.count) 张 · 失败 \(result.failures.count) 张 · 用时 \(String(format: "%.1f", result.elapsed))s")
+            for failure in result.failures {
+                say("  失败：\(failure.name) — \(failure.reason)")
+            }
+            if let db = result.dbPath {
+                _ = db
+                say("数据库已改完（临时库已清理）")
+            }
+            if result.daemonRestarted {
+                say("assetsd 已重启")
+            }
+        } catch {
+            say("失败：\(error.localizedDescription)")
+            exit(1)
+        }
+        exit(0)
+    }
+
+    private static func loadConversionItems(dbPath: String,
+                                            ids: [Int]?,
+                                            limit: Int) -> [ConversionItem] {
+        guard let db = SQLiteDB(path: dbPath, writable: false) else { return [] }
+        var whereClause = "ZKIND=0 AND ZTRASHEDSTATE=0"
+        if let ids, !ids.isEmpty {
+            whereClause += " AND Z_PK IN (\(ids.map(String.init).joined(separator: ",")))"
+        }
+        let sql = """
+        SELECT Z_PK, ZUUID, ZDIRECTORY, ZFILENAME, ZUNIFORMTYPEIDENTIFIER,
+               ZWIDTH, ZHEIGHT, ZKINDSUBTYPE, ZPLAYBACKSTYLE, ZISDETECTEDSCREENSHOT,
+               ZFAVORITE, ZKIND
+        FROM ZASSET
+        WHERE \(whereClause)
+        ORDER BY ZDATECREATED DESC
+        LIMIT \(max(1, limit));
+        """
+        return db.rows(sql).compactMap { row in
+            let name = row.string("ZFILENAME") ?? ""
+            guard !name.isEmpty else { return nil }
+            let subtype = row.int("ZKINDSUBTYPE")
+            let playback = row.int("ZPLAYBACKSTYLE")
+            return ConversionItem(
+                pk: row.int("Z_PK"),
+                uuid: row.string("ZUUID") ?? "",
+                directory: row.string("ZDIRECTORY") ?? "",
+                fileName: name,
+                uti: row.string("ZUNIFORMTYPEIDENTIFIER") ?? "",
+                width: row.int("ZWIDTH"),
+                height: row.int("ZHEIGHT"),
+                subtype: subtype,
+                playbackStyle: playback,
+                isScreenshot: row.int("ZISDETECTEDSCREENSHOT") == 1 || subtype == 10,
+                isLive: subtype == 2 && playback == 3,
+                isVideo: row.int("ZKIND") == 1,
+                favorite: row.int("ZFAVORITE") == 1,
+                byteSize: 0
+            )
+        }
+    }
+
+    private static func probeDaemon() {
+        let arguments = CommandLine.arguments
+        guard let index = arguments.firstIndex(of: "--udid"),
+              index + 1 < arguments.count else {
+            say("用法：--probe-daemon --udid <UDID>")
+            exit(1)
+        }
+        do {
+            try PhotoDaemon.restartLibrary(udid: arguments[index + 1])
+            say("assetsd 已重启")
+        } catch {
+            say("失败：\(error.localizedDescription)")
+            exit(1)
+        }
+        exit(0)
+    }
+
+    private static func probeCheck() {
+        let arguments = CommandLine.arguments
+        guard let index = arguments.firstIndex(of: "--name"),
+              index + 1 < arguments.count else {
+            say("用法：--probe-check --name <DCIM 文件名>")
+            exit(1)
+        }
+        let name = arguments[index + 1]
+        do {
+            let api = try MobileDeviceAPI.shared()
+            let device = try api.firstDevice(timeout: 10)
+            try api.openSession(device)
+            let afc = try api.openAFC(device)
+            defer { api.closeAFC(afc); api.stopSession(device) }
+
+            let file = "/DCIM/142APPLE/" + name
+            let bytes = api.entrySize(afc, path: file)
+            say("\(name)：\(bytes) 字节")
+
+            let local = URL(fileURLWithPath: "/tmp/cmi-check-\(UUID().uuidString).heic")
+            let downloaded = try api.downloadFile(afc, path: file, to: local)
+            if let source = CGImageSourceCreateWithURL(local as CFURL, nil),
+               let image = CGImageSourceCreateImageAtIndex(source, 0, nil) {
+                say("解码：\(downloaded) 字节，\(image.width)×\(image.height)")
+            } else {
+                say("解码失败")
+            }
+            try? FileManager.default.removeItem(at: local)
+
+            let thumbDir = "/PhotoData/Thumbnails/V2/DCIM/142APPLE/" + name
+            let names = (try? api.listDirectory(afc, path: thumbDir)) ?? []
+            say("缩略图：\(names)")
+            for entry in names where entry.lowercased().hasSuffix(".jpg") {
+                say("  \(entry) = \(api.entrySize(afc, path: thumbDir + "/" + entry)) 字节")
+            }
+        } catch {
+            say("失败：\(error.localizedDescription)")
         }
         exit(0)
     }

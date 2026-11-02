@@ -175,6 +175,22 @@ struct RootView: View {
                     .transition(.identity)
             }
         }
+        // 真删过程中的两块遮罩：删除中 / 删完的结果单。**必须在预览层之后**，
+        // 否则设备卡住时用户还能点到预览。这里整块吃掉点击，底下的按钮点不到。
+        .overlay {
+            if store.purgeProgress != nil || store.purgeReport != nil {
+                ZStack {
+                    Rectangle()
+                        .fill(.thickMaterial)
+                        .ignoresSafeArea()
+                        .contentShape(Rectangle())
+                    PurgeStatusOverlay()
+                }
+                .transition(.opacity)
+            }
+        }
+        .animation(.easeInOut(duration: 0.2),
+                   value: store.purgeProgress != nil || store.purgeReport != nil)
         .onChange(of: store.emptyTrashConfirmPresented) { _, shown in
             // 弹窗被 Esc / 点外面关掉时，别把待删名单留在内存里
             if !shown { store.pendingDeleteIDs = [] }

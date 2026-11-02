@@ -97,6 +97,17 @@ final class SQLiteDB {
         return first.string("quick_check") == "ok"
     }
 
+    /// 执行写语句（建表、UPDATE、INSERT、DROP TRIGGER 等）。
+    /// `sqlite3_exec` 可以一次跑多条语句；返回 false 表示有语句失败。
+    @discardableResult
+    func run(_ sql: String) -> Bool {
+        guard let handle else { return false }
+        var error: UnsafeMutablePointer<CChar>?
+        let rc = sqlite3_exec(handle, sql, nil, nil, &error)
+        if let error { sqlite3_free(error) }
+        return rc == SQLITE_OK
+    }
+
     func columns(of table: String) -> [String] {
         rows("PRAGMA table_info('\(table)')").compactMap { $0.string("name") }
     }

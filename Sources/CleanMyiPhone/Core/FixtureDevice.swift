@@ -78,12 +78,52 @@ final class FixtureDevice: DeviceSource, @unchecked Sendable {
         return image
     }
 
-    func delete(ids: [Asset.ID]) async -> (succeeded: [Asset.ID], failed: [(id: Asset.ID, message: String)]) {
+    /// 两个只影响模拟设备的注入点，用来复现「删除中」和「删一半失败」的界面：
+    ///
+    /// ```bash
+    /// CMI_FIXTURE=1 CMI_PURGE_DEMO=40 CMI_FIXTURE_DELAY=0.6 ./cleanmyiphone
+    /// CMI_FIXTURE=1 CMI_PURGE_DEMO=40 CMI_FIXTURE_FAIL=35 ./cleanmyiphone
+    /// ```
+    ///
+    /// - `CMI_FIXTURE_DELAY`：每批删除前等几秒（真机上删除本来就慢，这里只是让它可见）
+    /// - `CMI_FIXTURE_FAIL`：这一批里按顺序每 100 个放多少条失败（用来验逐条原因）
+    func delete(ids: [Asset.ID]) async -> DeleteBatchResult {
+        let env = ProcessInfo.processInfo.environment
+        if let raw = env["CMI_FIXTURE_DELAY"], let delay = Double(raw), delay > 0 {
+            try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+        }
+        let failRate = Int(env["CMI_FIXTURE_FAIL"] ?? "") ?? 0
+        let failReasons = [
+            "设备只读（开了 iCloud 照片 / 优化存储时常见），只能在这台 iPhone 的「照片」里删",
+            "设备拒绝删除（这条可能正被「照片」App 或同步占用）",
+            "设备 45 秒没有回执（可能锁屏或通道断了），这一项没删成"
+        ]
+
         let target = Set(ids)
-        let removed = assets.filter { target.contains($0.id) }.map(\.id)
-        assets.removeAll { target.contains($0.id) }
-        for id in removed { thumbnailCache[id] = nil }
-        return (removed, [])
+        var succeeded: [Asset.ID] = []
+        var failed: [(id: Asset.ID, message: String)] = []
+        var removable = Set<Asset.ID>()
+
+        for (index, id) in ids.enumerated() {
+            guard target.contains(id) else {
+                failed.append((id, "设备上已找不到这个文件（可能已经被删掉）"))
+                continue
+            }
+            if failRate > 0, index % 100 < failRate {
+                failed.append((id, failReasons[index % failReasons.count]))
+            } else {
+                succeeded.append(id)
+                removable.insert(id)
+            }
+        }
+
+        assets.removeAll { removable.contains($0.id) }
+        for id in removable { thumbnailCache[id] = nil }
+
+        var result = DeleteBatchResult()
+        result.succeeded = succeeded
+        result.failed = failed
+        return result
     }
 
     // MARK: - 生成占位缩略图

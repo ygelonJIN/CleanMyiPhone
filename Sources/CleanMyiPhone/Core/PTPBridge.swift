@@ -310,20 +310,31 @@ final class PTPBridge: NSObject, DeviceSource {
         }
     }
 
-    func delete(ids: [Asset.ID]) async -> (succeeded: [Asset.ID], failed: [(id: Asset.ID, message: String)]) {
+    /// 一批删除最多等多久。
+    ///
+    /// 设备锁屏 / 被「访达」「照片」抢走 / 通道半死的时候，`requestDeleteFiles` 的
+    /// completion **可能永远不来**（不是报错，是不回）。没这道闸，界面上那个
+    /// 「正在删除」会一直转圈，用户只能强退 —— 2026-11 用户说的「删着删着像崩了」
+    /// 就是这种。到点就收尾，并把这一批按「没回执」逐条报给界面。
+    static let deleteTimeout: TimeInterval = 45
+
+    func delete(ids: [Asset.ID]) async -> DeleteBatchResult {
+        var report = DeleteBatchResult()
+
         // 设备侧会话会自己消失（iPhone 锁屏 / 空闲太久 / 被访达和照片 App 抢走），
         // 这时 `camera` 是 nil，整批删除会一项都没试就全部失败 —— 用户看到的就是
         // 「成功 0 项，全都失败，设备未连接」（2026-11-01 现场）。别再让用户自己去
         // 重启 App 或拔插数据线，这里先自己做一次完整重连再重试。
         guard let camera = await cameraOrReconnect(timeout: 8) else {
-            return ([], ids.map { ($0, "设备未连接（解锁 iPhone 后重试）") })
+            report.failed = ids.map { ($0, "设备未连接（解锁 iPhone 后重试）") }
+            return report
         }
         // 会话刚重建时文件表还在填，给几秒收尾；空表会让下面每条都判成「设备上找不到」
         await waitForFiles(timeout: 3)
 
         var files: [ICCameraFile] = []
         var idByFile: [ObjectIdentifier: Asset.ID] = [:]
-        var missing: [(Asset.ID, String)] = []
+        var missingIDs = Set<Asset.ID>()
 
         lock.lock()
         for id in ids {
@@ -331,32 +342,66 @@ final class PTPBridge: NSObject, DeviceSource {
                 files.append(file)
                 idByFile[ObjectIdentifier(file)] = id
             } else {
-                missing.append((id, "设备上已找不到这个文件"))
+                missingIDs.insert(id)
+                report.failed.append((id, "设备上已找不到这个文件（可能已经被删掉）"))
             }
         }
         lock.unlock()
 
-        guard !files.isEmpty else { return ([], missing) }
+        guard !files.isEmpty else { return report }
 
         var succeeded: [Asset.ID] = []
-        var failed: [(id: Asset.ID, message: String)] = missing
+        var failureByID: [Asset.ID: String] = [:]
+        var batchError: String?
+        var timedOut = false
 
         await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
             let once = VoidOnce(continuation)
+            let boxLock = NSLock()
+            var finished = false
+            let finish: (Bool) -> Void = { isTimeout in
+                boxLock.lock()
+                let first = !finished
+                finished = true
+                boxLock.unlock()
+                guard first else { return }
+                if isTimeout { timedOut = true }
+                once.finish()
+            }
+
             _ = camera.requestDeleteFiles(files, deleteFailed: { (dict: [ICDeleteError: ICCameraItem]) in
+                // 设备**逐条**报到失败的都记下来：这是「哪些没删掉、为什么」的唯一来源
                 for (key, item) in dict {
-                    let id = idByFile[ObjectIdentifier(item)] ?? "未知项"
-                    failed.append((id, Self.message(forDelete: key)))
+                    guard let id = idByFile[ObjectIdentifier(item)] else { continue }
+                    failureByID[id] = Self.message(forDelete: key)
                 }
             }, completion: { result, error in
                 for item in result[.successful] ?? [] {
                     if let id = idByFile[ObjectIdentifier(item)] { succeeded.append(id) }
                 }
-                if let error, succeeded.isEmpty {
-                    failed.append(("", error.localizedDescription))
+                if let error, !error.localizedDescription.isEmpty {
+                    batchError = error.localizedDescription
                 }
-                once.finish()
+                finish(false)
             })
+
+            DispatchQueue.main.asyncAfter(deadline: .now() + Self.deleteTimeout) { finish(true) }
+        }
+
+        // 既不在成功名单、也没有逐条原因的，就是「设备没回执」的那批。
+        // 以前这里会把它们静默丢掉（界面只剩一条总的 error），现在每条都要有话说。
+        let succeededSet = Set(succeeded)
+        for id in ids where !succeededSet.contains(id) && !missingIDs.contains(id) {
+            guard failureByID[id] == nil else { continue }
+            if timedOut {
+                failureByID[id] = "设备 \(Int(Self.deleteTimeout)) 秒没有回执（可能锁屏或通道断了），这一项没删成"
+            } else {
+                failureByID[id] = batchError.map { "设备报错：\($0)" }
+                    ?? "设备没有回执，这一项没删成（可能被「照片」App 占用）"
+            }
+        }
+        for (id, message) in failureByID {
+            report.failed.append((id, message))
         }
 
         lock.lock()
@@ -367,7 +412,9 @@ final class PTPBridge: NSObject, DeviceSource {
         lock.unlock()
         publish()
 
-        return (succeeded, failed)
+        report.succeeded = succeeded
+        report.timedOut = timedOut
+        return report
     }
 
     // MARK: - 上传探针（能不能把文件写回设备）
@@ -419,8 +466,27 @@ final class PTPBridge: NSObject, DeviceSource {
 
     private static func message(forDelete key: ICDeleteError) -> String {
         let text = String(describing: key)
-        if text.contains("ReadOnly") { return "设备只读（多半是开了 iCloud 照片），只能在这台 iPhone 上删" }
-        if text.contains("Failed") { return "设备拒绝删除" }
+        if text.contains("ReadOnly") {
+            return "设备只读（开了 iCloud 照片 / 优化存储时常见），只能在这台 iPhone 的「照片」里删"
+        }
+        if text.contains("Permission") || text.contains("Authoriz") {
+            return "设备没给删除权限（解锁 iPhone 后重试）"
+        }
+        if text.contains("NotFound") {
+            return "设备上已找不到这个文件（可能已经被删掉）"
+        }
+        if text.contains("Cancel") {
+            return "设备取消了这次删除（多半是那一刻锁屏了）"
+        }
+        if text.contains("Unavailable") || text.contains("Disconnect") {
+            return "设备中途断开（看一下数据线，解锁后重试）"
+        }
+        if text.contains("InvalidParam") {
+            return "设备不接受这个删除请求"
+        }
+        if text.contains("Failed") {
+            return "设备拒绝删除（这条可能正被「照片」App 或同步占用）"
+        }
         return "删除失败：\(text)"
     }
 
