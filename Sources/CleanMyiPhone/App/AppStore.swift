@@ -9,7 +9,7 @@ final class AppStore {
     // MARK: - 导航
 
     enum Section: String, Identifiable {
-        case overview, photos, albums, trash
+        case overview, photos, albums, trash, compression
         var id: String { rawValue }
     }
 
@@ -21,6 +21,8 @@ final class AppStore {
         case photos(LibraryFilter)
         case album(Int)
         case trash
+        /// 压缩站：标记过的待压缩项，这里二次确认才真的压
+        case compression
     }
 
     var sidebarItem: SidebarItem = .overview
@@ -34,6 +36,7 @@ final class AppStore {
         case .photos(let filter): return "photos.\(filter.id).\(viewMode)"
         case .album(let id): return "album.\(id).\(viewMode)"
         case .trash: return "trash.\(viewMode)"
+        case .compression: return "compression"
         }
     }
 
@@ -44,6 +47,7 @@ final class AppStore {
         case .albums, .album: return .albums
         case .photos: return .photos
         case .trash: return .trash
+        case .compression: return .compression
         }
     }
 
@@ -105,6 +109,10 @@ final class AppStore {
     var hoveredID: Asset.ID?
 
     let trash = TrashStore()
+    /// 压缩站：只记「要压哪几张、用什么参数」，执行要到这里二次确认
+    let compression = CompressionQueue()
+    /// 上一次用的压缩参数。预览里按「-」没有面板可选，就用它（默认 60% · HEIC · Q80）
+    var lastCompressionProfile = ConversionProfile()
     /// 清空回收站 / 彻底删除中的二次确认弹窗
     var emptyTrashConfirmPresented = false
     /// 弹窗里要彻底删除的那一批（空 = 全部）
@@ -152,6 +160,11 @@ final class AppStore {
     private(set) var previewStageText = ""
     var previewError: String?
     var thumbnails: [Asset.ID: NSImage] = [:]
+    /// 本 App 压缩出来、但 PTP **还没枚举到**的副本。
+    /// 写进 DCIM 之后设备不会立刻把它报给 ImageCaptureCore（目录是快照），
+    /// 而手机相册已经能看到 —— 用户看到的就是「手机上有了，我们这里没有，刷新也没有」。
+    /// 这些副本的信息我们全都有（文件名、目录、体积、尺寸），所以直接补进列表。
+    var convertedAssets: [Asset] = []
     /// 缩略图批次号：PTP 恢复后 +1，格子靠 `.task(id:)` 重新取一次
     var thumbEpoch = 0
 
@@ -245,6 +258,8 @@ final class AppStore {
     private var libraryRetryTask: Task<Void, Never>?
     /// 扫描的最后一道时间闸（见 `scheduleScanDeadline`）
     private var scanDeadlineTask: Task<Void, Never>?
+    /// 目录最近一次有动静的时刻：闸门只认「安静了多久」，不认「跑了多久」
+    @ObservationIgnored private var catalogHeartbeat = Date()
     private var didBootstrap = false
 
     init() {
@@ -269,7 +284,14 @@ final class AppStore {
         guard ptpAllowed, !ptpWired else { return }
         ptpWired = true
         ptp.onDevice = { [weak self] snapshot in
-            guard let self, let snapshot else { return }
+            guard let self else { return }
+            guard let snapshot else {
+                // 会话掉了：`ptp.stop()` 只清它自己的表，界面这份 `assets` 还在。
+                // 不说一句的话，界面上就一直是上一轮那批照片（手机上删掉的还显示、
+                // 新拍的看不到），用户完全看不出来「这份列表已经不能当真」。
+                self.noteCatalogStale()
+                return
+            }
             self.device = snapshot
             if self.usingFixture {
                 self.usingFixture = false
@@ -282,7 +304,8 @@ final class AppStore {
         }
         ptp.onCatalog = { [weak self] list, fraction in
             guard let self, !self.usingFixture else { return }
-            self.assets = list
+            self.catalogHeartbeat = Date()
+            self.assets = self.mergingConverted(list)
             self.catalogFraction = fraction
             self.recomputeProgress()
             self.invalidateCounts()
@@ -297,6 +320,7 @@ final class AppStore {
         }
         ptp.onCatalogFinished = { [weak self] in
             guard let self else { return }
+            self.catalogHeartbeat = Date()
             // 目录重来过一遍：让格子重新试一次缩略图
             self.thumbEpoch &+= 1
             self.catalogDone = true
@@ -304,10 +328,37 @@ final class AppStore {
             self.recomputeProgress()
             self.maybeFinishScan()
             if self.libraryLooksStale() { self.scheduleLibraryRefresh() }
+            self.runAutoRefreshIfRequested()
         }
         ptp.onError = { [weak self] message in
             self?.errorText = message
         }
+    }
+
+    /// 只给回归用的入口：`CMI_AUTO_REFRESH=1` 启动，首轮目录读完之后自动点一次
+    /// 「重新读取」，把 `startScan` 那条路（先让出设备 → 读库 → 再起 PTP）跑一遍。
+    /// 用户现场报的「点重新读取一直卡着」就是这条路，没有这个开关只能靠手点复现。
+    @ObservationIgnored private var didAutoRefreshRun = false
+
+    private func runAutoRefreshIfRequested() {
+        guard ProcessInfo.processInfo.environment["CMI_AUTO_REFRESH"] != nil,
+              !usingFixture, !didAutoRefreshRun, catalogDone, !isScanning else { return }
+        didAutoRefreshRun = true
+        Self.debugLog("[selftest] 自动触发一次刷新（startScan）")
+        Task { [weak self] in
+            try? await Task.sleep(nanoseconds: 5_000_000_000)
+            guard let self else { return }
+            await self.startScan()
+        }
+    }
+
+    /// PTP 会话没了（锁屏 / 空闲太久 / 被访达和「照片」抢走）：界面这份列表已经过时。
+    ///
+    /// 不清空它 —— 正在看的时候列表突然空掉更吓人，而且清空也救不回数据；
+    /// 只把事实说出来，然后让用户点刷新走一遍 `startScan`（那条路会重新枚举）。
+    private func noteCatalogStale() {
+        guard !usingFixture, !assets.isEmpty, !isScanning, !isPurging else { return }
+        flash("设备照片会话已断开，这份列表可能不是最新的，点刷新重新读取")
     }
 
     // MARK: - 启动
@@ -382,6 +433,7 @@ final class AppStore {
         case "trash": sidebarItem = .trash
         case "photos": sidebarItem = .photos(.all)
         case "albums": sidebarItem = .albums
+        case "compression": sidebarItem = .compression
         // 影子资产（已隐藏 / 最近删除）排查用：这两个筛选的数据来自库而不是 PTP
         case "hidden": sidebarItem = .photos(.hidden)
         case "trashed": sidebarItem = .photos(.trashed)
@@ -408,7 +460,48 @@ final class AppStore {
             self.assets = (try? await (self.source as? FixtureDevice)?.load()) ?? []
             self.invalidateCounts()
             self.finishScan()
+            self.runCompressDemoIfRequested()
+            self.runTrashDemoIfRequested()
+            // 界面回归：`CMI_DEMO_PREVIEW=1` 直接打开预览（核对预览顶栏那几个键帽）
+            if ProcessInfo.processInfo.environment["CMI_DEMO_PREVIEW"] != nil {
+                self.openPreview()
+            }
             self.runPurgeDemoIfRequested()
+        }
+    }
+
+    /// 界面回归用：`CMI_TRASH_DEMO=<条数>` 启动，把**最旧**的 N 张标进回收站（不删除），
+    /// 用来核对底栏「已标记」计数；和 `CMI_COMPRESS_DEMO` 一起用能看两个计数并存。
+    private func runTrashDemoIfRequested() {
+        guard usingFixture,
+              let raw = ProcessInfo.processInfo.environment["CMI_TRASH_DEMO"],
+              let count = Int(raw), count > 0 else { return }
+        let chosen = Array(assets.filter { $0.kind == .photo }
+            .sorted { $0.createdAt < $1.createdAt }
+            .prefix(count))
+        guard !chosen.isEmpty else { return }
+        trash.add(chosen, deviceID: device?.id ?? "fixture")
+        compression.remove(ids: chosen.map(\.id))
+        if ProcessInfo.processInfo.environment["CMI_START_SECTION"] == nil {
+            sidebarItem = .photos(.all)
+        }
+    }
+
+    /// 界面回归用：`CMI_COMPRESS_DEMO=<条数>` 启动，自动把前 N 张标进压缩站
+    /// （只标记、不动设备），用来核对「待压缩」角标和压缩站的排版。
+    private func runCompressDemoIfRequested() {
+        guard usingFixture,
+              let raw = ProcessInfo.processInfo.environment["CMI_COMPRESS_DEMO"],
+              let count = Int(raw), count > 0 else { return }
+        // 按拍摄时间取最新的几张：这样截图时它们就在网格最前面，一眼能看到角标
+        let chosen = Array(assets.filter { $0.kind == .photo }
+            .sorted { $0.createdAt > $1.createdAt }
+            .prefix(count))
+        guard !chosen.isEmpty else { return }
+        compression.add(chosen, profile: ConversionProfile(), deviceID: device?.id ?? "fixture")
+        // 没显式指定起点就落在照片页（看得见灰色「待压缩」）；指定了 compression 就留在压缩站
+        if ProcessInfo.processInfo.environment["CMI_START_SECTION"] == nil {
+            sidebarItem = .photos(.all)
         }
     }
 
@@ -527,8 +620,25 @@ final class AppStore {
 
     /// 批量压缩/转换：先把 App 自己的两条 AFC 让开，再让引擎独占一条连接。
     /// 引擎会在改库前重新抓一份当前库，所以批次跑得久也不会丢新照片。
-    func startConversion(items: [ConversionItem], profile: ConversionProfile) {
+    /// - Parameter writeBack: 是否改库让手机相册认这些副本。
+    ///   `false` 时只把副本写进 DCIM（省掉每次约 300 MB 的库往返），手机相册里看不到，
+    ///   但本 App 的列表照样能看到、能预览。
+    /// 直接压一批（不走压缩站）。正常流程不用它 —— 界面上的「压缩」只做标记，
+    /// 真压缩统一从压缩站里 `runCompressionStation(writeBack:)` 进来。
+    func startConversion(items: [ConversionItem], profile: ConversionProfile, writeBack: Bool = true) {
         guard !conversionRunning, !items.isEmpty else { return }
+        Task {
+            let result = await runConversionBatch(items: items, profile: profile, writeBack: writeBack)
+            conversionResult = result
+        }
+    }
+
+    /// 一批压缩：编码 → 写 DCIM → （可选）整份改库 → 刷新相册 → 原图进回收站 + 副本进列表。
+    /// 一批只写一次库；调用方（压缩站）按参数分组，所以「每组一次 302 MB」。
+    private func runConversionBatch(items: [ConversionItem],
+                                    profile: ConversionProfile,
+                                    writeBack: Bool) async -> PhotoConversionEngine.Result {
+        guard !items.isEmpty else { return PhotoConversionEngine.Result() }
         conversionRunning = true
         conversionResult = nil
         conversionProgress = PhotoConversionEngine.Progress(
@@ -538,42 +648,167 @@ final class AppStore {
         let workDir = URL(fileURLWithPath: "/tmp/cmi-convert-\(UUID().uuidString)",
                           isDirectory: true)
 
-        Task {
-            await releaseDeviceFiles()
-            stopPTP()
-            do {
-                let engine = try PhotoConversionEngine(udid: udid, workDir: workDir)
-                let result = await Task.detached { [weak self] in
-                    engine.run(items: items, profile: profile) { progress in
-                        Task { @MainActor in
-                            self?.conversionProgress = progress
-                        }
+        await releaseDeviceFiles()
+        // 只关会话、不停 browser：`stop()` 会把设备从 IC 里彻底弄丢
+        ptp.pauseSession()
+        var result: PhotoConversionEngine.Result
+        do {
+            let engine = try PhotoConversionEngine(udid: udid, workDir: workDir)
+            result = await Task.detached { [weak self] in
+                engine.run(items: items,
+                           profile: profile,
+                           writeFiles: true,
+                           writeDB: writeBack,
+                           restartDaemon: writeBack) { progress in
+                    Task { @MainActor in
+                        self?.conversionProgress = progress
                     }
-                }.value
-                conversionResult = result
-                conversionRunning = false
-                await refreshDevice()
-                markConvertedOriginals(result)
-            } catch {
-                var result = PhotoConversionEngine.Result()
-                result.failures = [("转换", error.localizedDescription)]
-                conversionResult = result
-                conversionRunning = false
-                await refreshDevice()
-            }
+                }
+            }.value
+        } catch {
+            var failed = PhotoConversionEngine.Result()
+            failed.failures = [("转换", error.localizedDescription)]
+            result = failed
         }
+        conversionRunning = false
+        await refreshDevice()
+        markConvertedOriginals(result)
+        return result
+    }
+
+    // MARK: - 压缩站（先标记，后执行）
+
+    /// 第一次点「压缩」只做这个：**记下意图，不动设备**。
+    /// 参数一起存进条目（同一张再标一次就是改参数）。
+    func markForCompression(profile: ConversionProfile) {
+        lastCompressionProfile = profile
+        // 视频暂不支持压缩；其余的只要被选中就能标（已经标了回收的会被切过来）
+        let chosen = selectedAssets.filter { $0.kind == .photo }
+        let skipped = selectedAssets.count - chosen.count
+        guard !chosen.isEmpty else {
+            flash(skipped > 0 ? "视频暂不支持压缩" : "先选照片")
+            return
+        }
+        // **同一项只能带一个标记**：这批里已经标了回收的，直接撤销回收标记。
+        // 不然会出现「既在回收站、又在压缩站」，两边都以为自己会处理它。
+        let switched = chosen.filter { trash.ids.contains($0.id) }.count
+        trash.remove(ids: chosen.map(\.id))
+        compression.add(chosen, profile: profile, deviceID: device?.id ?? "unknown")
+        clearSelection()
+        var message = "已标记 \(chosen.count) 张待压缩（这一步不动设备）· 去「压缩站」确认后才会真压"
+        if switched > 0 { message += "；其中 \(switched) 张已从回收站移出" }
+        flash(message)
+        if skipped > 0 {
+            Self.debugLog("压缩标记跳过 \(skipped) 张（视频）")
+        }
+    }
+
+    /// 压缩站里点「开始压缩」：按参数分组批量跑，**每组一次写库**。
+    /// 成功的从待压缩名单里移除；失败的留在名单里，能直接再点一次。
+    /// 压缩完一定写回手机相册（改库 + 重启 assetsd）—— 副本不进相册就等于没压，
+    /// 所以这里不再给开关（2026-11 用户定的：不需要勾选）。
+    /// - Parameter ids: 只压这几张（`nil` = 整个压缩站）。压缩站里选中后点「压缩选中」走这个。
+    func runCompressionStation(ids: [Asset.ID]? = nil) async {
+        guard !conversionRunning, !isPurging, !compression.isEmpty else { return }
+        let wanted = ids.map(Set.init)
+        let picked = compression.entries.filter { wanted?.contains($0.id) ?? true }
+        guard !picked.isEmpty else { return }
+        // 按参数分组：不同比例/格式各跑一次，**每组一次写库**
+        var order: [ConversionProfile] = []
+        var buckets: [ConversionProfile: [CompressionQueue.Entry]] = [:]
+        for entry in picked {
+            if buckets[entry.profile] == nil {
+                buckets[entry.profile] = []
+                order.append(entry.profile)
+            }
+            buckets[entry.profile]?.append(entry)
+        }
+        var combined = PhotoConversionEngine.Result()
+        for profile in order {
+            guard let group = buckets[profile] else { continue }
+            var items: [ConversionItem] = []
+            var idByPK: [Int: Asset.ID] = [:]
+            for entry in group {
+                guard let meta = meta(entry.asset) else {
+                    combined.failures.append((entry.asset.fileName, "相册库里找不到这条（可能已经删了）"))
+                    continue
+                }
+                guard !meta.isVideo else {
+                    combined.failures.append((entry.asset.fileName, "视频暂不支持"))
+                    continue
+                }
+                items.append(ConversionItem(meta: meta))
+                idByPK[meta.pk] = entry.id
+            }
+            guard !items.isEmpty else { continue }
+            let done = await runConversionBatch(items: items, profile: profile, writeBack: true)
+            combined.records += done.records
+            combined.failures += done.failures
+            combined.skipped += done.skipped
+            combined.daemonRestarted = combined.daemonRestarted || done.daemonRestarted
+            combined.dbPath = done.dbPath ?? combined.dbPath
+            combined.elapsed += done.elapsed
+            // 成功的移出名单；失败/跳过的留着（用户能看见、能再压一次）
+            let doneIDs = Set(done.records.compactMap { idByPK[$0.originalPK] })
+            compression.remove(ids: doneIDs)
+        }
+        conversionResult = combined
+        conversionRunning = false
+        if combined.failures.isEmpty, !combined.records.isEmpty {
+            flash("压缩完成 \(combined.records.count) 张，原图已标记到回收站")
+        }
+    }
+
+    /// 目录回来时把「我们自己压缩出来、PTP 还没枚举到」的副本并进去（按 id 去重，
+    /// 设备真报上来之后自然就只剩一份）。
+    private func mergingConverted(_ list: [Asset]) -> [Asset] {
+        guard !convertedAssets.isEmpty else { return list }
+        let known = Set(list.map(\.id))
+        let extra = convertedAssets.filter { !known.contains($0.id) }
+        return extra.isEmpty ? list : list + extra
+    }
+
+    /// 压缩副本写进 DCIM 之后，PTP 的目录里不会立刻出现它（设备端是快照），
+    /// 但手机上相册已经能看到。这里用转换结果直接补进列表，压缩完就在 App 里看得见。
+    private func injectConvertedCopies(_ result: PhotoConversionEngine.Result) {
+        var fresh: [Asset] = []
+        for record in result.records where !record.newFileName.isEmpty {
+            fresh.append(Asset(
+                id: "\(record.newFileName)|\(record.directory)",
+                fileName: record.newFileName,
+                folder: record.directory,
+                byteSize: record.newSize,
+                createdAt: Date(),
+                kind: .photo,
+                tags: record.favorite ? [.favorite] : [],
+                pixelWidth: record.newWidth,
+                pixelHeight: record.newHeight,
+                duration: 0
+            ))
+        }
+        guard !fresh.isEmpty else { return }
+        let known = Set(convertedAssets.map(\.id))
+        convertedAssets.append(contentsOf: fresh.filter { !known.contains($0.id) })
+        let existing = Set(assets.map(\.id))
+        assets.append(contentsOf: convertedAssets.filter { !existing.contains($0.id) })
+        thumbEpoch &+= 1
+        invalidateCounts()
     }
 
     /// 转换成功后，把原图按现有「标记回收」流程放进回收站（橙色），
     /// 用户到回收站点「彻底删除」才真正从手机删。
     private func markConvertedOriginals(_ result: PhotoConversionEngine.Result) {
         guard !result.records.isEmpty else { return }
+        // 先把副本放进列表：用户压缩完最想看到的就是「新的那张在哪儿」
+        injectConvertedCopies(result)
         let pks = Set(result.records.map(\.originalPK))
         let originals = visibleAssets.filter { asset in
             guard let meta = meta(asset) else { return false }
             return pks.contains(meta.pk)
         }
         guard !originals.isEmpty else { return }
+        // 原图进回收站 → 它不再是「待压缩」，从压缩站名单里撤掉（两者互斥）
+        compression.remove(ids: originals.map(\.id))
         trash.add(originals, deviceID: device?.id ?? "unknown")
         clearSelection()
         flash("已压缩 \(result.records.count) 张，原图已标记到回收站")
@@ -603,14 +838,28 @@ final class AppStore {
         // 界面上什么都不变 —— 用户点了等于没点（连"清空"按钮都会先闪掉一下）。
         resetScan(skipLibrary: false)
         libraryStatus = nil
-        stopPTP()
-        startPTP()
-        // 以前这里只靠 PTP 的 `onDevice` 回调去触发 `beginSession()`（那条链才会读库）。
-        // 会话没真正重开时（解锁后刷新最典型：ICCamera 还挂着同一个设备，不会再报一次
-        // device）回调不会来 → 库永远不重读，界面停成
-        // 「正在读取相册索引 / 正在等手机回包 / 已读 0 KB」一直不动。
-        // 这里直接起一次会话链，不依赖回调是否还会来。
-        beginSession()
+
+        // 旧目录**不立刻清空**：清空了但枚举回不来，用户看到的是一屏空白。
+        // 枚举成功那一刻整份换掉（`onCatalog` 直接赋 `assets`）；失败就保留旧列表，
+        // 由 `noteCatalogStale()` 说一句「这份列表可能不是最新的」。
+        closePreview()
+
+        // ⚠️ 刷新**不许停 `ICDeviceBrowser`**（2026-11-02 真机实测）：`browser.stop()`
+        // 之后设备不再回到 IC 的列表里 —— 换三个新实例 `start()` 都没有一条 `didAdd`，
+        // 手机还插着、AFC 读库也正常，PTP 却永久空掉，只能重启 App。
+        // 所以这里只重开**会话**（`refreshCatalog`），设备对象始终在。
+        // 顺序仍是先读库、再让 PTP 重新枚举：重开那一刻设备会把目录重推一遍，
+        // 和读库叠在一起最容易把 AFC / 会话一起顶坏。
+        // 上一轮残留的 helper 会和新的一次抢 AFC（读库卡几分钟的头号原因）
+        await Task.detached { LibraryService.killStrayHelpers() }.value
+        // 自己也让开：缩略图、预览各攥着一条 AFC（`reset` 有 3 秒上限，不会挂死）
+        await releaseDeviceFiles()
+        await loadLibrary()
+
+        // 目录重推：会话解开再开一次，`deviceDidBecomeReady` 会重新 ingest 一遍。
+        // 回来之后 `onCatalog` 覆盖 `assets`，手机上新拍/已删的这时才对得上。
+        ptp.refreshCatalog()
+
         scheduleScanDeadline()
     }
 
@@ -624,20 +873,35 @@ final class AppStore {
     /// 首启，⌘R / 刷新按钮走的 `startScan` 这条路上原来一个兜底都没有。
     private func scheduleScanDeadline(timeout: TimeInterval = 30) {
         scanDeadlineTask?.cancel()
+        catalogHeartbeat = Date()
         scanDeadlineTask = Task { [weak self] in
-            try? await Task.sleep(nanoseconds: UInt64(timeout * 1_000_000_000))
-            guard let self, !Task.isCancelled, !self.scanFinished else { return }
-            if !self.catalogDone {
+            // **心跳式**闸门：只要目录还在往回吐东西，就不收尾。
+            //
+            // 原来是「从会话开始算满 30 秒就收尾」。这在正常启动时够用，但重新读库
+            // 之后重开会话、4541 个文件从头枚举，30 秒里目录明明在稳步往回吐，
+            // 这道闸还是会提前收尾，顺手把 `errorText` 写成
+            // 「读不到照片目录：解锁 iPhone 后点刷新重试」——**一句假的失败原因**
+            // （2026-11 实测日志里抓到 `scan finished` 紧接着 `deadline fired`）。
+            // 现在只认「目录安静了多久」，安静满 `timeout` 才算真的卡住。
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: 2_000_000_000)
+                guard let self, !Task.isCancelled else { return }
+                if self.scanFinished { return }
+                // 读库阶段是合法长过程，由 helper 自己的 30/90/150 秒三道闸负责
+                if self.libraryStarted && !self.libraryDone { continue }
+                if self.catalogDone { return }
+                guard Date().timeIntervalSince(self.catalogHeartbeat) >= timeout else { continue }
                 self.catalogDone = true
                 self.catalogFraction = 1
                 if self.errorText == nil, !self.isDeviceLocked {
                     self.errorText = "读不到照片目录：解锁 iPhone 后点刷新重试"
                 }
+                self.recomputeProgress()
+                self.maybeFinishScan()
+                self.finishScan()
+                Self.debugLog("scan deadline fired：目录静默 \(Int(timeout)) 秒，强制收尾")
+                return
             }
-            self.recomputeProgress()
-            self.maybeFinishScan()
-            self.finishScan()
-            Self.debugLog("scan deadline fired：强制收尾（catalogDone forced）")
         }
     }
 
@@ -689,6 +953,11 @@ final class AppStore {
             libraryStarted = false
             libraryDone = false
         }
+        // 上一轮那道闸必须在这里撤掉：`resetScan` 把 `scanFinished` 掰回 false，
+        // 旧闸再过几十秒就会「合法地」醒过来，把这一轮正在跑的读库当成卡住，
+        // 顺手写一句假的「读不到照片目录」。撤掉，本轮由 `scheduleScanDeadline` 重挂。
+        scanDeadlineTask?.cancel()
+        scanDeadlineTask = nil
     }
 
     private func finishScan() {
@@ -915,31 +1184,44 @@ final class AppStore {
     /// 「门禁一直盖着、又变回锁屏提示」，而不是先掉回正常界面
     /// —— 用户报的「点了重新读取，样式就变了（进去了）」就是这里漏的这一步。
     func retryLibraryNow() async {
+        guard !libraryRetryInFlight else { return }
         libraryFailureCount = 0
         libraryAutoRetryStopped = false
         isDeviceLocked = false
         await retryLibraryOnce(force: true)
     }
 
+    /// 一次重读正在跑：手动连点、自动重试、快照过期补抓撞在一起时拦住，
+    /// 不然几条 helper 会叠在同一根管子上抢设备（越点越读不出来）。
+    @ObservationIgnored private var libraryRetryInFlight = false
+
     private func retryLibraryOnce(force: Bool = false) async {
         guard !usingFixture else { return }
         if !force, libraryIndex != nil { return }
+        guard !libraryRetryInFlight else { return }
+        libraryRetryInFlight = true
+        // `libraryRetrying` **从按下那一刻**就置上：让出设备（pkill 最多 2.5 秒）+
+        // 800 ms 静默 + `reset()` 这几步都可能等一会儿，以前标志放在它们后面，
+        // 界面在这段时间里什么都不变 —— 用户以为按钮没反应，就再点一次，再叠一个任务。
+        libraryRetrying = true
+        defer {
+            libraryRetrying = false
+            libraryRetryInFlight = false
+        }
+
         // 重试前先把上一轮残留的辅助进程清掉：它们不随父进程退出，
         // 几个叠在一起就会互相抢设备，读库永远起不来。
-        LibraryService.killStrayHelpers()
-        // 重试时临时让出设备：有 ICCamera 会话时子进程的 AFC 会打不开文件
+        // 放后台跑，别在主线程等 pkill（最多 2.5 秒的冻界面）。
+        await Task.detached { LibraryService.killStrayHelpers() }.value
+        // 重试时临时让出设备：只关**会话**，不动 `ICDeviceBrowser`
+        // （`stop()` 之后设备就回不到 IC 的列表里了，见 `PTPBridge.refreshCatalog`）
         let pausePTP = ptpWired
-        if pausePTP { stopPTP() }
+        if pausePTP { ptp.pauseSession() }
         // 也让出**自己的 AFC**：缩略图和预览各自攥着一条连接（`photoSession` /
         // `previewSession`）。重抓 296 MB 时它们还开着，就是「App 两条 + helper 一条」
         // 压在同一根管子上 —— 这是最容易把设备侧 afcd 顶到拒连的一档。
         await releaseDeviceFiles()
         try? await Task.sleep(nanoseconds: 800_000_000)
-
-        // 从**按下那一刻**就算「在读」：让出设备 + 800 ms 静默这段也算，
-        // 否则门禁会在这半秒里画成「失败卡」，看着像又没读成。
-        libraryRetrying = true
-        defer { libraryRetrying = false }
 
         libraryStarted = false
         libraryDone = false
@@ -948,12 +1230,14 @@ final class AppStore {
         // `libraryReadingNow` 决定画进度、把原因留成底下那行小字。
         await loadLibrary()
 
-        if pausePTP { startPTP() }
+        // 会话重新打开，设备会把目录重推一遍（不然列表停在刷新前那一份）
+        if pausePTP { ptp.refreshCatalog() }
         maybeFinishScan()
     }
 
-    /// 关掉 App 自己那两条 AFC 连接（读库前必须让开），不阻塞主线程：
-    /// `reset()` 里是 `queue.sync`，正在下载缩略图时会等上几秒。
+    /// 关掉 App 自己那两条 AFC 连接（读库前必须让开），不阻塞主线程。
+    /// `reset()` 自己带 3 秒上限（设备不回包时换一条新连接、不干等），
+    /// 所以这里不会把「重新读取」永远挂住。
     private func releaseDeviceFiles() async {
         await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
             DispatchQueue.global(qos: .userInitiated).async {
@@ -1659,8 +1943,31 @@ final class AppStore {
     /// 就地改状态，画面留在原地 —— 顶栏的状态胶囊会立刻变成「已标记回收」，
     /// 反馈已经够了；自动跳走反而让人不知道刚才那一下动的是哪张。
     /// 想换下一张就 ← → 或点顶栏的「下一张」。
+    /// 预览里按「-」：标记压缩 ↔ 取消标记（和 ⌫ 的「标记回收」互斥，后按的那个说了算）
+    func compressionMarkCurrentPreview() {
+        guard let id = previewID, let asset = assets.first(where: { $0.id == id }) else { return }
+        if compression.ids.contains(id) {
+            compression.remove(ids: [id])
+            return
+        }
+        guard asset.kind == .photo else {
+            flash("视频暂不支持压缩")
+            return
+        }
+        // 同一项只能带一个标记：切到「待压缩」就把回收标记撤掉
+        let wasPending = pendingDeletions.contains(id)
+        trash.remove(ids: [id])
+        compression.add([asset], profile: lastCompressionProfile, deviceID: device?.id ?? "unknown")
+        selection.remove(id)
+        flash(wasPending
+              ? "已改为标记压缩（原回收标记已撤销）· 不动手机，去「压缩站」确认"
+              : "已标记压缩 · 不动手机，去「压缩站」确认后才真压")
+    }
+
     func trashCurrentPreview() {
         guard let id = previewID, let asset = assets.first(where: { $0.id == id }) else { return }
+        // 同一项只能带一个标记：切到「待删」就把压缩站里那条撤掉
+        compression.remove(ids: [id])
         trash.add([asset], deviceID: device?.id ?? "unknown")
         selection.remove(id)
     }
@@ -1710,9 +2017,15 @@ final class AppStore {
     func markSelectedForRecycle() {
         let chosen = selectedAssets
         guard !chosen.isEmpty else { return }
+        // **同一项只能带一个标记**（2026-11 用户定的）：后标的一方生效，
+        // 原来在压缩站里的这批直接移出，别让人以为它还会被压缩。
+        let switched = chosen.filter { compression.ids.contains($0.id) }.count
         trash.add(chosen, deviceID: device?.id ?? "unknown")
+        compression.remove(ids: chosen.map(\.id))
         clearSelection()
-        flash("已标记 \(chosen.count) 项到回收站")
+        flash(switched > 0
+              ? "已标记 \(chosen.count) 项到回收站（其中 \(switched) 项已从压缩站移出）"
+              : "已标记 \(chosen.count) 项到回收站")
     }
 
     /// 回收站里单独几条「彻底删除」：和清空走同一台引擎，只是范围小
@@ -1768,8 +2081,13 @@ final class AppStore {
         isPurging = false
         purgeProgress = nil
 
-        let removed = Set(outcome.succeeded)
+        // 成功的 + 设备上已经不存在的，一起从列表里拿掉。
+        // 后者是用户现场那条死循环的解药：手机上已经删掉、App 里还显示（甚至标着「已压缩」），
+        // 一点删除就报「找不到条目」，然后永远卡在回收站里。
+        let removed = Set(outcome.succeeded).union(outcome.gone)
         assets.removeAll { removed.contains($0.id) }
+        convertedAssets.removeAll { removed.contains($0.id) }
+        compression.remove(ids: removed)
         invalidateCounts()
         thumbnails = thumbnails.filter { !removed.contains($0.key) }
 
@@ -1777,14 +2095,18 @@ final class AppStore {
             total: outcome.total,
             succeededIDs: outcome.succeeded,
             succeededBytes: outcome.succeededBytes,
+            goneIDs: outcome.gone,
+            goneBytes: outcome.goneBytes,
             failures: outcome.failures,
             aborted: outcome.aborted,
             skipped: outcome.skipped
         )
 
+        let freed = ByteCountFormatter.string(fromByteCount: outcome.succeededBytes, countStyle: .file)
         if outcome.failures.isEmpty {
-            purgeMessage = "已彻底删除 \(outcome.succeeded.count) 项，释放 "
-                + ByteCountFormatter.string(fromByteCount: outcome.succeededBytes, countStyle: .file)
+            purgeMessage = outcome.gone.isEmpty
+                ? "已彻底删除 \(outcome.succeeded.count) 项，释放 \(freed)"
+                : "已彻底删除 \(outcome.succeeded.count) 项（释放 \(freed)），另有 \(outcome.gone.count) 项设备上已经不存在，已从列表移除"
         } else {
             let first = outcome.failures.first?.reason ?? "未知原因"
             purgeMessage = "\(outcome.summary)：\(first)"
@@ -2453,6 +2775,7 @@ final class AppStore {
         selection.removeAll()
         thumbUnavailable.removeAll()
         trash.removeAll()
+        compression.removeAll()
         invalidateCounts()
 
         // 清完就停在这：不重扫、不重生成缩略图，等用户点「重新读取」
@@ -2536,6 +2859,9 @@ final class AppStore {
                 } else {
                     trashCurrentPreview()
                 }
+                return true
+            case 27:                            // -：标记压缩 ↔ 取消标记（和 ⌫ 互斥）
+                compressionMarkCurrentPreview()
                 return true
             case 36, 76:                        // ⏎：选中 ↔ 取消选中
                 togglePreviewSelection()

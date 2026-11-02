@@ -2,8 +2,8 @@ import Foundation
 import UniformTypeIdentifiers
 
 /// 一次批量转换的参数：按比例缩、输出格式、质量、是否去实况。
-struct ConversionProfile: Sendable, Equatable {
-    enum Format: String, Sendable, CaseIterable {
+struct ConversionProfile: Sendable, Hashable {
+    enum Format: String, Sendable, Hashable, CaseIterable {
         case heic, jpeg, png
 
         var utType: UTType {
@@ -201,6 +201,9 @@ struct ConversionRecord: Sendable {
     let originalPK: Int
     let originalFileName: String
     let originalUUID: String
+    /// 原图体积。结果卡的「省了多少」只认它 —— 转换结束后选中被清掉了，
+    /// 再回去从列表里捞原图大小会捞到 0，于是把「省了 2 MB」显示成「体积增加 332 KB」。
+    let originalSize: Int64
     var newPK: Int
     let newUUID: String
     let directory: String

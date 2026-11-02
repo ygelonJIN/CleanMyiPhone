@@ -208,6 +208,7 @@ struct RootView: View {
         // 相簿这一节也用照片页：左边挂二级栏（相簿列表），右边是那个相簿里的图
         case .albums: PhotosView()
         case .trash: TrashView()
+        case .compression: CompressionView()
         }
     }
 }

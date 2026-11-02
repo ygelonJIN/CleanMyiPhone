@@ -16,7 +16,10 @@ final class PTPBridge: NSObject, DeviceSource {
     var onCatalogFinished: (() -> Void)?
     var onError: ((String) -> Void)?
 
-    private let browser = ICDeviceBrowser()
+    /// ⚠️ `ICDeviceBrowser` 是**一次性**的：同一个实例 `stop()` 之后再 `start()`，
+    /// 设备不会重新报 `didAdd`（2026-11-02 真机实测：刷新走完 stop→start，
+    /// 目录 30 秒一点动静都没有，界面就空着）。所以 `stop()` 里整个丢掉换新的。
+    private var browser = ICDeviceBrowser()
     private var camera: ICCameraDevice?
     /// 上传探针的回调落点（一次一条）
     private var uploadResult: ((String) -> Void)?
@@ -32,7 +35,19 @@ final class PTPBridge: NSObject, DeviceSource {
     override init() {
         super.init()
         let raw = ICDeviceTypeMask.camera.rawValue | ICDeviceLocationTypeMask.local.rawValue
-        browser.browsedDeviceTypeMask = ICDeviceTypeMask(rawValue: raw) ?? .camera
+        let mask = ICDeviceTypeMask(rawValue: raw) ?? .camera
+        browser.browsedDeviceTypeMask = mask
+        browser.delegate = self
+    }
+
+    /// 换一个全新的浏览器实例（掩码和代理都照旧）。
+    /// 只在 `stop()` 里调用 —— 见 `browser` 的注释。
+    private func replaceBrowser() {
+        let mask = ICDeviceTypeMask(rawValue: ICDeviceTypeMask.camera.rawValue
+                                    | ICDeviceLocationTypeMask.local.rawValue) ?? .camera
+        browser.delegate = nil
+        browser = ICDeviceBrowser()
+        browser.browsedDeviceTypeMask = mask
         browser.delegate = self
     }
 
@@ -329,8 +344,13 @@ final class PTPBridge: NSObject, DeviceSource {
             report.failed = ids.map { ($0, "设备未连接（解锁 iPhone 后重试）") }
             return report
         }
-        // 会话刚重建时文件表还在填，给几秒收尾；空表会让下面每条都判成「设备上找不到」
-        await waitForFiles(timeout: 3)
+        // 会话刚重建时文件表还在填，得等一会儿；**空表会让下面每条都判成「找不到」**，
+        // 而那句「设备上已找不到这个文件（可能已经被删掉）」是错的 —— 文件明明还在手机上。
+        // 以前只给 3 秒，5000 张的目录重填远不止 3 秒（用户现场就是这么被劝退的：
+        // 手机上删掉的照片在 App 里还在，一动删除就报「找不到」）。
+        // 现在等「表里真的有东西」，最多 15 秒；真的一张都填不出来才算设备没上来。
+        await waitForFiles(timeout: 15)
+        let tableEmpty = lock.withLock { filesByID.isEmpty }
 
         var files: [ICCameraFile] = []
         var idByFile: [ObjectIdentifier: Asset.ID] = [:]
@@ -343,7 +363,16 @@ final class PTPBridge: NSObject, DeviceSource {
                 idByFile[ObjectIdentifier(file)] = id
             } else {
                 missingIDs.insert(id)
-                report.failed.append((id, "设备上已找不到这个文件（可能已经被删掉）"))
+                // 两种「查不到」要分开说：表是空的 = 我们还没读到目录（过几秒重试就行）；
+                // 表里有东西、偏偏没有这一条 = 设备上确实没有这个文件了 →
+                // 不报失败，报「已经没了」，让界面把它从列表和回收站里清掉。
+                // （用户现场：手机上删掉的照片在 App 里还显示「已压缩」，一点删除就
+                //  报「找不到条目」，然后卡在回收站里出不去。）
+                if tableEmpty {
+                    report.failed.append((id, "设备的照片目录还没读完（会话刚重建），等几秒再点一次"))
+                } else {
+                    report.gone.append(id)
+                }
             }
         }
         lock.unlock()
@@ -490,12 +519,42 @@ final class PTPBridge: NSObject, DeviceSource {
         return "删除失败：\(text)"
     }
 
+    /// 让设备**重新报一遍目录**，但不碰 `ICDeviceBrowser`。
+    ///
+    /// 为什么不能停 browser（2026-11-02 真机实测）：`browser.stop()` 之后设备就不再
+    /// 回到 IC 的列表里，换三个新实例 `start()` 也一条 `didAdd` 都没有 ——
+    /// 手机明明还插着（AFC 读库正常），PTP 这边却永久空掉，只能重启 App。
+    /// 所以刷新只重开**会话**：设备对象还在，解开会话再开一次，设备会把
+    /// `mediaFiles` / 目录重新推一遍（`deviceDidBecomeReady` 里会重新 ingest）。
+    func refreshCatalog() {
+        guard let camera else { return }
+        Self.dbg("refreshCatalog：重开会话")
+        // 上一轮已经发过「目录枚举完成」了；不清掉，这一轮 `finishCatalog()` 会被
+        // 一次性守卫吃掉 → `catalogDone` 永远不置位 → 界面只能等 30 秒心跳闸门收尾。
+        catalogFinishSent = false
+        camera.requestCloseSession()
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { [weak self] in
+            guard let self, self.camera === camera else { return }
+            camera.requestOpenSession()
+        }
+    }
+
     // MARK: - Session
 
     func start() {
         guard !started else { return }
         started = true
         browser.start()
+        Self.dbg("browser.start() 已发出")
+    }
+
+    /// 临时让出设备：**只关会话，不碰 `ICDeviceBrowser`**。
+    /// 换开会话要配合 `refreshCatalog()`（它会重新开一次并让设备重推目录）。
+    /// 为什么不能停 browser：见 `refreshCatalog()` 的注释 —— 停了设备就回不来了。
+    func pauseSession() {
+        guard camera != nil else { return }
+        Self.dbg("pauseSession")
+        camera?.requestCloseSession()
     }
 
     /// 拿相机对象；拿不到就把浏览器**整个重置一遍**再等设备上来。
@@ -512,9 +571,12 @@ final class PTPBridge: NSObject, DeviceSource {
     /// 只在主线程调用（`delete` ← `PurgeEngine` 是 @MainActor），IC 的 browser 要求主线程。
     private func cameraOrReconnect(timeout: TimeInterval) async -> ICCameraDevice? {
         if let camera { return camera }
-        stop()
-        try? await Task.sleep(nanoseconds: 300_000_000)   // 让 browser 真正停稳
-        start()
+        // **不要再 stop() + start()**（2026-11-02 实测）：`browser.stop()` 之后设备
+        // 不会回到 IC 的列表里，换新实例也等不到 `didAdd` —— 一条 `stop()` 就把 PTP
+        // 永久弄死，只能重启 App。这里只把（还活着的）浏览器再 start 一次然后等；
+        // 真等不到就如实报「设备未连接」，让用户拔插数据线。
+        Self.dbg("cameraOrReconnect：camera 为空，等设备重新上来")
+        browser.start()
         let deadline = Date().addingTimeInterval(timeout)
         while Date() < deadline {
             if let camera { return camera }
@@ -537,11 +599,14 @@ final class PTPBridge: NSObject, DeviceSource {
     }
 
     func stop() {
+        Self.dbg("stop() started=\(started)")
         browser.stop()
         started = false
         catalogFinishSent = false
         camera?.requestCloseSession()
         camera = nil
+        // 旧实例已经没用了：下一次 `start()` 必须靠新实例才会重新报 `didAdd`
+        replaceBrowser()
         lock.withLock {
             filesByID.removeAll()
             assetsByID.removeAll()
@@ -641,6 +706,7 @@ extension PTPBridge: ICDeviceBrowserDelegate {
 
     func deviceBrowser(_ browser: ICDeviceBrowser, didAdd device: ICDevice, moreComing: Bool) {
         guard let camera = device as? ICCameraDevice else { return }
+        Self.dbg("didAdd \(camera.name ?? "?") moreComing=\(moreComing)")
         self.camera = camera
         camera.delegate = self
         camera.requestOpenSession()
@@ -656,6 +722,7 @@ extension PTPBridge: ICDeviceBrowserDelegate {
 
     func deviceBrowser(_ browser: ICDeviceBrowser, didRemove device: ICDevice, moreGoing: Bool) {
         guard (device as? ICCameraDevice) === camera else { return }
+        Self.dbg("didRemove")
         camera = nil
         lock.withLock {
             filesByID.removeAll()
@@ -671,9 +738,11 @@ extension PTPBridge: ICCameraDeviceDelegate {
 
     func device(_ device: ICDevice, didOpenSessionWithError error: (any Error)?) {
         guard error == nil, let camera = device as? ICCameraDevice else {
+            Self.dbg("openSession 失败：\(error?.localizedDescription ?? "未知")")
             if let error { onError?(error.localizedDescription) }
             return
         }
+        Self.dbg("openSession 成功：\(camera.name ?? "?")")
         ingest(camera.mediaFiles ?? [])
         publish()
     }
@@ -690,6 +759,21 @@ extension PTPBridge: ICCameraDeviceDelegate {
         guard let camera = device as? ICCameraDevice else { return }
         ingest(camera.mediaFiles ?? [])
         publish()
+    }
+
+    /// PTP 会话生命周期的诊断（只在 `CMI_DEBUG=1` 时写 `/tmp/cmi-app.log`）。
+    /// 「刷新之后列表空着」到底是没上报设备、还是会话打不开，只能靠这几行分。
+    static func dbg(_ line: String) {
+        guard ProcessInfo.processInfo.environment["CMI_DEBUG"] != nil else { return }
+        let url = URL(fileURLWithPath: "/tmp/cmi-app.log")
+        let text = "[ptp] " + line + "\n"
+        if let handle = try? FileHandle(forWritingTo: url) {
+            handle.seekToEndOfFile()
+            handle.write(Data(text.utf8))
+            try? handle.close()
+        } else {
+            try? Data(text.utf8).write(to: url)
+        }
     }
 
     /// 设备端缩略图这条路的诊断（写同一个 thumb-log.txt）

@@ -94,10 +94,13 @@ struct DateHeader: View {
 struct PhotoCell: View {
     let asset: Asset
     @Environment(AppStore.self) private var store
-    @State private var hovering = false
+    /// `CMI_DEMO_HOVER=1` 时初始就是悬停态：只给界面回归截图用（悬停没法用鼠标脚本复现）
+    @State private var hovering = ProcessInfo.processInfo.environment["CMI_DEMO_HOVER"] != nil
 
     private var isSelected: Bool { store.selection.contains(asset.id) }
     private var isPending: Bool { store.pendingDeletions.contains(asset.id) }
+    /// 已经标记待压缩（在压缩站里排队，**还没动设备**）
+    private var isQueuedForCompression: Bool { store.compression.ids.contains(asset.id) }
     private var compression: CompressionDisplay? { store.compressionDisplay(for: asset) }
     private var isCompressedCopy: Bool { compression?.role == .copy }
     /// 缩略图到了没有：新的一帧图要淡入，不能"啪"地出现
@@ -111,46 +114,16 @@ struct PhotoCell: View {
             .aspectRatio(1, contentMode: .fit)
             .overlay { thumbnail }
             .clipShape(RoundedRectangle(cornerRadius: corner, style: .continuous))
-            // 选中：整格铺一层淡强调色（苹果相册的做法：轻微压暗 + 角上打勾）
-            .overlay {
-                if isSelected {
-                    RoundedRectangle(cornerRadius: corner, style: .continuous)
-                        .fill(Color.accentColor.opacity(0.14))
-                }
-            }
-            // 标记回收：压暗 + 橙色调，远远看就是"这张不要了"
-            .overlay {
-                if isPending {
-                    RoundedRectangle(cornerRadius: corner, style: .continuous)
-                        .fill(Color.orange.opacity(0.18))
-                }
-            }
-            // 压缩副本：绿色，沿用选中/标记的圆环+铺色+角标语言。
-            .overlay {
-                if isCompressedCopy {
-                    RoundedRectangle(cornerRadius: corner, style: .continuous)
-                        .fill(Color.green.opacity(0.12))
-                }
-            }
+            // 状态铺色（选中 / 待删 / 待压缩 / 已压缩）一次画完，别写成四条 overlay 链
+            .overlay { stateTint }
             .overlay(alignment: .topLeading) { leadingBadges }
             .overlay(alignment: .topTrailing) { cornerBadge }
             .overlay(alignment: .bottomLeading) { durationBadge }
             .overlay(alignment: .bottomTrailing) { sizeBadge }
-            // 描边：选中 3pt 强调色 > 标记 2.5pt 橙 > 悬停 2pt 白。三者互斥，不叠加。
-            .overlay {
-                RoundedRectangle(cornerRadius: corner, style: .continuous)
-                    .strokeBorder(ringColor, lineWidth: ringWidth)
-            }
-            // 悬停时在外面再压一条很细的黑边：纯白边压在白底照片上等于没有
-            .overlay {
-                RoundedRectangle(cornerRadius: corner + 1.5, style: .continuous)
-                    .strokeBorder(Color.black.opacity(hovering && !isSelected && !isPending ? 0.32 : 0),
-                                  lineWidth: 1.5)
-                    .padding(-1.5)
-            }
-            // 悬停的"抬起来"：阴影在外，描边在内，图自己再推近 8%
+            .overlay { stateRing }
+            // 悬停的"抬起来"：柔和的大阴影（苹果那种悬浮感，不是套两层框）
             .shadow(color: .black.opacity(hovering ? 0.34 : 0),
-                    radius: hovering ? 10 : 0, y: hovering ? 4 : 0)
+                    radius: hovering ? 14 : 0, y: hovering ? 5 : 0)
             .background(CellFrameReporter(asset: asset))
             .overlay {
                 // 悬停层顺带记下这一格在 root 坐标系里的位置：预览卡片从这儿长出来
@@ -191,20 +164,45 @@ struct PhotoCell: View {
                   + "\n空格预览 · 拖动框选 · ⇧ 点连选")
     }
 
+    // MARK: - 状态铺色 / 描边 / 悬停（拆开写：整条链一起写会类型检查超时）
+
+    /// 一格只带一种状态色：选中（强调色）> 待删（橙）> 待压缩（浅黄）> 已压缩（绿）
+    private var tintColor: Color {
+        if isSelected { return Color.accentColor.opacity(0.14) }
+        if isPending { return Color.orange.opacity(0.18) }
+        if isQueuedForCompression { return Color.yellow.opacity(0.22) }
+        if isCompressedCopy { return Color.green.opacity(0.12) }
+        return .clear
+    }
+
+    private var stateTint: some View {
+        RoundedRectangle(cornerRadius: corner, style: .continuous)
+            .fill(tintColor)
+    }
+
+    private var stateRing: some View {
+        RoundedRectangle(cornerRadius: corner, style: .continuous)
+            .strokeBorder(ringColor, lineWidth: ringWidth)
+    }
+
     // MARK: - 描边
 
     private var ringColor: Color {
         if isSelected { return .accentColor }
         if isPending { return .orange }
+        if isQueuedForCompression { return .yellow }
         if isCompressedCopy { return .green }
-        if hovering { return Color.white.opacity(0.92) }
+        // 悬停：一条干净的白色细边（苹果相册那种头发丝边），配合下面的柔和投影
+        if hovering { return Color.white.opacity(0.78) }
         return .clear
     }
 
     private var ringWidth: CGFloat {
         if isSelected { return 3 }
         if isPending { return 2.5 }
+        if isQueuedForCompression { return 2.5 }
         if isCompressedCopy { return 2.5 }
+        // 2pt：白底照片上也看得见，又不至于像"套了个框"（3pt + 外圈白晕＝丑）
         if hovering { return 2 }
         return 0
     }
@@ -218,7 +216,10 @@ struct PhotoCell: View {
                     .resizable()
                     .scaledToFill()
                     // 只放大里面的图：外框不动，不会抖
-                    .scaleEffect(hovering ? 1.08 : 1.0)
+                    // 只放大里面的图：外框尺寸和命中区一点没变，不会触发 hover 抖动。
+                    // 1.08 → 1.16：用户觉得 8% 看不出来
+                    .scaleEffect(hovering ? 1.12 : 1.0)
+                    .brightness(hovering ? 0.03 : 0)
                     // 标记之后压暗，一眼能分出"留"和"不要"
                     .opacity(isPending ? 0.55 : 1)
                     .transition(.opacity)
@@ -256,6 +257,21 @@ struct PhotoCell: View {
                     .shadow(color: .black.opacity(0.3), radius: 2, y: 1)
                     .transition(.badge)
             }
+            // 待压缩：浅黄胶囊 + 深色字（黄底压白字读不出来）
+            if isQueuedForCompression && !isPending && !isCompressedCopy {
+                HStack(spacing: 2) {
+                    Image(systemName: "arrow.down.right.and.arrow.up.left")
+                        .font(.system(size: 6.5, weight: .bold))
+                    Text("待压缩")
+                        .font(.system(size: 8, weight: .bold))
+                }
+                .padding(.horizontal, 4)
+                .padding(.vertical, 1.5)
+                .background(Capsule().fill(Color.yellow.opacity(0.95)))
+                .foregroundStyle(Color.black.opacity(0.78))
+                .shadow(color: .black.opacity(0.25), radius: 1, y: 0.5)
+                .transition(.badge)
+            }
             if isCompressedCopy {
                 Text("已压缩")
                     .font(.system(size: 8, weight: .bold))
@@ -269,6 +285,7 @@ struct PhotoCell: View {
         }
         .animation(Motion.pop, value: isPending)
         .animation(Motion.pop, value: isCompressedCopy)
+        .animation(Motion.pop, value: isQueuedForCompression)
         .padding(6)
     }
 

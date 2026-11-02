@@ -116,6 +116,12 @@ private struct PurgeResultCard: View {
                         .font(.system(size: 12))
                         .foregroundStyle(.secondary)
                 }
+                if !report.goneIDs.isEmpty {
+                    Text("另有 \(report.goneIDs.count) 项设备上已经不存在（多半是在手机上删掉的），已从列表和回收站移除。")
+                        .font(.system(size: 12))
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
                 if report.hasFailures {
                     Text("没删掉的 \(report.failures.count) 项还留在回收站里，可以再试一次。")
                         .font(.system(size: 12))

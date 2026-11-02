@@ -55,14 +55,22 @@ final class DeviceFiles: @unchecked Sendable {
     }
 
     private let queue = DispatchQueue(label: "cmi.devicefiles", qos: .utility)
-    private let photoSession = Session()
+
+    /// 两条 AFC 通道的**当前**会话。
+    ///
+    /// 不是 `let`：`reset(timeout:)` 会整只换掉。卡在阻塞读里的那次调用攥着旧对象，
+    /// 超时后我们换一个新的，新请求立刻用得上；旧的那次等设备回包/断开时再关。
+    private let sessionLock = NSLock()
+    private var photoSessionRef = Session()
+    private var previewSessionRef = Session()
+    private var photoSession: Session { sessionLock.withLock { photoSessionRef } }
+    private var previewSession: Session { sessionLock.withLock { previewSessionRef } }
 
     /// 预览专用通道：**独立的 AFC 会话 + 独立的串行队列**。
     /// 共用一条的话，首次进照片页那串缩略图（每个都要建 /DCIM 名字索引、下整份原图）
     /// 会把队列顶满，预览要排在它们后面 —— 界面上就是"只有转圈，一个字节都没有"。
     /// 建不起第二条会话（设备只答应一条）时 `downloadByDevicePath` 会自动回退共用通道。
     private let previewQueue = DispatchQueue(label: "cmi.devicefiles.preview", qos: .userInitiated)
-    private let previewSession = Session()
 
     private(set) var lastError: String?
 
@@ -84,10 +92,32 @@ final class DeviceFiles: @unchecked Sendable {
     }
 
     /// 清缓存 / 出错后重置会话：下次调用会重新建 AFC 连接、重建 DCIM 索引
-    func reset() {
-        queue.sync { photoSession.reset() }
-        previewQueue.sync { previewSession.reset() }
+    ///
+    /// **必须带超时**（2026-11 现场）。以前是 `queue.sync { photoSession.reset() }`，
+    /// 而 `Session.reset()` 要关的正是那条可能已经卡死在 `AFCFileRefRead` 里的连接：
+    /// 设备侧 afcd 一不回包，这个 `sync` 就永远不返回 —— 调用方
+    /// `AppStore.releaseDeviceFiles()` 挂在 `await` 上，读库重试再也走不下去，
+    /// 界面上就是「点了重新读取，一直卡着」（而且没有任何一步能把它救出来）。
+    ///
+    /// 现在先把新会话换上、再把旧的丢到它自己的队列上去关，最多等 `timeout` 秒；
+    /// 超时就放手（旧连接等设备那边回包或断线时自然结束），不影响新连接。
+    func reset(timeout: TimeInterval = 3) {
+        sessionLock.lock()
+        let oldPhoto = photoSessionRef
+        let oldPreview = previewSessionRef
+        photoSessionRef = Session()
+        previewSessionRef = Session()
+        sessionLock.unlock()
         previewChannelBroken = false
+
+        let group = DispatchGroup()
+        group.enter()
+        queue.async { oldPhoto.reset(); group.leave() }
+        group.enter()
+        previewQueue.async { oldPreview.reset(); group.leave() }
+        if group.wait(timeout: .now() + timeout) == .timedOut {
+            lastError = "AFC 连接关不掉（设备没回包），已换一条新连接"
+        }
     }
 
     // MARK: - 单个文件下载

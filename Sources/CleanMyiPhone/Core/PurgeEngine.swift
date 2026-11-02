@@ -15,6 +15,9 @@ struct PurgeReport: Identifiable {
     var total = 0
     var succeededIDs: [Asset.ID] = []
     var succeededBytes: Int64 = 0
+    /// 设备上已经不存在（手机上删掉的）：已从列表移除，不用重试
+    var goneIDs: [Asset.ID] = []
+    var goneBytes: Int64 = 0
     /// 失败项**仍然在回收站里**，可以直接重试
     var failures: [PurgeFailure] = []
     /// 设备中途失去回执，后面几批根本没发出去
@@ -25,9 +28,14 @@ struct PurgeReport: Identifiable {
     var hasFailures: Bool { !failures.isEmpty }
 
     var title: String {
-        if failures.isEmpty { return "已彻底删除 \(succeededCount) 项" }
-        if succeededCount == 0 { return "\(failures.count) 项都没删掉" }
-        return "已删除 \(succeededCount) 项，\(failures.count) 项没删掉"
+        let gone = goneIDs.isEmpty ? "" : "，\(goneIDs.count) 项设备上已不存在"
+        if failures.isEmpty {
+            return succeededCount == 0
+                ? "没有需要删的了（\(goneIDs.count) 项设备上已不存在）"
+                : "已彻底删除 \(succeededCount) 项\(gone)"
+        }
+        if succeededCount == 0 { return "\(failures.count) 项都没删掉\(gone)" }
+        return "已删除 \(succeededCount) 项，\(failures.count) 项没删掉\(gone)"
     }
 }
 
@@ -61,6 +69,10 @@ struct DeleteOutcome {
     var total = 0
     var succeeded: [Asset.ID] = []
     var succeededBytes: Int64 = 0
+    /// 设备上已经不存在了（手机上删掉的、或者本来就没了）：
+    /// 不算失败，直接从列表和回收站里清掉
+    var gone: [Asset.ID] = []
+    var goneBytes: Int64 = 0
     var failures: [PurgeFailure] = []
     var aborted = false
     var skipped = 0
@@ -144,6 +156,10 @@ final class PurgeEngine {
                 outcome.succeeded.append(id)
                 outcome.succeededBytes += sizeByID[id] ?? 0
             }
+            for id in result.gone {
+                outcome.gone.append(id)
+                outcome.goneBytes += sizeByID[id] ?? 0
+            }
             for (id, message) in result.failed {
                 // `id` 为空 = 设备对整个请求报了一句错，没有指名到文件：
                 // 把这句话落到这一批里**既没成功、也没有逐条原因**的那些项上
@@ -191,7 +207,8 @@ final class PurgeEngine {
             onProgress(progress)
         }
 
-        trash.remove(ids: outcome.succeeded)
+        // 成功的和「设备上已经没了」的都从回收站拿掉：后者留着只会让人反复点删除
+        trash.remove(ids: outcome.succeeded + outcome.gone)
         return outcome
     }
 }

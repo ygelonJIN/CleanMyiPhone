@@ -25,6 +25,10 @@ struct ConversionSheet: View {
     }
 
     private var photos: [Selected] { selected.filter { !$0.meta.isVideo } }
+    /// 选中里已经在压缩站排队的张数（再标就是改参数）
+    private var queuedCount: Int {
+        photos.filter { store.compression.ids.contains($0.asset.id) }.count
+    }
     private var videos: [Selected] { selected.filter { $0.meta.isVideo } }
 
     private var items: [ConversionItem] { photos.map { ConversionItem(meta: $0.meta) } }
@@ -100,6 +104,23 @@ struct ConversionSheet: View {
                 .foregroundStyle(.secondary)
                 .monospacedDigit()
 
+            if queuedCount > 0 {
+                Text("其中 \(queuedCount) 张已经在压缩站里：再标一次就是改参数")
+                    .font(.caption2)
+                    .foregroundStyle(.orange)
+            }
+
+            // 这里**只标记**，所以不再放「写回手机相册」开关（那是执行时的事，在压缩站里）
+            HStack(alignment: .top, spacing: 6) {
+                Image(systemName: "bookmark")
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
+                Text("点「标记压缩」只是记下来（不动手机、不改库）。攒够一批后到左侧「压缩站」二次确认，才真的压缩 —— 整批只写一次相册库（约 300 MB）。")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
             status
 
             HStack {
@@ -113,13 +134,14 @@ struct ConversionSheet: View {
                         .keyboardShortcut(.defaultAction)
                 } else {
                     Button("取消") { dismiss() }
-                    Button("开始转换") {
-                        store.startConversion(
-                            items: items,
+                    Button("标记压缩") {
+                        store.markForCompression(
                             profile: ConversionProfile(ratio: ratio, format: format, quality: quality))
+                        dismiss()
                     }
                     .buttonStyle(.borderedProminent)
                     .disabled(items.isEmpty)
+                    .help("只标记，不动手机；到「压缩站」确认后才真的压")
                 }
             }
         }
@@ -253,13 +275,20 @@ struct ConversionSheet: View {
                         VStack(alignment: .leading, spacing: 2) {
                             Text("完成 \(result.records.count) 张")
                                 .font(.callout.weight(.semibold))
-                            let saved = savedBytes(result)
-                            if saved > 0 {
-                                Text("节省 \(size(saved))")
+                            // 三段分开报，别把「原图还在」混成「压缩后变大了」：
+                            // 副本合计、原图合计（已标记到回收站）、彻底删除后的净省。
+                            let copyBytes = result.records.reduce(Int64(0)) { $0 + $1.newSize }
+                            let originalBytes = result.records.reduce(Int64(0)) { $0 + $1.originalSize }
+                            let net = originalBytes - copyBytes
+                            Text("副本合计 \(size(copyBytes))（原图 \(size(originalBytes))）")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                            if net > 0 {
+                                Text("原图已标记到回收站：彻底删除后净省 \(size(net))")
                                     .font(.caption)
                                     .foregroundStyle(.green)
-                            } else if saved < 0 {
-                                Text("体积增加 \(size(-saved))（格式转换可能变大）")
+                            } else {
+                                Text("这批压缩没变小（\(size(-net))），别急着删原图")
                                     .font(.caption)
                                     .foregroundStyle(.orange)
                             }
@@ -279,14 +308,6 @@ struct ConversionSheet: View {
                 }
             }
         }
-    }
-
-    private func savedBytes(_ result: PhotoConversionEngine.Result) -> Int64 {
-        let success = Set(result.records.map(\.originalPK))
-        let before = photos.filter { success.contains($0.meta.pk) }
-            .reduce(Int64(0)) { $0 + $1.meta.byteSize }
-        let after = result.records.reduce(Int64(0)) { $0 + $1.newSize }
-        return before - after
     }
 
     private func labeled<Content: View>(_ title: String,

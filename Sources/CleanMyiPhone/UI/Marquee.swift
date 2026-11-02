@@ -11,6 +11,7 @@ enum MarqueeSpace {
     static let grid = "cmi.grid"
     static let list = "cmi.list"
     static let trash = "cmi.trash"
+    static let compression = "cmi.compression"
 }
 
 /// 这次框选要干什么。**在按下那一刻按"按住的那一格"定死**，

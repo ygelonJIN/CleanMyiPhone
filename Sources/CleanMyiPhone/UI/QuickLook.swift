@@ -176,6 +176,10 @@ struct PreviewOverlay: View {
                         if isPending { store.unmarkCurrentPreview() }
                         else { store.trashCurrentPreview() }
                     }
+                    // 「-」= 标记压缩（和 ⌫ 互斥；已是待压缩时变「取消压缩」）
+                    hintButton("-", isCompressionQueued ? "取消压缩" : "标记压缩") {
+                        store.compressionMarkCurrentPreview()
+                    }
                 }
             }
         }
@@ -187,6 +191,8 @@ struct PreviewOverlay: View {
     private var statePill: some View {
         if isPending {
             pill("已标记回收", symbol: "trash.fill", tint: .orange)
+        } else if isCompressionQueued {
+            pill("待压缩", symbol: "arrow.down.right.and.arrow.up.left", tint: .brown)
         } else if isSelected {
             pill("已选中", symbol: "checkmark.circle.fill", tint: .accentColor)
         }
@@ -499,6 +505,11 @@ struct PreviewOverlay: View {
     private var isPending: Bool {
         guard let asset else { return false }
         return store.pendingDeletions.contains(asset.id)
+    }
+
+    private var isCompressionQueued: Bool {
+        guard let asset else { return false }
+        return store.compression.ids.contains(asset.id)
     }
 
     private func infoItem(_ title: String, _ value: String) -> some View {

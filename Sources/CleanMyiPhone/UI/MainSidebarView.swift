@@ -73,6 +73,12 @@ struct MainSidebarView: View {
                 Label("回收站", systemImage: "trash")
                     .countBadge(store.trash.count)
                     .tag(AppStore.SidebarItem.trash)
+
+                // 压缩站：照片页点「压缩」只是标记，真压缩在站里二次确认
+                Label("压缩站", systemImage: "arrow.down.right.and.arrow.up.left")
+                    .countBadge(store.compression.count)
+                    .tag(AppStore.SidebarItem.compression)
+                    .help("标记待压缩的照片都在这儿；这里点「开始压缩」才真的动设备（整批只写一次相册库）")
             }
         }
         .listStyle(.sidebar)

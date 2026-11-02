@@ -51,10 +51,12 @@ struct PhotoList: View {
 struct PhotoRow: View {
     let asset: Asset
     @Environment(AppStore.self) private var store
-    @State private var hovering = false
+    /// 同 `PhotoCell`：`CMI_DEMO_HOVER=1` 时初始就是悬停态（截图回归用）
+    @State private var hovering = ProcessInfo.processInfo.environment["CMI_DEMO_HOVER"] != nil
 
     private var isSelected: Bool { store.selection.contains(asset.id) }
     private var isPending: Bool { store.pendingDeletions.contains(asset.id) }
+    private var isQueuedForCompression: Bool { store.compression.ids.contains(asset.id) }
     private var compression: CompressionDisplay? { store.compressionDisplay(for: asset) }
     private var isCompressedCopy: Bool { compression?.role == .copy }
     private var hasThumbnail: Bool { store.thumbnails[asset.id] != nil }
@@ -92,6 +94,18 @@ struct PhotoRow: View {
                     .foregroundStyle(.green)
                     .lineLimit(1)
                     .minimumScaleFactor(0.75)
+                    .transition(.badge)
+            }
+            if isQueuedForCompression && !isPending {
+                // 和「已标记」完全同一套，只是浅黄（灰的太不显眼）
+                Label("待压缩", systemImage: "arrow.down.right.and.arrow.up.left")
+                    .font(.caption2.weight(.semibold))
+                    .labelStyle(.titleAndIcon)
+                    .foregroundStyle(Color.black.opacity(0.78))
+                    .padding(.horizontal, 5)
+                    .padding(.vertical, 1)
+                    .background(Capsule().fill(Color.yellow.opacity(0.95)))
+                    .fixedSize()
                     .transition(.badge)
             }
 
@@ -148,7 +162,9 @@ struct PhotoRow: View {
         if isSelected { return Color.accentColor.opacity(0.16) }
         if isPending { return Color.orange.opacity(0.12) }
         if isCompressedCopy { return Color.green.opacity(0.10) }
-        if hovering { return Color.secondary.opacity(0.08) }
+        if isQueuedForCompression { return Color.yellow.opacity(0.16) }
+        // 悬停底色提亮：8% 太淡，看不出来鼠标在哪一行
+        if hovering { return Color.secondary.opacity(0.16) }
         return .clear
     }
 

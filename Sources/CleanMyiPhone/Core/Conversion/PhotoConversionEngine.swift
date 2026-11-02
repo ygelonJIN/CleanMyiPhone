@@ -185,6 +185,7 @@ final class PhotoConversionEngine: @unchecked Sendable {
                         originalPK: item.pk,
                         originalFileName: item.fileName,
                         originalUUID: item.uuid,
+                        originalSize: item.byteSize,
                         newPK: 0,
                         newUUID: UUID().uuidString,
                         directory: dir,

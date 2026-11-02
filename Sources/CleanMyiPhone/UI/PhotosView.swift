@@ -154,10 +154,15 @@ struct PhotosView: View {
         } else if store.visibleAssets.isEmpty && store.isScanning {
             Color.clear.frame(maxWidth: .infinity, maxHeight: .infinity)
         } else if store.visibleAssets.isEmpty {
+            // `errorText` 以前是**只写不读**的死状态：读不到目录/会话断了，
+            // 界面只给一句「还没读到照片。插上数据线…」——等于什么都不说。
+            // 现在把真正的原因放在这里（读失败、刷新超时、会话断开都在这里露面）。
             EmptyStateView(icon: "photo.on.rectangle.angled",
-                           title: "这里还没有内容",
+                           title: store.assets.isEmpty && store.errorText != nil
+                                ? "没读到照片" : "这里还没有内容",
                            message: store.assets.isEmpty
-                                ? "还没读到照片。插上数据线，在 iPhone 上点「信任」。"
+                                ? (store.errorText
+                                   ?? "还没读到照片。插上数据线，在 iPhone 上点「信任」。")
                                 : "这个相簿或筛选条件下没有项，换一个看看。",
                            actionTitle: store.assets.isEmpty ? "重新读取" : "查看全部") {
                 if store.assets.isEmpty {
@@ -209,17 +214,37 @@ struct PhotosView: View {
                 .foregroundStyle(.secondary)
                 .monospacedDigit()
 
-            if store.trash.count > 0 {
+            // 两个标记分开报（2026-11 用户要求）：标记回收、标记压缩是两件事，
+            // 都要显示「几项 + 体积 + 占当前列表的百分比」，字号比左边小一号。
+            // 有选中时先不显示计数：底栏总宽 500，选中那一组按钮已经占满
+            if store.trash.count > 0, store.selection.isEmpty {
                 Button {
                     store.select(.trash)
                 } label: {
-                    Label("已标记 \(store.trash.count) 项 · \(AppStore.sizeText(store.trash.totalBytes))",
+                    Label("\(store.trash.count) 项 · \(AppStore.sizeText(store.trash.totalBytes)) · \(percentText(store.trash.totalBytes))",
                           systemImage: "trash")
-                        .font(.callout)
+                        .font(.caption2)
                         .foregroundStyle(.orange)
+                        .monospacedDigit()
+                        .lineLimit(1)
                 }
                 .buttonStyle(.plain)
-                .help("打开回收站；在那里「彻底删除」才会真正动设备上的照片")
+                .help("标记回收：打开回收站；在那里「彻底删除」才会真正动设备上的照片")
+            }
+
+            if store.compression.count > 0, store.selection.isEmpty {
+                Button {
+                    store.select(.compression)
+                } label: {
+                    Label("\(store.compression.count) 张 · \(AppStore.sizeText(store.compression.totalBytes)) · \(percentText(store.compression.totalBytes))",
+                          systemImage: "arrow.down.right.and.arrow.up.left")
+                        .font(.caption2)
+                        .foregroundStyle(.brown)
+                        .monospacedDigit()
+                        .lineLimit(1)
+                }
+                .buttonStyle(.plain)
+                .help("待压缩：打开压缩站；在那里「开始压缩」才真的动设备（整批只写一次相册库）")
             }
 
             if let message = store.provisionalMessage {
@@ -235,17 +260,11 @@ struct PhotosView: View {
 
             Spacer(minLength: 12)
 
-            Button {
-                showConversion = true
-            } label: {
-                Label("压缩", systemImage: "arrow.down.right.and.arrow.up.left")
-            }
-            .controlSize(.small)
-            .disabled(store.selection.isEmpty)
-            .help(store.selection.isEmpty ? "先选照片，再压缩/转换" : "批量压缩/转换选中项")
-
             if store.selection.isEmpty {
-                hintChip
+                // 有标记计数时优先给计数让位：底栏总宽只有 500
+                if store.trash.count == 0 && store.compression.count == 0 {
+                    hintChip
+                }
             } else {
                 Text("已选 \(store.selection.count) 项 · \(AppStore.sizeText(store.selectedBytes))")
                     .font(.callout.weight(.semibold))
@@ -258,7 +277,17 @@ struct PhotosView: View {
                     Label("标记回收", systemImage: "trash")
                 }
                 .controlSize(.small)
-                .help("打上回收标记（不需要二次确认），到回收站点「彻底删除」才真正从 iPhone 上删掉")
+                .help("打上回收标记（不需要二次确认），到回收站点「彻底删除」才真正从 iPhone 上删掉。同一项只能带一个标记：已经在压缩站的会被移出")
+
+                // 「标记压缩」和「标记回收」同一套：只有选中了才出现、同一个位置、同一种按钮。
+                // 点它只打开参数面板（那里面也只是标记），真压缩在「压缩站」。
+                Button {
+                    showConversion = true
+                } label: {
+                    Label("标记压缩", systemImage: "arrow.down.right.and.arrow.up.left")
+                }
+                .controlSize(.small)
+                .help("只标记、不动手机：到「压缩站」确认后才真压。同一项只能带一个标记：已标回收的会被切到待压缩")
 
                 Button("取消选择") { store.clearSelection() }
                     .controlSize(.small)
@@ -271,6 +300,14 @@ struct PhotosView: View {
         .background(.bar)
         .animation(.easeInOut(duration: 0.16), value: store.selection.isEmpty)
         .animation(.easeInOut(duration: 0.18), value: store.provisionalMessage)
+    }
+
+    /// 标记占当前列表体积的比例（底栏计数用）
+    private func percentText(_ bytes: Int64) -> String {
+        let total = store.visibleBytes
+        guard total > 0 else { return "—" }
+        let pct = Double(bytes) / Double(total) * 100
+        return pct < 0.1 ? "<0.1%" : String(format: "%.1f%%", pct)
     }
 
     /// 底栏右下角的操作提示：以前是一行 tertiary 小字，几乎看不见。
