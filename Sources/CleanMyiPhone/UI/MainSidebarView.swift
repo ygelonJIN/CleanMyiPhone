@@ -140,7 +140,7 @@ struct MainSidebarView: View {
             Text("退出即清空 · 本机不留缓存")
                 .font(.caption)
                 .foregroundStyle(.secondary)
-                .help("⌘Q、关窗口、崩溃、强制退出，都不会在这台电脑上留下照片数据")
+                .help("⌘Q、关窗口、崩溃、强制退出，都不会在这台电脑上留下照片数据。唯一留下的是压缩参数（比例/格式/质量三个数，不含任何照片信息），下次打开还是上次设的那一套")
 
             HStack(spacing: 6) {
                 Button("清空本机数据", systemImage: "trash.slash") {

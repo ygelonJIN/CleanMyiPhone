@@ -55,8 +55,10 @@ struct PhotoRow: View {
     @State private var hovering = ProcessInfo.processInfo.environment["CMI_DEMO_HOVER"] != nil
 
     private var isSelected: Bool { store.selection.contains(asset.id) }
-    private var isPending: Bool { store.pendingDeletions.contains(asset.id) }
-    private var isQueuedForCompression: Bool { store.compression.ids.contains(asset.id) }
+    private var isPending: Bool { store.isPending(asset.id) }
+    private var isQueuedForCompression: Bool { store.isQueuedForCompression(asset.id) }
+    /// 这一张标记时选的参数（行尾直接写出「怎么压」）
+    private var compressionProfile: ConversionProfile? { store.compressionProfile(for: asset.id) }
     private var compression: CompressionDisplay? { store.compressionDisplay(for: asset) }
     private var isCompressedCopy: Bool { compression?.role == .copy }
     private var hasThumbnail: Bool { store.thumbnails[asset.id] != nil }
@@ -97,8 +99,10 @@ struct PhotoRow: View {
                     .transition(.badge)
             }
             if isQueuedForCompression && !isPending {
-                // 和「已标记」完全同一套，只是浅黄（灰的太不显眼）
-                Label("待压缩", systemImage: "arrow.down.right.and.arrow.up.left")
+                // 和「已标记」完全同一套，只是浅黄（灰的太不显眼）。
+                // 文字写参数而不是「待压缩」：这一张会压成什么样，列表里就要看得见。
+                Label(compressionProfile.map { "待压缩 \($0.badgeText)" } ?? "待压缩",
+                      systemImage: "arrow.down.right.and.arrow.up.left")
                     .font(.caption2.weight(.semibold))
                     .labelStyle(.titleAndIcon)
                     .foregroundStyle(Color.black.opacity(0.78))

@@ -214,14 +214,16 @@ struct PhotosView: View {
                 .foregroundStyle(.secondary)
                 .monospacedDigit()
 
-            // 两个标记分开报（2026-11 用户要求）：标记回收、标记压缩是两件事，
-            // 都要显示「几项 + 体积 + 占当前列表的百分比」，字号比左边小一号。
+            // 两个标记分开报：标记回收、标记压缩是两件事。
+            // **只报这些标记项自己的前后对比**（2026-11 改写）：不再拿「标记体积 ÷ 当前列表体积」
+            // 给百分比 —— 标记的项还在列表里、分母又是整屏照片，200 MB 的标记只会显示 2.1%，
+            // 看着像白标记了。用户要的是「这批删完/压完能降多少」。
             // 有选中时先不显示计数：底栏总宽 500，选中那一组按钮已经占满
             if store.trash.count > 0, store.selection.isEmpty {
                 Button {
                     store.select(.trash)
                 } label: {
-                    Label("\(store.trash.count) 项 · \(AppStore.sizeText(store.trash.totalBytes)) · \(percentText(store.trash.totalBytes))",
+                    Label("\(store.trash.count) 项 · \(markSizeText(store.trash.totalBytes, after: 0))",
                           systemImage: "trash")
                         .font(.caption2)
                         .foregroundStyle(.orange)
@@ -229,14 +231,15 @@ struct PhotosView: View {
                         .lineLimit(1)
                 }
                 .buttonStyle(.plain)
-                .help("标记回收：打开回收站；在那里「彻底删除」才会真正动设备上的照片")
+                .help("已标记回收 \(store.trash.count) 项：现在占 \(AppStore.sizeText(store.trash.totalBytes))，彻底删掉后归 0。点开进回收站，那里删才真正动设备")
             }
 
             if store.compression.count > 0, store.selection.isEmpty {
+                let change = store.compressionSizeChange
                 Button {
                     store.select(.compression)
                 } label: {
-                    Label("\(store.compression.count) 张 · \(AppStore.sizeText(store.compression.totalBytes)) · \(percentText(store.compression.totalBytes))",
+                    Label("\(store.compression.count) 张 · \(markSizeText(change.before, after: change.after))",
                           systemImage: "arrow.down.right.and.arrow.up.left")
                         .font(.caption2)
                         .foregroundStyle(.brown)
@@ -244,7 +247,7 @@ struct PhotosView: View {
                         .lineLimit(1)
                 }
                 .buttonStyle(.plain)
-                .help("待压缩：打开压缩站；在那里「开始压缩」才真的动设备（整批只写一次相册库）")
+                .help("待压缩 \(store.compression.count) 张：现在 \(AppStore.sizeText(change.before))，按标记时选的比例/格式/质量压完约 \(AppStore.sizeText(change.after))（预估，不是整库占比）。点开进压缩站，那里压才真正动设备")
             }
 
             if let message = store.provisionalMessage {
@@ -302,12 +305,10 @@ struct PhotosView: View {
         .animation(.easeInOut(duration: 0.18), value: store.provisionalMessage)
     }
 
-    /// 标记占当前列表体积的比例（底栏计数用）
-    private func percentText(_ bytes: Int64) -> String {
-        let total = store.visibleBytes
-        guard total > 0 else { return "—" }
-        let pct = Double(bytes) / Double(total) * 100
-        return pct < 0.1 ? "<0.1%" : String(format: "%.1f%%", pct)
+    /// 标记项的「现在 → 之后」。删掉的写 0，压缩写预估体积。
+    /// **不再算占全库/列表的百分比**（见底栏那段注释）。
+    private func markSizeText(_ before: Int64, after: Int64) -> String {
+        "\(AppStore.sizeText(before)) → \(after == 0 ? "0" : AppStore.sizeText(after))"
     }
 
     /// 底栏右下角的操作提示：以前是一行 tertiary 小字，几乎看不见。

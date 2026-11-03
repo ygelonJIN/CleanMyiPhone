@@ -145,3 +145,32 @@ DispatchQueue.main.async { withAnimation(Motion.page) { shown = true } }
 但 **Esc / ⏎ 必须返回 false 放行** —— 结果单那两个按钮靠 `.keyboardShortcut(.cancelAction)` /
 `.defaultAction` 接，`KeyMonitor` 吞掉事件按钮就全废了（`KeyMonitor` 是「返回 true → 事件置 nil」）。
 
+## 十三、`@State` 初值别从 `static let` 取（"设置记不住"就是这个）
+
+2026-11 现场：压缩参数（比例 / 质量）明明写了盘，用户改成 40% 关掉面板再打开还是 60%，
+只有退出重启才恢复 —— 看着像"记不住"，实际是读到的永远是进程启动时那一份：
+
+```swift
+// ❌ static let 在进程内只求值一次
+private static let saved = CompressionPrefs.load()
+@State private var ratio: Double = ConversionSheet.saved.ratio
+```
+
+`static let` 是懒初始化 + **只算一次**。用户在同一次运行里改完再打开面板，`saved` 不会再读盘。
+退出重启看着正常，正好好骗过自己。
+
+改法：**在 `init()` 里读，逐条 `State(initialValue:)`**。视图每次被构造（每次 present sheet）
+都会重新读盘；至于 SwiftUI 复不复用旧 state 都无所谓 —— 复用的话 state 里本来就是用户刚调的值。
+
+```swift
+@State private var ratio: Double
+init() {
+    let saved = CompressionPrefs.load()          // 全项目唯一保留的落盘，见「不留痕」
+    _ratio = State(initialValue: saved.ratio)
+}
+```
+
+判断这类问题快：**"退出重启后正常、同一次运行内不正常" = 一定有进程级缓存**（`static let` /
+`lazy var` / `@ObservationIgnored` 缓存字典）。这个工程里已经栽过两次：侧栏计数（`countCache`）
+和这里的压缩参数。
+

@@ -337,11 +337,15 @@ final class PTPBridge: NSObject, DeviceSource {
         var report = DeleteBatchResult()
 
         // 设备侧会话会自己消失（iPhone 锁屏 / 空闲太久 / 被访达和照片 App 抢走），
-        // 这时 `camera` 是 nil，整批删除会一项都没试就全部失败 —— 用户看到的就是
-        // 「成功 0 项，全都失败，设备未连接」（2026-11-01 现场）。别再让用户自己去
-        // 重启 App 或拔插数据线，这里先自己做一次完整重连再重试。
-        guard let camera = await cameraOrReconnect(timeout: 8) else {
-            report.failed = ids.map { ($0, "设备未连接（解锁 iPhone 后重试）") }
+        // 或者被**压缩流程最后那步重启相册服务**打断，这时 `camera` 是 nil，
+        // 整批删除会一项都没试就全部失败 —— 用户看到的就是
+        // 「成功 0 项，全都失败，设备未连接」（2026-11 现场第二次踩到：
+        // 压缩成功 52 张，删除 52 项全报「设备未连接」）。
+        // 这里先自己做一次真正的重连（重建浏览器，多轮），再接删除。
+        guard let camera = await cameraOrReconnect(timeout: 20) else {
+            report.failed = ids.map {
+                ($0, "PTP 通道没回来（相册服务刚重启过，或手机在锁屏）：拔插一次数据线，再点重试")
+            }
             return report
         }
         // 会话刚重建时文件表还在填，得等一会儿；**空表会让下面每条都判成「找不到」**，
@@ -557,30 +561,42 @@ final class PTPBridge: NSObject, DeviceSource {
         camera?.requestCloseSession()
     }
 
-    /// 拿相机对象；拿不到就把浏览器**整个重置一遍**再等设备上来。
+    /// 拿相机对象；拿不到就**真的重建一次浏览器**再等设备上来。
     ///
-    /// 为什么需要：iPhone 锁屏 / 空闲太久 / 被访达或「照片」抢走时，设备侧会关掉
+    /// 为什么需要：iPhone 锁屏 / 空闲太久 / 被访达和「照片」抢走时，设备侧会关掉
     /// PTP 会话，`camera` 变 nil。这时整批删除会一项都没试就全失败 ——
     /// 用户看到的就是「成功 0 项，全都失败，设备未连接」。
     ///
-    /// 为什么是 `stop()` + `start()` 而不是只 `start()`：`start()` 有 `started` 守卫，
-    /// **浏览器活着但会话死了**的时候它什么都不做，等于白等。先 `stop()` 把 `started`
-    /// 清掉、`browser.stop()`，再 `start()` 才是一次真正的重连（这也是「拔插数据线
-    /// 才有用」在 App 内的等价操作）。
-    ///
-    /// 只在主线程调用（`delete` ← `PurgeEngine` 是 @MainActor），IC 的 browser 要求主线程。
-    private func cameraOrReconnect(timeout: TimeInterval) async -> ICCameraDevice? {
-        if let camera { return camera }
-        // **不要再 stop() + start()**（2026-11-02 实测）：`browser.stop()` 之后设备
-        // 不会回到 IC 的列表里，换新实例也等不到 `didAdd` —— 一条 `stop()` 就把 PTP
-        // 永久弄死，只能重启 App。这里只把（还活着的）浏览器再 start 一次然后等；
-        // 真等不到就如实报「设备未连接」，让用户拔插数据线。
-        Self.dbg("cameraOrReconnect：camera 为空，等设备重新上来")
-        browser.start()
+    /// 2026-11 现场补的一条：**压缩的最后一步会重启设备上的相册服务**
+    /// （`PhotoDaemon.restartLibrary` 把 `assetsd` 和「照片」App 都 terminate 再拉起来），
+    /// 设备这一下被 IC 报成 `didRemove` → `camera = nil`，之后 `browser` 再也不会报
+    /// `didAdd`。用户的原话：「显示压缩成功了，但是 52 项都没删掉……设备没问题」。
+    /// 所以这里不能只 `browser.start()` 干等（浏览器活着时它什么都不做），
+    /// 要**丢掉旧实例、换新的、重开**，给足几轮时间。
+    @discardableResult
+    func cameraOrReconnect(timeout: TimeInterval) async -> ICCameraDevice? {
+        if let camera {
+            // 会话还在，但目录可能是空的（刚重开过）：让它重推一遍，别在这里白等
+            if !filesAreReady() { refreshCatalog() }
+            return camera
+        }
+        Self.dbg("cameraOrReconnect：camera 为空，开始重建浏览器")
         let deadline = Date().addingTimeInterval(timeout)
+        var round = 0
         while Date() < deadline {
-            if let camera { return camera }
-            try? await Task.sleep(nanoseconds: 200_000_000)
+            round += 1
+            // 旧实例已经"消费"过这台设备（`didRemove` 之后它不会再给 didAdd），
+            // 每轮都换全新实例。`stop()` 只清状态，不碰界面。
+            browser.stop()
+            replaceBrowser()
+            browser.start()
+            started = true
+            Self.dbg("cameraOrReconnect：第 \(round) 轮，已重新 start")
+            let roundDeadline = min(deadline, Date().addingTimeInterval(8))
+            while Date() < roundDeadline {
+                if let camera { return camera }
+                try? await Task.sleep(nanoseconds: 200_000_000)
+            }
         }
         return camera
     }

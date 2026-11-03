@@ -3,7 +3,7 @@ import UniformTypeIdentifiers
 
 /// 一次批量转换的参数：按比例缩、输出格式、质量、是否去实况。
 struct ConversionProfile: Sendable, Hashable {
-    enum Format: String, Sendable, Hashable, CaseIterable {
+    enum Format: String, Sendable, Hashable, CaseIterable, Codable {
         case heic, jpeg, png
 
         var utType: UTType {
@@ -43,6 +43,57 @@ struct ConversionProfile: Sendable, Hashable {
 
     var label: String {
         "\(Int((clampedRatio * 100).rounded()))% · \(format.displayName) · Q\(Int((clampedQuality * 100).rounded()))"
+    }
+
+    /// 格子/列表角标上的紧凑写法：`60%·HEIC·Q80`。
+    /// 缩略图最小 118pt 宽，带空格的全称塞不下，所以这里用中点连起来。
+    /// 用户要在每一格上直接看出「这张会怎么压」，别让人点开压缩站才知道。
+    var badgeText: String {
+        "\(Int((clampedRatio * 100).rounded()))%·\(format.displayName)·Q\(Int((clampedQuality * 100).rounded()))"
+    }
+
+    // MARK: - 体积预估
+
+    /// 预估压缩后的体积。**压缩参数面板和底栏共用这一份**：两处各写一套必然会给出两个数。
+    ///
+    /// 口径：系数按输出格式挑（JPEG→HEIC 大约省一半，PNG 无损反而涨），
+    /// 再乘「比例平方」（线性缩边、面积按平方掉）和质量系数（以 Q0.8 为 1.0）。
+    func estimatedBytes(for meta: PhotoLibraryIndex.Meta) -> Int64 {
+        estimatedBytes(byteSize: meta.byteSize, typeIdentifier: meta.typeIdentifier)
+    }
+
+    /// 同上一份系数，但**基准体积由调用方给**：底栏的「现在」用的是资源合计
+    /// （`resourceBytes`，含编辑版与实况视频分量），估算也必须拿同一个数当基准，
+    /// 否则前后两栏不是同一个口径，省出来的数字会虚高。
+    func estimatedBytes(byteSize: Int64, typeIdentifier: String) -> Int64 {
+        Int64(Double(byteSize) * clampedRatio * clampedRatio * formatFactor(typeIdentifier) * qualityFactor)
+    }
+
+    /// 拿不到库信息（对不上 `meta`）时的下限估算：只按比例平方缩，**不猜格式收益**。
+    /// 宁可估高：底栏要给的是「大概能省多少」，报得太乐观会让人以为白压了。
+    func estimatedBytes(forUnresolved byteSize: Int64) -> Int64 {
+        Int64(Double(byteSize) * clampedRatio * clampedRatio)
+    }
+
+    private func formatFactor(_ typeIdentifier: String) -> Double {
+        let lower = typeIdentifier.lowercased()
+        switch format {
+        case .heic:
+            if lower.contains("png") { return 0.12 }
+            if lower.contains("raw") { return 0.10 }
+            if lower.contains("heic") || lower.contains("heif") { return 0.60 }
+            return 0.50
+        case .jpeg:
+            if lower.contains("raw") { return 0.35 }
+            if lower.contains("heic") || lower.contains("heif") { return 1.10 }
+            return 1.00
+        case .png:
+            return 1.60
+        }
+    }
+
+    private var qualityFactor: Double {
+        format == .png ? 1.0 : max(0.35, min(1.5, clampedQuality / 0.8))
     }
 }
 

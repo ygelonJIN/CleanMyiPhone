@@ -98,9 +98,12 @@ struct PhotoCell: View {
     @State private var hovering = ProcessInfo.processInfo.environment["CMI_DEMO_HOVER"] != nil
 
     private var isSelected: Bool { store.selection.contains(asset.id) }
-    private var isPending: Bool { store.pendingDeletions.contains(asset.id) }
+    private var isPending: Bool { store.isPending(asset.id) }
     /// 已经标记待压缩（在压缩站里排队，**还没动设备**）
-    private var isQueuedForCompression: Bool { store.compression.ids.contains(asset.id) }
+    private var isQueuedForCompression: Bool { store.isQueuedForCompression(asset.id) }
+    /// 这一张标记时选的参数：格子上直接写出来（比例/格式/质量），
+    /// 别让人非得进压缩站才知道自己标的是什么
+    private var compressionProfile: ConversionProfile? { store.compressionProfile(for: asset.id) }
     private var compression: CompressionDisplay? { store.compressionDisplay(for: asset) }
     private var isCompressedCopy: Bool { compression?.role == .copy }
     /// 缩略图到了没有：新的一帧图要淡入，不能"啪"地出现
@@ -161,6 +164,7 @@ struct PhotoCell: View {
             }
             .help("\(asset.fileName)\n\(asset.dateText)\n\(asset.sizeText) · \(asset.resolutionText)"
                   + (compression.map { "\n\($0.label)" } ?? "")
+                  + (compressionProfile.map { "\n标记压缩：\($0.label)（再点一次取消）" } ?? "")
                   + "\n空格预览 · 拖动框选 · ⇧ 点连选")
     }
 
@@ -257,13 +261,16 @@ struct PhotoCell: View {
                     .shadow(color: .black.opacity(0.3), radius: 2, y: 1)
                     .transition(.badge)
             }
-            // 待压缩：浅黄胶囊 + 深色字（黄底压白字读不出来）
+            // 待压缩：浅黄胶囊 + 深色字（黄底压白字读不出来）。
+            // 文字从「待压缩」换成**这张会怎么压**：`60%·HEIC·Q80`（用户要每格都能看出参数）。
             if isQueuedForCompression && !isPending && !isCompressedCopy {
                 HStack(spacing: 2) {
                     Image(systemName: "arrow.down.right.and.arrow.up.left")
                         .font(.system(size: 6.5, weight: .bold))
-                    Text("待压缩")
+                    Text(compressionProfile?.badgeText ?? "待压缩")
                         .font(.system(size: 8, weight: .bold))
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.7)
                 }
                 .padding(.horizontal, 4)
                 .padding(.vertical, 1.5)

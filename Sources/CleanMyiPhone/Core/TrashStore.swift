@@ -26,9 +26,20 @@ final class TrashStore {
 
     private(set) var entries: [Entry] = []
 
+    /// 按 id 查的索引：**网格每一格每帧都在问「这张已标记吗」**，
+    /// 别在查询里现拼 `Set(entries.map(\.id))`（5000 格 × 几百条，全在主线程）。
+    private var byID: [Asset.ID: Entry] = [:]
+
     var count: Int { entries.count }
     var totalBytes: Int64 { entries.reduce(0) { $0 + $1.byteSize } }
-    var ids: Set<Asset.ID> { Set(entries.map(\.id)) }
+    var ids: Set<Asset.ID> { Set(byID.keys) }
+
+    /// 这一项在不在回收站（O(1)）
+    func contains(_ id: Asset.ID) -> Bool { byID[id] != nil }
+
+    private func rebuildIndex() {
+        byID = Dictionary(uniqueKeysWithValues: entries.map { ($0.id, $0) })
+    }
 
     init() {}
 
@@ -36,9 +47,9 @@ final class TrashStore {
 
     func add(_ assets: [Asset], deviceID: String) {
         let now = Date()
-        var byID = Dictionary(uniqueKeysWithValues: entries.map { ($0.id, $0) })
+        var map = byID
         for asset in assets {
-            byID[asset.id] = Entry(
+            map[asset.id] = Entry(
                 id: asset.id,
                 fileName: asset.fileName,
                 folder: asset.folder,
@@ -49,15 +60,18 @@ final class TrashStore {
                 markedAt: now
             )
         }
-        entries = byID.values.sorted { $0.markedAt > $1.markedAt }
+        entries = map.values.sorted { $0.markedAt > $1.markedAt }
+        rebuildIndex()
     }
 
     func remove(ids: some Sequence<Asset.ID>) {
         let set = Set(ids)
         entries.removeAll { set.contains($0.id) }
+        rebuildIndex()
     }
 
     func removeAll() {
         entries.removeAll()
+        rebuildIndex()
     }
 }

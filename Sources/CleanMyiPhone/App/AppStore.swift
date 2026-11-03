@@ -112,7 +112,9 @@ final class AppStore {
     /// 压缩站：只记「要压哪几张、用什么参数」，执行要到这里二次确认
     let compression = CompressionQueue()
     /// 上一次用的压缩参数。预览里按「-」没有面板可选，就用它（默认 60% · HEIC · Q80）
-    var lastCompressionProfile = ConversionProfile()
+    /// 预览里按「-」标记压缩时用的参数。启动时从**上次存下的那份**读（`CompressionPrefs`），
+    /// 不是永远回到 60%/HEIC/Q80 —— 用户要求「每次新设置的都记住保留」。
+    var lastCompressionProfile = CompressionPrefs.load().profile
     /// 清空回收站 / 彻底删除中的二次确认弹窗
     var emptyTrashConfirmPresented = false
     /// 弹窗里要彻底删除的那一批（空 = 全部）
@@ -682,6 +684,8 @@ final class AppStore {
     /// 参数一起存进条目（同一张再标一次就是改参数）。
     func markForCompression(profile: ConversionProfile) {
         lastCompressionProfile = profile
+        // 参数存盘：下次打开面板、以及预览里按「-」，都从这里取（用户要求记住）
+        CompressionPrefs(profile: profile).save()
         // 视频暂不支持压缩；其余的只要被选中就能标（已经标了回收的会被切过来）
         let chosen = selectedAssets.filter { $0.kind == .photo }
         let skipped = selectedAssets.count - chosen.count
@@ -754,8 +758,21 @@ final class AppStore {
         }
         conversionResult = combined
         conversionRunning = false
+        // 压缩最后一步会**重启设备上的相册服务**（`PhotoDaemon.restartLibrary`），
+        // 设备这一下被 IC 报成 `didRemove` → `camera` 变 nil，之后不会自己回来。
+        // 用户 N 分钟后再去回收站点删除，看到的就是「52 项全没删掉 · 设备未连接」。
+        // 所以这里趁热立刻重建一次 PTP，并把结果如实说出来 —— 不是每批都成功。
+        var ptpBack = true
+        if combined.daemonRestarted {
+            ptpBack = await ptp.cameraOrReconnect(timeout: 25) != nil
+            Self.debugLog("压缩后重连 PTP：\(ptpBack ? "回来了" : "没回来")")
+        }
         if combined.failures.isEmpty, !combined.records.isEmpty {
-            flash("压缩完成 \(combined.records.count) 张，原图已标记到回收站")
+            flash(ptpBack
+                  ? "压缩完成 \(combined.records.count) 张，原图已标记到回收站"
+                  : "压缩完成 \(combined.records.count) 张，原图已进回收站；相册服务重启打断了 PTP 通道，拔插一次数据线再删原图")
+        } else if !ptpBack {
+            flash("相册服务重启后 PTP 通道没回来：拔插一次数据线再操作")
         }
     }
 
@@ -1832,6 +1849,30 @@ final class AppStore {
     var selectedBytes: Int64 { selectedAssets.reduce(0) { $0 + totalBytes(of: $1) } }
     var pendingDeletions: Set<Asset.ID> { trash.ids }
 
+    // MARK: - 标记项自己的前后对比（底栏用）
+
+    /// 压缩站里这批标记项：`before` 是它们现在的体积，`after` 是按**各自参数**估的压缩后体积。
+    ///
+    /// **只比这些项自己**（2026-11 用户定的）。以前底栏给的是「标记体积 ÷ 当前列表体积」的百分比，
+    /// 标记的项本身还在列表里、分母又是整屏照片（本机 8.93 GB），于是 200 MB 的标记只显示 2.1%，
+    /// 看着像白标记了。用户真正想知道的是「这批东西压完能降到多少」。
+    var compressionSizeChange: (before: Int64, after: Int64) {
+        var before: Int64 = 0
+        var after: Int64 = 0
+        for entry in compression.entries {
+            // 体积口径跟底栏/回收站一致：优先库里的资源合计（含编辑版与实况视频分量）
+            let now = totalBytes(of: entry.asset)
+            before += now
+            if let meta = meta(entry.asset) {
+                // 前后同口径：都以 `now`（资源合计）为基准
+                after += entry.profile.estimatedBytes(byteSize: now, typeIdentifier: meta.typeIdentifier)
+            } else {
+                after += entry.profile.estimatedBytes(forUnresolved: now)
+            }
+        }
+        return (before, after)
+    }
+
 
     func clearFilters() {
         kindFilter = nil
@@ -1853,6 +1894,12 @@ final class AppStore {
             unmark([asset.id])
             return
         }
+        // 待压缩同理（2026-11 用户要求）：单击已带黄标的格子 = 取消压缩标记，
+        // 和回收站那套完全一致 —— 两者都不需要"再找一颗取消按钮"。
+        if compression.contains(asset.id) {
+            unmarkCompression([asset.id])
+            return
+        }
         if selection.contains(asset.id) {
             selection.remove(asset.id)
         } else {
@@ -1872,12 +1919,12 @@ final class AppStore {
         }
         let range = start <= end ? start...end : end...start
         // 已标记的项不进选中集合（和 toggle / selectAll 保持同一口径）
-        selection = Set(list[range].map(\.id)).subtracting(pendingDeletions)
+        selection = Set(list[range].map(\.id)).subtracting(pendingDeletions).subtracting(compression.ids)
     }
 
     /// 全选：跳过已标记回收的（它们已经在待删名单里了）
     func selectAll() {
-        selection = Set(visibleAssets.map(\.id)).subtracting(pendingDeletions)
+        selection = Set(visibleAssets.map(\.id)).subtracting(pendingDeletions).subtracting(compression.ids)
     }
 
     func clearSelection() {
@@ -1973,9 +2020,12 @@ final class AppStore {
     }
 
     /// 预览里切换「当前这一项」的选中状态。
-    /// **已经标记回收的不许再选中** —— 它已经在待删名单里了，再打勾只会自相矛盾。
+    /// **已经标记回收 / 已标待压缩的不许再选中** —— 它们已经在名单里了，再打勾只会自相矛盾。
     func togglePreviewSelection() {
-        guard let id = previewID, !pendingDeletions.contains(id) else { return }
+        guard let id = previewID,
+              !pendingDeletions.contains(id),
+              !compression.contains(id)
+        else { return }
         if selection.contains(id) {
             selection.remove(id)
         } else {
@@ -1996,6 +2046,25 @@ final class AppStore {
         trash.remove(ids: ids)
     }
 
+    /// 取消压缩标记（回到普通项）。单击已带黄标的格子 / 预览里的 `-` 都走这里。
+    func unmarkCompression(_ ids: some Sequence<Asset.ID>) {
+        let set = Set(ids)
+        guard !set.isEmpty else { return }
+        compression.remove(ids: set)
+        flash("已取消压缩标记 \(set.count) 张")
+    }
+
+    // MARK: - 网格/列表的每格查询（O(1)，别在 body 里现拼 Set）
+
+    func isPending(_ id: Asset.ID) -> Bool { trash.contains(id) }
+
+    func isQueuedForCompression(_ id: Asset.ID) -> Bool { compression.contains(id) }
+
+    /// 这一项标记时选的压缩参数（没标记返回 nil）。格子上要直接写出「怎么压」。
+    func compressionProfile(for id: Asset.ID) -> ConversionProfile? {
+        compression.profile(for: id)
+    }
+
     /// 框选结果怎么落到状态里（模式在拖拽开始时按"按住的那一格"定好）。
     /// **框选不再能取消标记**（2026-11 用户定的）：取消标记只能人工点格子右上角的叉，
     /// 或者预览里按 ⌫。框到已标记的项就当没框到 —— 已标记的不进选中集合。
@@ -2003,7 +2072,7 @@ final class AppStore {
         guard !hits.isEmpty else { return }
         switch mode {
         case .select:
-            let addable = hits.subtracting(pendingDeletions)
+            let addable = hits.subtracting(pendingDeletions).subtracting(compression.ids)
             guard !addable.isEmpty else { return }
             mergeSelection(addable)
         case .deselect:

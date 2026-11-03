@@ -169,9 +169,9 @@ struct PreviewOverlay: View {
                 HStack(spacing: 6) {
                     hintButton("空格", "关闭") { store.closePreview() }
                     hintButton("← →", "下一张") { store.stepPreview(1) }
-                    // 已标记回收的项不许再选中：它已经在待删名单里了
+                    // 已标记回收 / 已标待压缩的项不许再选中：它们已经在名单里了
                     hintButton("⏎", isSelected ? "取消选中" : "选中",
-                               enabled: !isPending) { store.togglePreviewSelection() }
+                               enabled: !isPending && !isCompressionQueued) { store.togglePreviewSelection() }
                     hintButton("⌫", isPending ? "取消标记" : "标记回收") {
                         if isPending { store.unmarkCurrentPreview() }
                         else { store.trashCurrentPreview() }
@@ -192,7 +192,9 @@ struct PreviewOverlay: View {
         if isPending {
             pill("已标记回收", symbol: "trash.fill", tint: .orange)
         } else if isCompressionQueued {
-            pill("待压缩", symbol: "arrow.down.right.and.arrow.up.left", tint: .brown)
+            // 带上这张会怎么压：和格子上的角标同一套口径
+            pill(compressionProfile.map { "待压缩 \($0.label)" } ?? "待压缩",
+                 symbol: "arrow.down.right.and.arrow.up.left", tint: .brown)
         } else if isSelected {
             pill("已选中", symbol: "checkmark.circle.fill", tint: .accentColor)
         }
@@ -504,12 +506,18 @@ struct PreviewOverlay: View {
 
     private var isPending: Bool {
         guard let asset else { return false }
-        return store.pendingDeletions.contains(asset.id)
+        return store.isPending(asset.id)
     }
 
     private var isCompressionQueued: Bool {
         guard let asset else { return false }
-        return store.compression.ids.contains(asset.id)
+        return store.isQueuedForCompression(asset.id)
+    }
+
+    /// 这一项标记时选的压缩参数（预览状态胶囊里直接写出来）
+    private var compressionProfile: ConversionProfile? {
+        guard let asset else { return nil }
+        return store.compressionProfile(for: asset.id)
     }
 
     private func infoItem(_ title: String, _ value: String) -> some View {

@@ -5,9 +5,22 @@ struct ConversionSheet: View {
     @Environment(AppStore.self) private var store
     @Environment(\.dismiss) private var dismiss
 
-    @State private var ratio: Double = 0.6
-    @State private var format: ConversionProfile.Format = .heic
-    @State private var quality: Double = 0.8
+    @State private var ratio: Double
+    @State private var format: ConversionProfile.Format
+    @State private var quality: Double
+
+    /// 每次被构造（= 每次打开面板）都从盘上取上次那套。
+    ///
+    /// ⚠️ **不要写成 `private static let saved = CompressionPrefs.load()` 再给三个 `@State` 赋初值**：
+    /// `static let` 在进程内只求值一次，于是「改成 40% → 关掉面板 → 再打开」拿到的还是
+    /// 进程启动时读到的那份（默认 60%/Q80），看着就是「比例和质量记不住」（2026-11 用户报的）。
+    /// 只有退出重启才会看起来正常 —— 那正好骗过自己。
+    init() {
+        let saved = CompressionPrefs.load()
+        _ratio = State(initialValue: saved.ratio)
+        _format = State(initialValue: saved.format)
+        _quality = State(initialValue: saved.quality)
+    }
 
     private struct Selected: Identifiable {
         let asset: Asset
@@ -27,7 +40,7 @@ struct ConversionSheet: View {
     private var photos: [Selected] { selected.filter { !$0.meta.isVideo } }
     /// 选中里已经在压缩站排队的张数（再标就是改参数）
     private var queuedCount: Int {
-        photos.filter { store.compression.ids.contains($0.asset.id) }.count
+        photos.filter { store.isQueuedForCompression($0.asset.id) }.count
     }
     private var videos: [Selected] { selected.filter { $0.meta.isVideo } }
 
@@ -135,8 +148,8 @@ struct ConversionSheet: View {
                 } else {
                     Button("取消") { dismiss() }
                     Button("标记压缩") {
-                        store.markForCompression(
-                            profile: ConversionProfile(ratio: ratio, format: format, quality: quality))
+                        // 先落盘参数：用户在面板里调过什么，下次打开就得是这个
+                        store.markForCompression(profile: currentPrefs.profile)
                         dismiss()
                     }
                     .buttonStyle(.borderedProminent)
@@ -148,7 +161,21 @@ struct ConversionSheet: View {
         .padding(20)
         .frame(width: 440)
         .onAppear { store.conversionResult = nil }
+        // 拖一下滑块、换个格式就立刻记住（不等点「标记压缩」）：
+        // 用户说过「每次新设置的都记住保留」，中途关掉面板也算设置过。
+        .onChange(of: ratio) { _, _ in savePrefs() }
+        .onChange(of: format) { _, _ in savePrefs() }
+        .onChange(of: quality) { _, _ in savePrefs() }
         .interactiveDismissDisabled(store.conversionRunning)
+    }
+
+    /// 面板当前的三个参数（存盘、标记、估算都用它，别各拼一份）
+    private var currentPrefs: CompressionPrefs {
+        CompressionPrefs(ratio: ratio, format: format, quality: quality, stripLive: true)
+    }
+
+    private func savePrefs() {
+        currentPrefs.save()
     }
 
     private var itemList: some View {
@@ -206,24 +233,12 @@ struct ConversionSheet: View {
         return parts.joined(separator: " · ")
     }
 
+    /// 当前面板参数。估算走 `ConversionProfile.estimatedBytes(for:)`，
+    /// 和底栏、压缩站用**同一份系数**（分开写会给出两个不同的「预计」）。
+    private var profile: ConversionProfile { currentPrefs.profile }
+
     private func estimatedBytes(_ meta: PhotoLibraryIndex.Meta) -> Int64 {
-        let lower = meta.typeIdentifier.lowercased()
-        let factor: Double
-        switch format {
-        case .heic:
-            if lower.contains("png") { factor = 0.12 }
-            else if lower.contains("raw") { factor = 0.10 }
-            else if lower.contains("heic") || lower.contains("heif") { factor = 0.60 }
-            else { factor = 0.50 }
-        case .jpeg:
-            if lower.contains("raw") { factor = 0.35 }
-            else if lower.contains("heic") || lower.contains("heif") { factor = 1.10 }
-            else { factor = 1.00 }
-        case .png:
-            factor = 1.60
-        }
-        let qualityFactor = format == .png ? 1.0 : max(0.35, min(1.5, quality / 0.8))
-        return Int64(Double(meta.byteSize) * ratio * ratio * factor * qualityFactor)
+        profile.estimatedBytes(for: meta)
     }
 
     private func formatName(_ uti: String, _ fileName: String) -> String {

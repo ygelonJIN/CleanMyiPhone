@@ -194,7 +194,7 @@ final class PurgeEngine {
                             id: entry.id,
                             name: entry.fileName,
                             bytes: entry.byteSize,
-                            reason: "没有执行：设备在前面那一批就没有回执了（解锁 iPhone、拔插数据线后重试）"
+                            reason: "没有执行：设备在前面那一批就没有回执了（拔插一次数据线后点重试）"
                         )
                     )
                 }
