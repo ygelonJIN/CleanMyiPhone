@@ -53,6 +53,14 @@ struct CleanMyiPhoneApp: App {
             CommandGroup(after: .toolbar) {
                 Button("缩略图") { store.viewMode = .grid }.keyboardShortcut("1")
                 Button("列表") { store.viewMode = .list }.keyboardShortcut("2")
+                Divider()
+                // 缩略图大小可调（2026-11 用户要求）：菜单给键盘通路，顶栏那根滑杆给鼠标
+                Button("放大缩略图") { store.stepThumbCell(12) }
+                    .keyboardShortcut("+", modifiers: .command)
+                Button("缩小缩略图") { store.stepThumbCell(-12) }
+                    .keyboardShortcut("-", modifiers: .command)
+                Button("还原缩略图大小") { store.setThumbCell(AppStore.thumbCellDefault) }
+                    .keyboardShortcut("0", modifiers: .command)
             }
         }
     }
@@ -117,10 +125,11 @@ struct RootView: View {
                 Divider()
             }
 
-            // 500 是顶栏要的最小宽度：6 个控件收窄后合计 444 + 左右内边距 36 = 480。
-            // 低于这个数顶栏就只能横向滚，"如图标视图/日月年按钮被裁掉"就是这么来的。
+            // 610 是顶栏要的最小宽度：加进「缩略图大小」那根滑杆之后，7 个控件合计
+            // 569 + 左右内边距 40 = 609（见 PhotosView 里的宽度预算）。
+            // 低于这个数顶栏就会被裁，"图标视图/日月年按钮被裁掉"就是这么来的。
             page
-                .frame(minWidth: 500, maxWidth: .infinity, maxHeight: .infinity)
+                .frame(minWidth: 610, maxWidth: .infinity, maxHeight: .infinity)
                 .layoutPriority(1)
 
             if showInspector {
@@ -132,9 +141,9 @@ struct RootView: View {
                     .transition(.move(edge: .trailing))
             }
         }
-        // 236 + 1 + 500 + 1 + 180 = 918：窗口最小宽度必须盖住三栏 + 顶栏，
+        // 236 + 1 + 610 + 1 + 180 = 1028：窗口最小宽度必须盖住三栏 + 顶栏，
         // 否则顶栏右边那几个控件会被裁掉（2026-11 用户报的就是这个）。
-        .frame(minWidth: 920, minHeight: 620)
+        .frame(minWidth: 1030, minHeight: 620)
         .coordinateSpace(name: PreviewAnchorSpace.root)
         .background(WindowOnScreenGuard())
         .toolbar(removing: .sidebarToggle)
@@ -191,6 +200,21 @@ struct RootView: View {
         }
         .animation(.easeInOut(duration: 0.2),
                    value: store.purgeProgress != nil || store.purgeReport != nil)
+        // 写回修改：同样盖死整窗。整份库覆盖期间不许点任何东西（也不能中途拔线）
+        .overlay {
+            if store.editSubmitting || store.editReport != nil {
+                ZStack {
+                    Rectangle()
+                        .fill(.thickMaterial)
+                        .ignoresSafeArea()
+                        .contentShape(Rectangle())
+                    EditStatusOverlay()
+                }
+                .transition(.opacity)
+            }
+        }
+        .animation(.easeInOut(duration: 0.2),
+                   value: store.editSubmitting || store.editReport != nil)
         .onChange(of: store.emptyTrashConfirmPresented) { _, shown in
             // 弹窗被 Esc / 点外面关掉时，别把待删名单留在内存里
             if !shown { store.pendingDeleteIDs = [] }
@@ -209,6 +233,7 @@ struct RootView: View {
         case .albums: PhotosView()
         case .trash: TrashView()
         case .compression: CompressionView()
+        case .edits: EditStationView()
         }
     }
 }

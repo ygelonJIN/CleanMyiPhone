@@ -19,6 +19,9 @@ struct PreviewOverlay: View {
     @State private var livePlaying = false
     /// 进场 / 退场：只驱动缩放和透明度，不参与任何数据
     @State private var presented = false
+    /// 顶栏那一排键帽的**实测**宽度（见 `topBar(available:)`）。
+    /// 用它来算名字两侧要不要对称留白 —— 不靠猜的常量，改标签宽度也不会算错。
+    @State private var hintRowWidth: CGFloat = 0
 
     private var asset: Asset? { store.previewAsset }
 
@@ -37,12 +40,13 @@ struct PreviewOverlay: View {
                     .onTapGesture { store.closePreview() }
 
                 VStack(spacing: 0) {
-                    topBar
+                    // 传下去的是**内层**宽度：外层有 28pt 左右内边距
+                    topBar(available: proxy.size.width - 56)
                     media
                         // 从缩略图那一格长出来：锚点就是那一格的中心
                         .scaleEffect(presented ? 1 : 0.72, anchor: anchor)
                         .opacity(presented ? 1 : 0)
-                    infoBar
+                    infoBar(available: proxy.size.width - 56)
                         .opacity(presented ? 1 : 0)
                 }
                 .padding(.horizontal, 28)
@@ -131,59 +135,126 @@ struct PreviewOverlay: View {
 
     // MARK: - 顶栏
 
-    private var topBar: some View {
-        ZStack {
-            // 标题居中，两侧各自独立，窄窗口下只截标题、不截提示
-            VStack(spacing: 1) {
-                if let asset {
-                    Text(asset.fileName)
-                        .font(.system(size: 15, weight: .semibold))
-                        .lineLimit(1)
-                        .truncationMode(.middle)
-                    HStack(spacing: 6) {
-                        Text("\(indexText) · \(asset.kind.label)")
-                            .font(.caption.monospacedDigit())
-                            .foregroundStyle(.secondary)
-                        statePill
+    /// 顶栏排法（2026-11 用户报的「键帽和中间的文件名重叠」）。
+    ///
+    /// 以前是「ZStack + 名字固定 `padding(.horizontal, 340)` + 右对齐键帽」：
+    /// 那一排键帽 250–520pt 宽，窗口一窄就和名字抢同一条水平线（默认 1180 窗口下
+    /// 内容区只有 762pt，名字两侧各 340 之后只剩 82pt，必然压上）。
+    ///
+    /// 现在**先量再排**，两种情况都不会重叠：
+    /// · 两侧各留出键帽那一排的宽度还够名字（≥150pt）→ 名字正中、键帽贴右，单行；
+    /// · 不够 → 键帽挪到第二行，名字独占一行（宁可多一行，也不让谁压住谁）。
+    /// ⚠️ 2026-11 用户定：**窄了也不许把键帽上的文字删掉，只许整体缩小**
+    /// （三档字号/内边距，见 `HintDensity`）。实在挤不下才把这一排挪到第二行。
+    @ViewBuilder
+    private func topBar(available: CGFloat) -> some View {
+        let density = HintDensity.forWidth(available)
+        let rowWidth = max(hintRowWidth, 24)
+        let canCenter = available - rowWidth * 2 >= 150
+
+        Group {
+            if canCenter {
+                ZStack {
+                    // 状态胶囊本身就不短（「待压缩 60%·HEIC·Q80」），名字那一块太窄时先把它收起来，
+                    // 免得它撑破留白、又和键帽压在一起
+                    titleBlock(showsPill: available - rowWidth * 2 >= 250)
+                        .padding(.horizontal, rowWidth)
+                    HStack(spacing: 0) {
+                        closeButton
+                        Spacer(minLength: 0)
+                        hintRow(density)
                     }
                 }
-            }
-            .padding(.horizontal, 340)
-
-            HStack(spacing: 0) {
-                Button {
-                    store.closePreview()
-                } label: {
-                    Image(systemName: "xmark")
-                        .font(.system(size: 11, weight: .bold))
-                        .frame(width: 24, height: 24)
-                        .background(Circle().fill(.quaternary))
-                }
-                .buttonStyle(.plain)
-                .help("关闭（Esc / 空格）")
-
-                Spacer(minLength: 0)
-
-                // 提示从右下角搬到顶部，而且**本身就是按钮** ——
-                // 既能看快捷键，也能直接点着用。
-                HStack(spacing: 6) {
-                    hintButton("空格", "关闭") { store.closePreview() }
-                    hintButton("← →", "下一张") { store.stepPreview(1) }
-                    // 已标记回收 / 已标待压缩的项不许再选中：它们已经在名单里了
-                    hintButton("⏎", isSelected ? "取消选中" : "选中",
-                               enabled: !isPending && !isCompressionQueued) { store.togglePreviewSelection() }
-                    hintButton("⌫", isPending ? "取消标记" : "标记回收") {
-                        if isPending { store.unmarkCurrentPreview() }
-                        else { store.trashCurrentPreview() }
+            } else {
+                VStack(spacing: 8) {
+                    HStack(spacing: 10) {
+                        closeButton
+                        titleBlock(showsPill: true)
+                            .frame(maxWidth: .infinity)
+                        // 右边补一块和关闭按钮一样宽的空位，名字才是真的居中
+                        Color.clear.frame(width: 24, height: 24)
                     }
-                    // 「-」= 标记压缩（和 ⌫ 互斥；已是待压缩时变「取消压缩」）
-                    hintButton("-", isCompressionQueued ? "取消压缩" : "标记压缩") {
-                        store.compressionMarkCurrentPreview()
+                    HStack(spacing: 0) {
+                        Spacer(minLength: 0)
+                        hintRow(density)
                     }
                 }
             }
         }
         .padding(.bottom, 12)
+        .onPreferenceChange(PreviewHintWidthKey.self) { hintRowWidth = $0 }
+    }
+
+    private var closeButton: some View {
+        Button {
+            store.closePreview()
+        } label: {
+            Image(systemName: "xmark")
+                .font(.system(size: 11, weight: .bold))
+                .frame(width: 24, height: 24)
+                .background(Circle().fill(.quaternary))
+        }
+        .buttonStyle(.plain)
+        .help("关闭（Esc / 空格）")
+    }
+
+    /// 名字 + 「第几张 · 类型」+ 状态胶囊。宽度全交给外层，自己只负责不许撑破：
+    /// 文件名中点截断，下面一行让读数先缩、状态胶囊不让。
+    private func titleBlock(showsPill: Bool) -> some View {
+        VStack(spacing: 1) {
+            if let asset {
+                Text(asset.fileName)
+                    .font(.system(size: 15, weight: .semibold))
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                HStack(spacing: 6) {
+                    Text("\(indexText) · \(asset.kind.label)")
+                        .font(.caption.monospacedDigit())
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.7)
+                    if showsPill {
+                        statePill
+                            .fixedSize()
+                            .layoutPriority(1)
+                    }
+                }
+            }
+        }
+    }
+
+    /// 提示从右下角搬到顶部，而且**本身就是按钮** ——
+    /// 既能看快捷键，也能直接点着用。
+    /// 窗口变窄只**整体缩小**（字号 / 内边距 / 间距），文字一个字都不删。
+    private func hintRow(_ density: HintDensity) -> some View {
+        HStack(spacing: density.spacing) {
+            hintButton("空格", "关闭", density) { store.closePreview() }
+            hintButton("← →", "下一张", density) { store.stepPreview(1) }
+            // 已标记回收 / 已标待压缩的项不许再选中：它们已经在名单里了
+            hintButton("⏎", isSelected ? "取消选中" : "选中", density,
+                       enabled: !isPending && !isCompressionQueued) { store.togglePreviewSelection() }
+            hintButton("⌫", isPending ? "取消标记" : "标记回收", density) {
+                if isPending { store.unmarkCurrentPreview() }
+                else { store.trashCurrentPreview() }
+            }
+            // 「-」= 标记压缩（和 ⌫ 互斥；已是待压缩时变「取消压缩」）
+            hintButton("-", isCompressionQueued ? "取消压缩" : "标记压缩", density) {
+                store.compressionMarkCurrentPreview()
+            }
+            // 「♥」= 收藏 / 取消收藏（只暂存，到修改站写回）
+            hintButton("♥", isFavorite ? "取消收藏" : "收藏", density) {
+                if let asset { store.toggleFavorite([asset]) }
+            }
+        }
+        // 这一排**永远按自然宽度**排：量出来的宽度就是它的真实宽度，
+        // 居中 / 分行的判断才稳（一旦被压缩，宽度就跟着变，会来回抖）。
+        .fixedSize(horizontal: true, vertical: false)
+        .layoutPriority(1)
+        .background(
+            GeometryReader { geo in
+                Color.clear.preference(key: PreviewHintWidthKey.self, value: geo.size.width)
+            }
+        )
     }
 
     /// 当前这一项的状态胶囊：选中 / 已标记回收
@@ -210,27 +281,33 @@ struct PreviewOverlay: View {
             .overlay(Capsule().strokeBorder(tint.opacity(0.35), lineWidth: 1))
     }
 
-    /// 键帽 + 文字，整个是一颗按钮：键帽告诉你快捷键，点它直接执行
+    /// 键帽 + 文字，整个是一颗按钮：键帽告诉你快捷键，点它直接执行。
+    /// 三档只差字号和内边距 —— **文字永远在**（用户定的）。
     private func hintButton(_ key: String,
                             _ label: String,
+                            _ density: HintDensity,
                             enabled: Bool = true,
                             action: @escaping () -> Void) -> some View {
         Button(action: action) {
-            HStack(spacing: 5) {
+            HStack(spacing: density.keyToLabel) {
                 Text(key)
-                    .font(.system(size: 12, weight: .semibold, design: .rounded))
-                    .frame(minWidth: 26)
-                    .padding(.horizontal, 5)
-                    .padding(.vertical, 3)
+                    .font(.system(size: density.keyFont, weight: .semibold, design: .rounded))
+                    .lineLimit(1)
+                    .fixedSize()
+                    .frame(minWidth: density.keyMinWidth)
+                    .padding(.horizontal, density.keyPadding)
+                    .padding(.vertical, density.keyPaddingV)
                     .background(
                         RoundedRectangle(cornerRadius: 5, style: .continuous)
                             .fill(.quaternary)
                     )
                 Text(label)
-                    .font(.system(size: 12.5, weight: .medium))
+                    .font(.system(size: density.labelFont, weight: .medium))
+                    .lineLimit(1)
+                    .fixedSize()
             }
-            .padding(.horizontal, 7)
-            .padding(.vertical, 3)
+            .padding(.horizontal, density.buttonPadding)
+            .padding(.vertical, density.buttonPaddingV)
             .background(
                 RoundedRectangle(cornerRadius: 8, style: .continuous)
                     .fill(Color.secondary.opacity(enabled ? 0.10 : 0.04))
@@ -439,8 +516,11 @@ struct PreviewOverlay: View {
 
     // MARK: - 信息条
 
-    private var infoBar: some View {
-        HStack(alignment: .center, spacing: 24) {
+    /// 窗口窄的时候先把「类型 / 格式 / 相簿」那三列收起来（它们在窄窗口里顶到窗口外面，
+    /// 顺带把右边「已选 N 项」挤没了）。分辨率和体积是第一眼要看的，永远留。
+    private func infoBar(available: CGFloat) -> some View {
+        let showsDetails = available >= 660
+        return HStack(alignment: .center, spacing: 24) {
             if let asset {
                 // 分辨率和体积是第一眼要看到的信息，日期退到第二行
                 VStack(alignment: .leading, spacing: 3) {
@@ -463,14 +543,16 @@ struct PreviewOverlay: View {
                         .foregroundStyle(.tertiary)
                 }
 
-                Divider().frame(height: 30)
+                if showsDetails {
+                    Divider().frame(height: 30)
 
-                HStack(spacing: 20) {
-                    infoItem("类型", store.isLivePhoto(asset) ? "实况照片" : asset.kind.label)
-                    infoItem("格式", asset.fileExtension)
-                    infoItem("相簿", asset.folder)
-                    if asset.isCloudOnly {
-                        infoItem("来源", "仅云端")
+                    HStack(spacing: 20) {
+                        infoItem("类型", store.isLivePhoto(asset) ? "实况照片" : asset.kind.label)
+                        infoItem("格式", asset.fileExtension)
+                        infoItem("相簿", asset.folder)
+                        if asset.isCloudOnly {
+                            infoItem("来源", "仅云端")
+                        }
                     }
                 }
 
@@ -497,6 +579,12 @@ struct PreviewOverlay: View {
             }
         }
         .padding(.top, 14)
+    }
+
+    /// 暂存的收藏改动优先于库里的状态：预览里点完要立刻看到变化
+    private var isFavorite: Bool {
+        guard let asset else { return false }
+        return store.displayedFavorite(asset)
     }
 
     private var isSelected: Bool {
@@ -532,6 +620,106 @@ struct PreviewOverlay: View {
     }
 }
 
+
+/// 预览顶栏那排键帽的**密度**：窗口越窄字号和内边距越小，但文字一个都不删。
+///
+/// 2026-11 用户定的：窄窗口里不许把「关闭 / 下一张 / 选中 / 标记回收 / 标记压缩」收起来，
+/// 只许整体缩小 —— 键帽本身是按钮，缩了还能点，删了等于把功能藏起来。
+/// 三档的宽度大致是 449 / 354 / 310pt（5 颗按钮 + 间距，中文标签那版）。
+enum HintDensity {
+    case normal, compact, tiny
+
+    /// 分档要跟「能不能单行居中」对齐：单行大约需要 `这一排宽度 × 2 + 名字 150`。
+    /// 449×2+150≈1048 / 354×2+150≈858 / 310×2+150≈770，所以取 1100 / 860 两个门槛，
+    /// 免得出现「明明缩小一档就能单行，却因为还挂着大一档而换行」的台阶。
+    static func forWidth(_ available: CGFloat) -> HintDensity {
+        if available >= 1100 { return .normal }
+        if available >= 860 { return .compact }
+        return .tiny
+    }
+
+    var keyFont: CGFloat {
+        switch self {
+        case .normal: return 12
+        case .compact: return 10.5
+        case .tiny: return 9.5
+        }
+    }
+
+    var labelFont: CGFloat {
+        switch self {
+        case .normal: return 12.5
+        case .compact: return 10.5
+        case .tiny: return 9.5
+        }
+    }
+
+    var keyMinWidth: CGFloat {
+        switch self {
+        case .normal: return 22
+        case .compact: return 18
+        case .tiny: return 16
+        }
+    }
+
+    var keyPadding: CGFloat {
+        switch self {
+        case .normal: return 4
+        case .compact: return 3
+        case .tiny: return 2
+        }
+    }
+
+    var keyPaddingV: CGFloat {
+        switch self {
+        case .normal: return 3
+        case .compact: return 2
+        case .tiny: return 1.5
+        }
+    }
+
+    var buttonPadding: CGFloat {
+        switch self {
+        case .normal: return 6
+        case .compact: return 4.5
+        case .tiny: return 3
+        }
+    }
+
+    var buttonPaddingV: CGFloat {
+        switch self {
+        case .normal: return 3
+        case .compact: return 2
+        case .tiny: return 1.5
+        }
+    }
+
+    /// 键帽和文字之间
+    var keyToLabel: CGFloat {
+        switch self {
+        case .normal: return 5
+        case .compact: return 4
+        case .tiny: return 3.5
+        }
+    }
+
+    /// 按钮之间
+    var spacing: CGFloat {
+        switch self {
+        case .normal: return 6
+        case .compact: return 5
+        case .tiny: return 4
+        }
+    }
+}
+
+/// 顶栏键帽那一排的实测宽度：顶栏靠它算「名字两侧要不要对称留白」。
+private struct PreviewHintWidthKey: PreferenceKey {
+    static var defaultValue: CGFloat = 0
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
+        value = max(value, nextValue())
+    }
+}
 
 /// 用 AppKit 的 AVPlayerView 播放，避开 SwiftUI VideoPlayer 在当前系统上的崩溃
 struct PlayerSurface: NSViewRepresentable {

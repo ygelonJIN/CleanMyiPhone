@@ -9,7 +9,7 @@ final class AppStore {
     // MARK: - 导航
 
     enum Section: String, Identifiable {
-        case overview, photos, albums, trash, compression
+        case overview, photos, albums, trash, compression, edits
         var id: String { rawValue }
     }
 
@@ -23,6 +23,8 @@ final class AppStore {
         case trash
         /// 压缩站：标记过的待压缩项，这里二次确认才真的压
         case compression
+        /// 修改站：收藏 / 移动相簿 / 新建相簿，攒够了一次性写回手机
+        case edits
     }
 
     var sidebarItem: SidebarItem = .overview
@@ -37,6 +39,7 @@ final class AppStore {
         case .album(let id): return "album.\(id).\(viewMode)"
         case .trash: return "trash.\(viewMode)"
         case .compression: return "compression"
+        case .edits: return "edits"
         }
     }
 
@@ -48,6 +51,7 @@ final class AppStore {
         case .photos: return .photos
         case .trash: return .trash
         case .compression: return .compression
+        case .edits: return .edits
         }
     }
 
@@ -111,6 +115,21 @@ final class AppStore {
     let trash = TrashStore()
     /// 压缩站：只记「要压哪几张、用什么参数」，执行要到这里二次确认
     let compression = CompressionQueue()
+
+    /// 修改站：收藏 / 移动相簿 / 新建相簿的暂存区（只在内存，退出即清空）
+    let edits = PhotoEditQueue()
+
+    /// 写库闸门：同一时刻只允许一个「抓库 → 改 → 写回 → 重启相册服务」。
+    /// 压缩的**编码阶段不占**这把锁，只有它最后写库那一下占 —— 所以「压着的时候存几张」
+    /// 不会互相干等十分钟。详见 `submitEdits` 和 `runCompressionStation`。
+    var editSubmitting = false
+    var editStageText = ""
+    var editReport: EditReport?
+    /// 提交时正赶上压缩/删除：记下来，等它们跑完自动写（用户定的）
+    var editSubmitAfterCompression = false
+    /// 两个小面板
+    var moveSheetPresented = false
+    var newAlbumSheetPresented = false
     /// 上一次用的压缩参数。预览里按「-」没有面板可选，就用它（默认 60% · HEIC · Q80）
     /// 预览里按「-」标记压缩时用的参数。启动时从**上次存下的那份**读（`CompressionPrefs`），
     /// 不是永远回到 60%/HEIC/Q80 —— 用户要求「每次新设置的都记住保留」。
@@ -129,6 +148,38 @@ final class AppStore {
     var provisionalMessage: String?
 
     var columns = 6
+
+    // MARK: - 缩略图大小（2026-11：不再定死 118pt）
+    //
+    // 网格的格子宽度由用户自己调，照片页 / 回收站 / 压缩站共用这一个值。
+    // 只存在内存里：退出即清空、**不落盘**（见 AGENTS.md「不留痕」）。
+    /// 单格的目标宽度（pt）。网格按可用宽度自动排几列，滑杆改的就是这个数。
+    var thumbCell: CGFloat = AppStore.thumbCellDefault
+    /// 允许的范围：84（一屏塞得多）… 200（一张顶两张）
+    static let thumbCellMin: CGFloat = 84
+    static let thumbCellMax: CGFloat = 200
+    static let thumbCellDefault: CGFloat = 118
+
+    /// 角标 / 圆角 / 内边距跟着格子一起缩放：84pt 的小格子和 200pt 的大格子才是一套外观，
+    /// 不会出现「大格子里飘着几个米粒大的角标」。
+    var thumbScale: CGFloat {
+        min(max(thumbCell / AppStore.thumbCellDefault, 0.78), 1.7)
+    }
+
+    /// 滑杆 / ⌘+ ⌘- 都走这里：夹到范围内，再按 2pt 一档吸附
+    /// （不吸附的话拖一下会换几百次列数，格子一路抖）。
+    func setThumbCell(_ value: CGFloat) {
+        let clamped = min(max(value, AppStore.thumbCellMin), AppStore.thumbCellMax)
+        let snapped = (clamped / 2).rounded() * 2
+        guard abs(snapped - thumbCell) > 0.01 else { return }
+        thumbCell = snapped
+    }
+
+    func stepThumbCell(_ delta: CGFloat) { setThumbCell(thumbCell + delta) }
+
+    var canEnlargeThumbCells: Bool { thumbCell < AppStore.thumbCellMax - 0.5 }
+    var canShrinkThumbCells: Bool { thumbCell > AppStore.thumbCellMin + 0.5 }
+
     var previewID: Asset.ID?
     /// 正在播退出动画：预览层按它反向缩放，180 ms 后才真正拆除（不靠淡出糊过去）。
     var isClosingPreview = false
@@ -307,6 +358,16 @@ final class AppStore {
         ptp.onCatalog = { [weak self] list, fraction in
             guard let self, !self.usingFixture else { return }
             self.catalogHeartbeat = Date()
+            // **空目录不许覆盖已有列表**（2026-11 用户现场：写完库之后「全部照片」变成
+            // 「没读到照片」，而相机/相簿/收藏全正常）。
+            // 写完库 / 刚重启相册服务时，设备会先推一次空目录，真目录要几秒后才来；
+            // 直接赋值就把整屏照片抹掉了 —— 而库那边一条没丢，看起来就是「库好好的、照片没了」。
+            if list.isEmpty, !self.assets.isEmpty {
+                Self.debugLog("catalog 空推送，保留现有 \(self.assets.count) 项")
+                self.catalogFraction = fraction
+                self.recomputeProgress()
+                return
+            }
             self.assets = self.mergingConverted(list)
             self.catalogFraction = fraction
             self.recomputeProgress()
@@ -416,11 +477,21 @@ final class AppStore {
             return
         }
 
-        // PTP 没上来：锁屏就直接说锁屏，否则提示读不到照片目录
+        // PTP 没上来：先自动重建一次 IC 通道（不要求用户拔线），还不行再报错
         if libraryDone || librarySkipped {
+            if assets.isEmpty {
+                if await retryCatalogAfterChannelLoss() {
+                    catalogDone = true
+                    maybeFinishScan()
+                    return
+                }
+            }
             catalogDone = true
             if errorText == nil, !isDeviceLocked {
-                errorText = "读不到照片目录，解锁 iPhone 后再刷新"
+                errorText = libraryIndex.map {
+                    "照片目录没枚举出来（相册库读到了 \($0.metaByFile.count) 条，所以相机/相簿能看）"
+                    + " —— 拔插一次数据线或重启 iPhone，再点「重新读取」"
+                } ?? "读不到照片目录，解锁 iPhone 后再刷新"
             }
             maybeFinishScan()
         }
@@ -555,7 +626,20 @@ final class AppStore {
         while !catalogDone && Date() < deadline {
             try? await Task.sleep(nanoseconds: 120_000_000)
         }
-        if catalogDone || !assets.isEmpty { maybeFinishScan() }
+        if catalogDone || !assets.isEmpty { maybeFinishScan(); return }
+        // 和 bootstrap 同一条兜底：库读到了、目录空 → 重建 IC 通道再试一轮
+        if await retryCatalogAfterChannelLoss() {
+            catalogDone = true
+            maybeFinishScan()
+            return
+        }
+        catalogDone = true
+        if errorText == nil, !isDeviceLocked {
+            errorText = libraryIndex.map {
+                "照片目录没枚举出来（相册库读到了 \($0.metaByFile.count) 条）—— 拔插一次数据线或重启 iPhone 后再试"
+            } ?? "读不到照片目录，解锁 iPhone 后再刷新"
+        }
+        maybeFinishScan()
     }
 
     func useFixture() {
@@ -678,6 +762,162 @@ final class AppStore {
         return result
     }
 
+    // MARK: - 修改站（收藏 / 移动相簿 / 新建相簿）
+
+    /// 库里当前是不是收藏（给暂存区判断「再点一次该回到原样」）。
+    func libraryFavorite(_ asset: Asset) -> Bool {
+        meta(asset)?.isFavorite ?? asset.tags.contains(.favorite)
+    }
+
+    /// 这一格**现在应该显示成**收藏还是没收藏：暂存的改动优先。
+    func displayedFavorite(_ asset: Asset) -> Bool {
+        edits.favorite(for: asset.id) ?? libraryFavorite(asset)
+    }
+
+    func isEdited(_ id: Asset.ID) -> Bool { edits.contains(id) }
+
+    /// 右键菜单用：右键的那一张不在选中集合里时，先把它选上（苹果的常规行为）。
+    @discardableResult
+    func prepareContext(_ asset: Asset) -> [Asset] {
+        if !selection.contains(asset.id) { selectSingle(asset) }
+        return selectedAssets
+    }
+
+    func editMoveTarget(for id: Asset.ID) -> PhotoEditQueue.AlbumRef? { edits.moveTarget(for: id) }
+
+    /// 收藏 / 取消收藏：**只暂存，不动设备**（和「标记压缩」同一套）。
+    func toggleFavorite(_ assets: [Asset]) {
+        guard !assets.isEmpty else { return }
+        for asset in assets {
+            edits.toggleFavorite(asset, original: libraryFavorite(asset))
+        }
+        flash("已暂存 \(assets.count) 项收藏改动（这一步不动设备）· 到「修改站」写回手机")
+    }
+
+    /// 选中项里点 ♥：整批往同一个方向翻。
+    /// 口径：只要有一个是「没收藏」，整批就变收藏；否则整批取消收藏。
+    func toggleFavoriteSelection() {
+        let assets = selectedAssets
+        guard !assets.isEmpty else { return }
+        let makeFavorite = assets.contains { !displayedFavorite($0) }
+        for asset in assets where displayedFavorite(asset) != makeFavorite {
+            edits.toggleFavorite(asset, original: libraryFavorite(asset))
+        }
+        flash(makeFavorite ? "已暂存收藏 \(assets.count) 项" : "已暂存取消收藏 \(assets.count) 项")
+    }
+
+    /// 移到相簿。`from` = 当前所在相簿（在「全部照片」里是 nil，等于「只加入」）；
+    /// `to` = nil 表示只从相簿里移出，不加入任何相簿。
+    func stageMove(_ assets: [Asset], from: Int?, to: PhotoEditQueue.AlbumRef?) {
+        guard !assets.isEmpty else { return }
+        edits.move(assets, from: from, to: to)
+        clearSelection()
+        if let to {
+            flash("已暂存：\(assets.count) 项移到「\(to.title)」（这一步不动设备）")
+        } else {
+            flash("已暂存：\(assets.count) 项移出相簿（这一步不动设备）")
+        }
+    }
+
+    /// 底栏「移动到相簿…」：弹面板，选完才落到暂存区。
+    /// 「从哪本移出」就是当前正在看的相簿（不在相簿页时是 nil）。
+    func stageMoveSelection(to target: PhotoEditQueue.AlbumRef?) {
+        stageMove(selectedAssets, from: albumFilter, to: target)
+    }
+
+    /// 在移动面板里新建一本相簿，并把这批放进去（同一批只建一次库）。
+    func stageNewAlbumAndMove(title: String) {
+        guard !selectedAssets.isEmpty else { return }
+        let ref = edits.createAlbum(title: title)
+        stageMoveSelection(to: ref)
+    }
+
+    /// 把暂存的一批写回手机。**整批一次写库**（297 MB 下 + 上 + 重启相册服务，约 40–60 秒）。
+    /// - Parameter redirect: 压缩刚生成的新副本映射（原 PK → 新 PK）。
+    ///   压缩后暂存的收藏/相簿要落到**新那张**上，老的那份照旧进「已压缩待删除」。
+    func submitEdits(redirect: [Int: Int] = [:]) async {
+        guard edits.hasWork, !editSubmitting, !isPurging else { return }
+        // 库还没读好就没有 Z_PK 可映射：这时候写出去会把整批改动悄悄丢掉
+        guard libraryIndex != nil else {
+            flash("相册索引还没读好，等它读完再写回")
+            return
+        }
+        // 压缩/删除在跑：按用户定的「等它跑完再生效」，记一笔，收尾时自动提交。
+        if conversionRunning {
+            editSubmitAfterCompression = true
+            flash("正在压缩，等它跑完自动写回")
+            return
+        }
+        let operations = edits.operations { [self] asset in
+            guard let pk = meta(asset)?.pk else { return nil }
+            return redirect[pk] ?? pk
+        }
+        guard !operations.isEmpty else {
+            edits.clear()
+            return
+        }
+
+        editSubmitting = true
+        editReport = nil
+        editStageText = "准备"
+        let udid = stats.udid
+        let workDir = URL(fileURLWithPath: "/tmp/cmi-edits-\(UUID().uuidString)", isDirectory: true)
+        // 和压缩同一条规矩：先把缩略图/预览占着的 AFC 让开，PTP 只关会话不停 browser
+        await releaseDeviceFiles()
+        ptp.pauseSession()
+
+        var outcome: LibraryEditEngine.Outcome?
+        var failure: String?
+        do {
+            let engine = try LibraryEditEngine(udid: udid, workDir: workDir)
+            outcome = try await Task.detached { [weak self] in
+                try engine.run(ops: operations) { stage in
+                    Task { @MainActor in self?.editStageText = stage }
+                }
+            }.value
+        } catch {
+            failure = error.localizedDescription
+        }
+        editSubmitting = false
+
+        // 用**改好的那份本地库**重读索引：省掉再下 297 MB，而且相簿和收藏立刻就是新的。
+        if let path = outcome?.editedDBPath, let index = PhotoLibraryIndex.load(dbPath: path) {
+            libraryIndex = index
+            libraryAlbums = index.albumsSorted()
+            metaCacheStore.removeAll()
+            invalidateCounts()
+            ensureAlbumSelection()
+            Self.debugLog("[edit] 用改后的库重载索引：\(index.metaByFile.count) 条 / \(index.albums.count) 本")
+        }
+        try? FileManager.default.removeItem(at: workDir)
+
+        if let outcome {
+            edits.clear()
+            // 重启 assetsd 会把 PTP 打断：**无条件**重建一次。
+            // 只 condaemonRestarted 不够 —— 重启调用失败（没装 Xcode / devicectl 报错）时
+            // 不重建，会话就一直停在我们 pause 掉的状态，之后「全部照片」永远空。
+            let ptpBack = await ptp.cameraOrReconnect(timeout: 25) != nil
+            editReport = EditReport(createdAlbums: outcome.createdAlbums.count,
+                                    moved: outcome.memberships,
+                                    favorited: outcome.favorites,
+                                    seconds: outcome.elapsed,
+                                    daemonRestarted: outcome.daemonRestarted,
+                                    failure: nil,
+                                    ptpBack: ptpBack)
+            invalidateCounts()
+            flash("已写回手机：\(outcome.memberships) 处相簿 · \(outcome.favorites) 处收藏")
+        } else {
+            editReport = EditReport(createdAlbums: 0, moved: 0, favorited: 0, seconds: 0,
+                                    daemonRestarted: false,
+                                    failure: failure ?? "未知错误")
+            flash("写回失败：\(failure ?? "未知错误")（改动还在修改站里，可以直接重试）")
+        }
+    }
+
+    func dismissEditReport() {
+        editReport = nil
+    }
+
     // MARK: - 压缩站（先标记，后执行）
 
     /// 第一次点「压缩」只做这个：**记下意图，不动设备**。
@@ -713,7 +953,7 @@ final class AppStore {
     /// 所以这里不再给开关（2026-11 用户定的：不需要勾选）。
     /// - Parameter ids: 只压这几张（`nil` = 整个压缩站）。压缩站里选中后点「压缩选中」走这个。
     func runCompressionStation(ids: [Asset.ID]? = nil) async {
-        guard !conversionRunning, !isPurging, !compression.isEmpty else { return }
+        guard !conversionRunning, !isPurging, !editSubmitting, !compression.isEmpty else { return }
         let wanted = ids.map(Set.init)
         let picked = compression.entries.filter { wanted?.contains($0.id) ?? true }
         guard !picked.isEmpty else { return }
@@ -763,10 +1003,21 @@ final class AppStore {
         // 用户 N 分钟后再去回收站点删除，看到的就是「52 项全没删掉 · 设备未连接」。
         // 所以这里趁热立刻重建一次 PTP，并把结果如实说出来 —— 不是每批都成功。
         var ptpBack = true
-        if combined.daemonRestarted {
+        if combined.daemonRestarted || combined.dbPath != nil {
             ptpBack = await ptp.cameraOrReconnect(timeout: 25) != nil
             Self.debugLog("压缩后重连 PTP：\(ptpBack ? "回来了" : "没回来")")
         }
+        // 压缩刚生成的新副本要继承暂存的收藏/相簿改动：把目标改指到新 PK。
+        // 老的那份照旧进「已压缩待删除」（零痕：这一批只会走一次写库）。
+        if edits.hasWork || editSubmitAfterCompression {
+            var redirect: [Int: Int] = [:]
+            for record in combined.records where record.newPK > 0 {
+                redirect[record.originalPK] = record.newPK
+            }
+            editSubmitAfterCompression = false
+            await submitEdits(redirect: redirect)
+        }
+
         if combined.failures.isEmpty, !combined.records.isEmpty {
             flash(ptpBack
                   ? "压缩完成 \(combined.records.count) 张，原图已标记到回收站"
@@ -826,7 +1077,7 @@ final class AppStore {
         guard !originals.isEmpty else { return }
         // 原图进回收站 → 它不再是「待压缩」，从压缩站名单里撤掉（两者互斥）
         compression.remove(ids: originals.map(\.id))
-        trash.add(originals, deviceID: device?.id ?? "unknown")
+        trash.add(originals, deviceID: device?.id ?? "unknown", reason: .compressed)
         clearSelection()
         flash("已压缩 \(result.records.count) 张，原图已标记到回收站")
     }
@@ -877,7 +1128,45 @@ final class AppStore {
         // 回来之后 `onCatalog` 覆盖 `assets`，手机上新拍/已删的这时才对得上。
         ptp.refreshCatalog()
 
+        // 目录一条都没有（多半是写完库/重启相册服务把会话弄丢了）：后台自动重建通道，
+        // 成功了列表会自己回来，失败就由 30 秒闸门收尾并给出可操作的原因。
+        if assets.isEmpty {
+            Task { [weak self] in
+                guard let self else { return }
+                if await self.retryCatalogAfterChannelLoss() {
+                    self.errorText = nil
+                    self.catalogDone = true
+                    self.recomputeProgress()
+                    self.maybeFinishScan()
+                }
+            }
+        }
+
         scheduleScanDeadline()
+    }
+
+    /// 库读到了、照片目录却一条都没有：**重建一次 IC 通道**再等一轮。
+    ///
+    /// `ICDeviceBrowser` 是一次性的（见经验文档 8.10）：重启相册服务 / 锁屏之后 `camera`
+    /// 可能已经是 nil，这时 `refreshCatalog()` 里的 `guard let camera` 直接返回，等于什么都没做
+    /// ——「点重新读取没用」就是这么来的。只有换新浏览器实例（`cameraOrReconnect`）能救。
+    @discardableResult
+    private func retryCatalogAfterChannelLoss(wait: TimeInterval = 10) async -> Bool {
+        guard let index = libraryIndex, !index.isEmpty else { return false }
+        guard assets.isEmpty else { return true }
+        Self.debugLog("[scan] 库 \(index.metaByFile.count) 条但照片目录为空，重建 IC 通道")
+        let camera = await ptp.cameraOrReconnect(timeout: 15)
+        guard camera != nil else {
+            Self.debugLog("[scan] 重建通道失败：camera 还是 nil")
+            return false
+        }
+        ptp.refreshCatalog()
+        let deadline = Date().addingTimeInterval(wait)
+        while Date() < deadline {
+            if !assets.isEmpty { return true }
+            try? await Task.sleep(nanoseconds: 150_000_000)
+        }
+        return !assets.isEmpty
     }
 
     /// 扫描的**最后一道时间闸**：超时就收尾，绝不让界面永远转圈。
@@ -1316,6 +1605,11 @@ final class AppStore {
     /// 没准备好就别出数字：`数学上算得出来`不等于`数字是对的` —— 没有库时
     /// 「应用与数据」是拿「已用 − 媒体 − 系统 − 回收站」反推的，媒体按 PTP 的部分
     /// 资产算，视频一小、应用与数据就虚高一大截，看着就是「数据都不对」。
+    /// 照片列表是不是「从相册库兜底」来的（PTP 通道断了）
+    var usingLibraryFallback: Bool {
+        assets.isEmpty && !(libraryIndex?.metaByFile.isEmpty ?? true)
+    }
+
     var mediaBytesReady: Bool {
         guard let index = libraryIndex else { return false }
         return !index.isEmpty
@@ -1675,6 +1969,19 @@ final class AppStore {
             }
         }
         var result = assets
+        // **PTP 通道没了就用库里的条目顶上**（2026-11 用户现场：写完库之后
+        // 「全部照片 / 照片 / 视频」整屏空，而相机/相簿/收藏全正常 —— 那三页走的是 PTP 列表）。
+        // 只在这三页兜底，而且只在 `assets` 真的是空的时候；正常有 PTP 列表时一行都不影响。
+        // 排除隐藏和最近删除：PTP 本来就不列它们，兜底也不能把它们混进「全部照片」。
+        if result.isEmpty, let index = libraryIndex, !index.isEmpty,
+           albumFilter == nil,
+           libraryFilter == .all || libraryFilter == .photos || libraryFilter == .videos {
+            result = index.shadowAssets.filter { shadow in
+                guard let meta = index.meta(for: shadow.fileName) else { return false }
+                return !meta.isHidden && !meta.isTrashed
+            }
+            Self.debugLog("[scan] PTP 列表为空，用库里的 \(result.count) 条兜底显示")
+        }
         if libraryFilter != .all {
             result = result.filter { matches($0, filter: libraryFilter) }
         }
@@ -2133,6 +2440,11 @@ final class AppStore {
     /// 3. 底栏再留一句短的，弹窗关了也看得到。
     private func purge(_ entries: [TrashStore.Entry]) async {
         guard !entries.isEmpty, !isPurging else { return }
+        // 正在写库（整份覆盖中）：这时候动删除会把设备堵死，直接拒绝，让用户等一下
+        if editSubmitting {
+            flash("正在写回修改，等它结束再删")
+            return
+        }
         isPurging = true
         purgeReport = nil
         purgeProgress = PurgeProgress(
@@ -2157,6 +2469,7 @@ final class AppStore {
         assets.removeAll { removed.contains($0.id) }
         convertedAssets.removeAll { removed.contains($0.id) }
         compression.remove(ids: removed)
+        edits.remove(removed)
         invalidateCounts()
         thumbnails = thumbnails.filter { !removed.contains($0.key) }
 
@@ -2913,11 +3226,32 @@ final class AppStore {
             }
         }
 
+        // 写回修改期间同样盖死键盘：整份库在覆盖，这时候按键只会把状态搞乱。
+        if editSubmitting { return true }
+        // 结果单：Esc 关掉，⏎ 交给「关闭」按钮
+        if editReport != nil {
+            if event.keyCode == 53 {
+                dismissEditReport()
+                return true
+            }
+            switch event.keyCode {
+            case 36, 76: return false
+            default: return true
+            }
+        }
+
         let shift = event.modifierFlags.contains(.shift)
         let command = event.modifierFlags.contains(.command)
         let chars = event.charactersIgnoringModifiers?.lowercased() ?? ""
 
-        if command, chars == "a" { selectAll(); return true }
+        // 带 ⌘ 的组合键：⌘A 自己接（全选），其余一律放行给菜单 ——
+        // 本地监听器是**最先**看到事件的，这里吞掉就等于把菜单快捷键全废了
+        // （⌘R 刷新、⌘+ / ⌘- 缩略图大小、⌘1 / ⌘2 视图…）。
+        // 顺带也拦住了"预览里 ⌘- 被当成标记压缩"这种误解。
+        if command {
+            if chars == "a" { selectAll(); return true }
+            return false
+        }
 
         // 预览开着：只认预览那几个键，别的都不管
         if previewID != nil {
@@ -3022,4 +3356,18 @@ extension AppStore {
         default: return parts.first.map { "\($0)年" } ?? key
         }
     }
+}
+
+/// 一次「写回手机」的结果：改了多少、花多久、有没有失败。
+/// 弹一次就够，不逐条列（改库是一整批成功/失败，不像删除那样一条条回来）。
+struct EditReport: Identifiable, Equatable {
+    let id = UUID()
+    let createdAlbums: Int
+    let moved: Int
+    let favorited: Int
+    let seconds: TimeInterval
+    let daemonRestarted: Bool
+    let failure: String?
+    /// 写完之后 PTP 通道有没有回来（没回来 = 删除/新拍识别要等拔插线）
+    var ptpBack = true
 }

@@ -365,6 +365,14 @@ enum Probe {
             probeDbWrite()
             return
         }
+        if CommandLine.arguments.contains("--probe-edit") {
+            probeEdit()
+            return
+        }
+        if CommandLine.arguments.contains("--probe-edit-check") {
+            probeEditCheck()
+            return
+        }
         if CommandLine.arguments.contains("--probe-reboot") {
             probeReboot()
             return
@@ -1767,6 +1775,514 @@ enum Probe {
             exit(1)
         }
         exit(0)
+    }
+
+    /// 把 `/tmp/cmi-edit-backup/Photos.sqlite` 写回手机（`--probe-edit --restore`）。
+    /// 只在「写回之后手机上不对劲」时用：备份是改库前那一刻的原库。
+    private static func restoreEditBackup() {
+        let backup = URL(fileURLWithPath: "/tmp/cmi-edit-backup/Photos.sqlite")
+        guard let data = try? Data(contentsOf: backup), !data.isEmpty else {
+            say("找不到备份：\(backup.path)（重启过电脑的话 /tmp 已经被清了）")
+            exit(1)
+        }
+        do {
+            let api = try MobileDeviceAPI.shared()
+            let device = try api.firstDevice(timeout: 10)
+            try api.openSession(device)
+            let afc = try api.openAFC(device)
+            let info = api.info(device)
+            say("还原：\(ByteCountFormatter.string(fromByteCount: Int64(data.count), countStyle: .file))")
+            let temp = "/PhotoData/Photos.sqlite.new"
+            try? api.removePath(afc, path: temp)
+            let written = try api.writeFile(afc, path: temp, data: data)
+            guard written == Int64(data.count) else {
+                say("写入字节数不对：\(written) / \(data.count)")
+                api.closeAFC(afc); api.stopSession(device)
+                exit(1)
+            }
+            try api.renamePath(afc, from: temp, to: "/PhotoData/Photos.sqlite")
+            try? api.removePath(afc, path: "/PhotoData/Photos.sqlite-wal")
+            try? api.removePath(afc, path: "/PhotoData/Photos.sqlite-shm")
+            api.closeAFC(afc); api.stopSession(device)
+            try? PhotoDaemon.restartLibrary(udid: info.identifier)
+            say("已还原到备份，相册服务已重启")
+            say("⚠️ 还原会丢掉备份之后新拍的照片行。确认没问题后删掉备份：rm -rf /tmp/cmi-edit-backup")
+        } catch {
+            say("还原失败：\(error.localizedDescription)")
+            exit(1)
+        }
+        exit(0)
+    }
+
+    /// 元数据编辑探针：**收藏 + 新建相簿 + 移动** 三件事一次验完。
+    ///
+    /// 默认只改本地副本（打印改完的样子），**不写回设备**；加 `--apply` 才真写回并重启相册服务。
+    /// 参数：
+    ///   `--file IMG_1234.HEIC`  目标资产（默认取库里第一条普通照片）
+    ///   `--create 名字`          新建相簿名（默认 `cmi测试`）
+    ///   `--album 源相簿名`       从哪个相簿移出（可省；省了就是"加入"）
+    ///   `--apply`               写回手机
+    private static func probeEdit() {
+        func argument(_ name: String) -> String? {
+            guard let index = CommandLine.arguments.firstIndex(of: name),
+                  index + 1 < CommandLine.arguments.count else { return nil }
+            return CommandLine.arguments[index + 1]
+        }
+        let wantedFile = argument("--file")
+        let createTitle = argument("--create") ?? "cmi测试"
+        let sourceTitle = argument("--album")
+        let apply = CommandLine.arguments.contains("--apply")
+        let restore = CommandLine.arguments.contains("--restore")
+
+        if restore {
+            restoreEditBackup()
+            return
+        }
+
+        say("元数据编辑探针：\(apply ? "会写回设备" : "只改本地副本")")
+
+        do {
+            let api = try MobileDeviceAPI.shared()
+            let device = try api.firstDevice(timeout: 10)
+            try api.openSession(device)
+            let afc = try api.openAFC(device)
+            let info = api.info(device)
+            let dir = URL(fileURLWithPath: "/tmp/cmi-edit")
+            try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+            for name in ["Photos.sqlite", "Photos.sqlite-wal", "Photos.sqlite-shm"] {
+                let remote = "/PhotoData/" + name
+                let expected = api.entrySize(afc, path: remote)
+                guard expected > 0 else { continue }
+                let local = dir.appendingPathComponent(name)
+                let bytes = try api.downloadFile(afc, path: remote, to: local, expected: expected)
+                say("\(name)：\(ByteCountFormatter.string(fromByteCount: bytes, countStyle: .file))")
+            }
+            let dbPath = dir.appendingPathComponent("Photos.sqlite").path
+
+            // 真写之前留一份原库：这台手机的照片库是用户唯一的，出问题要能退回。
+            if apply {
+                let backup = URL(fileURLWithPath: "/tmp/cmi-edit-backup")
+                try? FileManager.default.removeItem(at: backup)
+                try? FileManager.default.createDirectory(at: backup, withIntermediateDirectories: true)
+                for name in ["Photos.sqlite", "Photos.sqlite-wal", "Photos.sqlite-shm"] {
+                    let source = dir.appendingPathComponent(name)
+                    guard FileManager.default.fileExists(atPath: source.path) else { continue }
+                    try? FileManager.default.copyItem(at: source, to: backup.appendingPathComponent(name))
+                }
+                say("原库已备份到 /tmp/cmi-edit-backup/")
+                say("要退回：同一条命令加 --restore（重启前有效）")
+            }
+
+            guard let index = PhotoLibraryIndex.load(dbPath: dbPath) else {
+                say("库读不出来（quick_check 没过）")
+                api.closeAFC(afc); api.stopSession(device)
+                exit(1)
+            }
+            say("库：\(index.metaByFile.count) 条资产 / \(index.albums.count) 个相簿")
+
+            // 表结构自检：新建相簿要动 `ZGENERICALBUM` 和 `Z_PRIMARYKEY`，
+            // 这两张表的真实长相必须打出来（`Z_PRIMARYKEY.Z_NAME` 到底有没有、叫什么）。
+            if let db = SQLiteDB(path: dbPath) {
+                say("Z_PRIMARYKEY 列：\(db.columns(of: "Z_PRIMARYKEY").joined(separator: ", "))")
+                for row in db.rows("SELECT * FROM Z_PRIMARYKEY ORDER BY Z_ENT") {
+                    say("  ent=\(row.int("Z_ENT"))"
+                        + "  name=\(row.string("Z_NAME") ?? "—")"
+                        + "  super=\(row.int("Z_SUPER"))"
+                        + "  max=\(row.int("Z_MAX"))")
+                }
+                for table in ["ZGENERICALBUM"] {
+                    let ddl = db.rows("SELECT sql FROM sqlite_master WHERE type='table' AND name='\(table)'")
+                        .first?.string("sql") ?? "—"
+                    say("\(table) DDL：\(ddl)")
+                }
+                for row in db.rows("SELECT ZKIND, COUNT(*) AS c FROM ZGENERICALBUM GROUP BY ZKIND ORDER BY c DESC") {
+                    say("  相簿 ZKIND=\(row.int("ZKIND")) 有 \(row.int("c")) 个")
+                }
+                if let sample = db.rows("""
+                    SELECT Z_PK, ZTITLE, ZKIND, ZCACHEDCOUNT, Z_OPT,
+                           typeof(ZUUID) AS UUIDTYPE, ZCREATIONDATE
+                    FROM ZGENERICALBUM
+                    WHERE ZKIND = 2 AND ZTITLE IS NOT NULL AND TRIM(ZTITLE) <> ''
+                    ORDER BY Z_PK LIMIT 1
+                    """).first {
+                    say("  样本相簿：pk=\(sample.int("Z_PK"))「\(sample.string("ZTITLE") ?? "—")」"
+                        + " kind=\(sample.int("ZKIND")) count=\(sample.int("ZCACHEDCOUNT"))"
+                        + " ZUUID 类型=\(sample.string("UUIDTYPE") ?? "—")"
+                        + " 创建=\(sample.double("ZCREATIONDATE"))")
+                }
+                if let join = try? PhotosDBEdit.joinTable(db) {
+                    let ddl = db.rows("SELECT sql FROM sqlite_master WHERE type='table' AND name='\(join.name)'")
+                        .first?.string("sql") ?? "—"
+                    say("关联表 \(join.name)（\(join.albumColumn) / \(join.assetColumn)）：\(ddl)")
+                }
+            }
+
+            let target: PhotoLibraryIndex.Meta
+            if let wantedFile, let hit = index.meta(for: wantedFile) {
+                target = hit
+            } else if let first = index.metaByFile.values
+                .filter({ !$0.isVideo && !$0.isTrashed && $0.pk > 0 })
+                .min(by: { $0.pk < $1.pk }) {
+                target = first
+                if wantedFile != nil { say("没找到 \(wantedFile!)，改用 \(first.fileName)") }
+            } else {
+                say("库里没有可用的照片")
+                api.closeAFC(afc); api.stopSession(device)
+                exit(1)
+            }
+            say("目标：\(target.fileName)（pk \(target.pk)，\(target.directory)）当前收藏 = \(target.isFavorite)")
+
+            // `--cleanup`：把前面几次验证留下的痕迹清掉 —— 测试相簿、加进 CapCut 的那张、以及翻转过的收藏位。
+            if CommandLine.arguments.contains("--cleanup") {
+                var ops: [PhotosDBEdit.Op] = []
+                for album in index.albums where album.title.hasPrefix("cmi") {
+                    say("删测试相簿「\(album.title)」(pk \(album.id)，\(album.count) 张)")
+                    ops.append(.deleteAlbum(pk: album.id))
+                }
+                if let capcut = index.albums.first(where: { $0.title == "CapCut" }) {
+                    say("把这张从「CapCut」里拿掉（恢复成空相簿）")
+                    ops.append(.membership(assetPK: target.pk, album: .existing(capcut.id), present: false))
+                }
+                ops.append(.favorite(pk: target.pk, value: false))
+                let (edited, result) = try PhotosDBEdit.apply(dbPath: dbPath, workDir: dir, ops: ops)
+                say("清理：删相簿 \(result.deletedAlbums.count) 本 · 成员 \(result.memberships) 处")
+                if let check = SQLiteDB(path: edited) {
+                    let left = check.rows("""
+                        SELECT COUNT(*) AS c FROM ZGENERICALBUM WHERE ZTITLE LIKE 'cmi%'
+                        """).first?.int("c") ?? -1
+                    say("  库里剩下的 cmi 相簿：\(left)")
+                    let fav = check.rows("SELECT ZFAVORITE AS c FROM ZASSET WHERE Z_PK=\(target.pk)")
+                        .first?.int("c") ?? -1
+                    say("  \(target.fileName) 的 ZFAVORITE = \(fav)")
+                }
+                guard apply else {
+                    say("只改了本地副本，没写回设备。加 --apply 才真清。")
+                    api.closeAFC(afc); api.stopSession(device)
+                    exit(0)
+                }
+                try writeBackEdit(api: api, afc: afc, path: edited, udid: info.identifier)
+                say("已清理并写回；去手机上看那两个测试相簿是不是没了")
+                try? FileManager.default.removeItem(at: dir)
+                exit(0)
+            }
+
+            // `--conform`：一次验两件事 ——
+            // ① 往「早就存在的空相簿」里加一张（隔离出「成员关系写法」对不对）
+            // ② 用「照正常用户相簿改过的行」新建一本再加一张（隔离出「新建相簿那一行」对不对）
+            if CommandLine.arguments.contains("--conform") {
+                let conformTitle = argument("--create") ?? "cmi测试2"
+                var ops: [PhotosDBEdit.Op] = [
+                    .createAlbum(tempID: -2, title: conformTitle),
+                    .membership(assetPK: target.pk, album: .created(-2), present: true)
+                ]
+                let existing = index.albums.first { $0.title == "CapCut" }
+                    ?? index.albums.first { $0.kind == 2 && $0.count == 0 }
+                if let existing {
+                    say("同时把这张加进已有空相簿「\(existing.title)」(pk \(existing.id))")
+                    ops.append(.membership(assetPK: target.pk, album: .existing(existing.id), present: true))
+                } else {
+                    say("库里没有「已有空相簿」，只验新建那本")
+                }
+                let (edited, result) = try PhotosDBEdit.apply(dbPath: dbPath, workDir: dir, ops: ops)
+                say("改完：新建 \(result.createdAlbums[-2] ?? 0) · 成员 \(result.memberships) 处")
+                if let check = SQLiteDB(path: edited) {
+                    for row in check.rows("""
+                        SELECT Z_PK, ZTITLE, ZCACHEDCOUNT, ZCUSTOMSORTKEY, Z_OPT, ZSTARTDATE, ZENDDATE
+                        FROM ZGENERICALBUM WHERE Z_PK = \(result.createdAlbums[-2] ?? -1)
+                        """) {
+                        say("  新相簿：pk=\(row.int("Z_PK"))「\(row.string("ZTITLE") ?? "—")」"
+                            + " count=\(row.int("ZCACHEDCOUNT")) sortKey=\(row.int("ZCUSTOMSORTKEY"))"
+                            + " opt=\(row.int("Z_OPT")) 起=\(row.double("ZSTARTDATE")) 止=\(row.double("ZENDDATE"))")
+                    }
+                    if let join = try? PhotosDBEdit.joinTable(check) {
+                        for row in check.rows("""
+                            SELECT \(join.albumColumn) AS a, \(join.assetColumn) AS s, Z_FOK_3ASSETS AS f
+                            FROM "\(join.name)" WHERE \(join.assetColumn) = \(target.pk)
+                            """) {
+                            say("  成员：相簿 \(row.int("a")) · 资产 \(row.int("s")) · FOK=\(row.int("f"))")
+                        }
+                    }
+                }
+                guard apply else {
+                    say("只改了本地副本（\(edited)），没写回设备。加 --apply 才真写。")
+                    api.closeAFC(afc); api.stopSession(device)
+                    exit(0)
+                }
+                try writeBackEdit(api: api, afc: afc, path: edited, udid: info.identifier)
+                say("去手机上看两件事：")
+                say("  ① 「CapCut」相簿里有没有这张照片（验成员写法）")
+                say("  ② 新相簿「\(conformTitle)」里有没有这张照片（验新建那行）")
+                try? FileManager.default.removeItem(at: dir)
+                exit(0)
+            }
+
+            var ops: [PhotosDBEdit.Op] = [
+                .createAlbum(tempID: -1, title: createTitle),
+                .favorite(pk: target.pk, value: !target.isFavorite),
+                .membership(assetPK: target.pk, album: .created(-1), present: true)
+            ]
+            if let sourceTitle, let source = index.albums.first(where: { $0.title == sourceTitle }) {
+                say("从相簿「\(sourceTitle)」(\(source.id)，\(source.count) 张) 移出")
+                ops.append(.membership(assetPK: target.pk, album: .existing(source.id), present: false))
+            } else if sourceTitle != nil {
+                say("警告：库里没有叫「\(sourceTitle!)」的相簿，只做加入")
+            }
+
+            let (edited, result) = try PhotosDBEdit.apply(dbPath: dbPath, workDir: dir, ops: ops)
+            say("改完：新建相簿 \(result.createdAlbums.values.map(String.init).joined(separator: ", "))"
+                + " · 收藏 \(result.favorites) 处 · 成员 \(result.memberships) 处")
+            if !result.missingAssets.isEmpty {
+                say("跳过（资产不在了）：\(result.missingAssets)")
+            }
+
+            if let check = SQLiteDB(path: edited) {
+                for row in check.rows("""
+                    SELECT Z_PK, ZTITLE, ZKIND, ZCACHEDCOUNT FROM ZGENERICALBUM
+                    ORDER BY Z_PK DESC LIMIT 4
+                    """) {
+                    say("  相簿 pk=\(row.int("Z_PK"))  「\(row.string("ZTITLE") ?? "—")」"
+                        + "  kind=\(row.int("ZKIND"))  count=\(row.int("ZCACHEDCOUNT"))")
+                }
+                let fav = check.rows("SELECT ZFAVORITE AS c FROM ZASSET WHERE Z_PK=\(target.pk)")
+                    .first?.int("c") ?? -1
+                say("  \(target.fileName) 的 ZFAVORITE = \(fav)")
+                if let join = try? PhotosDBEdit.joinTable(check),
+                   let newPK = result.createdAlbums[-1] {
+                    let members = check.rows("""
+                        SELECT \(join.assetColumn) AS c FROM \(join.name)
+                        WHERE \(join.albumColumn) = \(newPK)
+                        """)
+                    say("  新相簿成员表（\(join.name)）里有 \(members.count) 行")
+                }
+                say("  quick_check：\(check.quickCheck() ? "ok" : "失败")")
+            }
+
+            guard apply else {
+                say("没有写回设备。确认上面的结果对，再加 --apply 跑一次就真写。")
+                api.closeAFC(afc); api.stopSession(device)
+                try? FileManager.default.removeItem(at: dir)
+                exit(0)
+            }
+
+            let data = try Data(contentsOf: URL(fileURLWithPath: edited))
+            say("写回：\(ByteCountFormatter.string(fromByteCount: Int64(data.count), countStyle: .file))")
+            let temp = "/PhotoData/Photos.sqlite.new"
+            try? api.removePath(afc, path: temp)
+            let written = try api.writeFile(afc, path: temp, data: data)
+            guard written == Int64(data.count) else {
+                say("写入字节数不对：\(written) / \(data.count)")
+                api.closeAFC(afc); api.stopSession(device)
+                exit(1)
+            }
+            try api.renamePath(afc, from: temp, to: "/PhotoData/Photos.sqlite")
+            try? api.removePath(afc, path: "/PhotoData/Photos.sqlite-wal")
+            try? api.removePath(afc, path: "/PhotoData/Photos.sqlite-shm")
+            say("已替换 Photos.sqlite（旧 WAL/SHM 已清）")
+            api.closeAFC(afc); api.stopSession(device)
+
+            do {
+                try PhotoDaemon.restartLibrary(udid: info.identifier)
+                say("相册服务已重启")
+            } catch {
+                say("重启相册失败：\(error.localizedDescription)（重启 iPhone 后生效）")
+            }
+            say("去手机上确认三件事：① 相簿里多出「\(createTitle)」"
+                + "② 这张照片在它里面 ③ 这张照片的爱心状态翻转了")
+            try? FileManager.default.removeItem(at: dir)
+        } catch {
+            say("失败：\(error.localizedDescription)")
+            exit(1)
+        }
+        exit(0)
+    }
+
+    /// 写回之后「相簿有了、里面是空的」时用：把设备上**现在的**库读回来，
+    /// 对比「新建相簿那一行 / 成员关联行 / 收藏位」到底留下了什么、被改回什么。
+    private static func probeEditCheck() {
+        func argument(_ name: String) -> String? {
+            guard let index = CommandLine.arguments.firstIndex(of: name),
+                  index + 1 < CommandLine.arguments.count else { return nil }
+            return CommandLine.arguments[index + 1]
+        }
+        let title = argument("--create") ?? "cmi测试"
+        let file = argument("--file") ?? "IMG_0017.JPG"
+        do {
+            let api = try MobileDeviceAPI.shared()
+            let device = try api.firstDevice(timeout: 10)
+            try api.openSession(device)
+            let afc = try api.openAFC(device)
+            let dir = URL(fileURLWithPath: "/tmp/cmi-edit-check")
+            try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+            for name in ["Photos.sqlite", "Photos.sqlite-wal", "Photos.sqlite-shm"] {
+                let remote = "/PhotoData/" + name
+                let expected = api.entrySize(afc, path: remote)
+                guard expected > 0 else { continue }
+                _ = try api.downloadFile(afc, path: remote,
+                                         to: dir.appendingPathComponent(name), expected: expected)
+            }
+            api.closeAFC(afc); api.stopSession(device)
+
+            let dbPath = dir.appendingPathComponent("Photos.sqlite").path
+            guard let db = SQLiteDB(path: dbPath) else { say("库打不开"); exit(1) }
+
+            say("关联表候选（`Z_%ASSETS`）：")
+            for table in db.tables(matching: "Z_%ASSETS") {
+                let count = db.rows("SELECT COUNT(*) AS c FROM \"\(table)\"").first?.int("c") ?? 0
+                say("  \(table) 行数 \(count) · 列 \(db.columns(of: table).joined(separator: ", "))")
+            }
+
+            say("最近 8 个相簿：")
+            let recent = db.rows("""
+                SELECT Z_PK, Z_ENT, ZTITLE, ZKIND, ZCACHEDCOUNT, ZCACHEDPHOTOSCOUNT, ZCACHEDVIDEOSCOUNT,
+                       ZTRASHEDSTATE, ZCLOUDLOCALSTATE, ZCLOUDDELETESTATE, Z_OPT, ZCREATIONDATE
+                FROM ZGENERICALBUM ORDER BY Z_PK DESC LIMIT 8
+                """)
+            for a in recent {
+                say("  pk=\(a.int("Z_PK")) ent=\(a.int("Z_ENT"))「\(a.string("ZTITLE") ?? "—")」"
+                    + " kind=\(a.int("ZKIND")) cached=\(a.int("ZCACHEDCOUNT"))"
+                    + " 照片=\(a.int("ZCACHEDPHOTOSCOUNT")) 视频=\(a.int("ZCACHEDVIDEOSCOUNT"))"
+                    + " trashed=\(a.int("ZTRASHEDSTATE")) cloudLocal=\(a.int("ZCLOUDLOCALSTATE"))"
+                    + " cloudDel=\(a.int("ZCLOUDDELETESTATE")) opt=\(a.int("Z_OPT"))")
+            }
+
+            let our = db.rows("SELECT Z_PK FROM ZGENERICALBUM WHERE ZTITLE = \(quoteSQL(title)) ORDER BY Z_PK DESC")
+            say("叫「\(title)」的相簿：\(our.map { String($0.int("Z_PK")) }.joined(separator: ", "))")
+            if let join = try? PhotosDBEdit.joinTable(db) {
+                for album in our {
+                    let id = album.int("Z_PK")
+                    let rows = db.rows("""
+                        SELECT * FROM "\(join.name)" WHERE \(join.albumColumn) = \(id) LIMIT 5
+                        """)
+                    say("  pk=\(id) 在 \(join.name) 里有 \(rows.count) 行")
+                    for row in rows { say("    \(dumpRow(db, table: join.name, row: row))") }
+                }
+                // 拿一个正常相簿对照：它的成员行长什么样
+                if let normal = db.rows("""
+                    SELECT Z_PK, ZTITLE FROM ZGENERICALBUM
+                    WHERE ZKIND = 2 AND ZTITLE IS NOT NULL AND ZTITLE <> \(quoteSQL(title))
+                    ORDER BY ZCACHEDCOUNT DESC LIMIT 1
+                    """).first {
+                    let id = normal.int("Z_PK")
+                    say("对照相簿「\(normal.string("ZTITLE") ?? "—")」pk=\(id)：")
+                    for row in db.rows("SELECT * FROM \"\(join.name)\" WHERE \(join.albumColumn) = \(id) LIMIT 3") {
+                        say("    \(dumpRow(db, table: join.name, row: row))")
+                    }
+                }
+
+                // 目标照片到底在哪些相簿里（确认我们只动了自己那一个）
+                say("照片 \(file) 出现在这些相簿里：")
+                for row in db.rows("""
+                    SELECT j.\(join.albumColumn) AS a, j.Z_FOK_3ASSETS AS f, g.ZTITLE AS t
+                    FROM "\(join.name)" j LEFT JOIN ZGENERICALBUM g ON g.Z_PK = j.\(join.albumColumn)
+                    WHERE j.\(join.assetColumn) = (
+                        SELECT Z_PK FROM ZASSET WHERE ZFILENAME = \(quoteSQL(file)) LIMIT 1
+                    )
+                    """) {
+                    say("    相簿 \(row.int("a"))「\(row.string("t") ?? "—")」 Z_FOK=\(row.int("f"))")
+                }
+            }
+
+            // 触发器：`ZGENERICALBUM` / `Z_33ASSETS` 上如果有维护别的东西的触发器，
+            // 我们「摘掉 → 插入 → 装回」就不算数了（装回时不会补跑）。
+            say("相关触发器：")
+            for row in db.rows("""
+                SELECT name, tbl_name, sql FROM sqlite_master
+                WHERE type = 'trigger'
+                  AND tbl_name IN ('ZGENERICALBUM', 'Z_33ASSETS', 'Z_32KEYASSETS', 'ZASSET')
+                LIMIT 10
+                """) {
+                say("  \(row.string("tbl_name") ?? "?") · \(row.string("name") ?? "?")")
+                say("    \(row.string("sql") ?? "—")")
+            }
+
+            // 整行对比：我们新建的 vs 一个正常用户相簿，逐列看差在哪儿
+            for name in [title, "滑蛋牛肉饭"] {
+                guard let row = db.rows("""
+                    SELECT * FROM ZGENERICALBUM WHERE ZTITLE = \(quoteSQL(name)) ORDER BY Z_PK DESC
+                    """).first else { continue }
+                say("整行「\(name)」：")
+                say("  \(dumpRow(db, table: "ZGENERICALBUM", row: row))")
+            }
+
+            // 封面/关键资产：相簿列表里的那张缩略图，看看正常相簿有没有、我们有没有
+            for table in db.tables(matching: "Z_%KEYASSETS") {
+                say("\(table)（封面）里我们的相簿：")
+                let cols = db.columns(of: table)
+                guard let albumCol = cols.first(where: { $0.hasSuffix("ALBUMSBEINGKEYASSETS") }) else { continue }
+                for row in db.rows("""
+                    SELECT * FROM "\(table)" WHERE \(albumCol) IN (
+                        SELECT Z_PK FROM ZGENERICALBUM WHERE ZTITLE IN (\(quoteSQL(title)), '滑蛋牛肉饭')
+                    ) LIMIT 6
+                    """) {
+                    say("    \(dumpRow(db, table: table, row: row))")
+                }
+            }
+
+            say("照片 \(file) 的收藏位：")
+            for row in db.rows("""
+                SELECT Z_PK, ZFAVORITE, ZTRASHEDSTATE, ZHIDDEN FROM ZASSET
+                WHERE ZFILENAME = \(quoteSQL(file))
+                """) {
+                say("  pk=\(row.int("Z_PK")) ZFAVORITE=\(row.int("ZFAVORITE"))"
+                    + " trashed=\(row.int("ZTRASHEDSTATE")) hidden=\(row.int("ZHIDDEN"))")
+            }
+
+            for table in ["ZALBUMLIST", "Z_2ALBUMS", "Z_2ASSETS"] where db.tables(matching: table).contains(table) {
+                say("\(table)：")
+                for row in db.rows("SELECT * FROM \"\(table)\" LIMIT 8") {
+                    say("    \(dumpRow(db, table: table, row: row))")
+                }
+            }
+
+            say("这个库里的相簿总数：\(db.rows("SELECT COUNT(*) AS c FROM ZGENERICALBUM").first?.int("c") ?? 0)")
+            try? FileManager.default.removeItem(at: dir)
+        } catch {
+            say("失败：\(error.localizedDescription)")
+            exit(1)
+        }
+        exit(0)
+    }
+
+    /// 把改好的库写回设备，并让相册服务重读（`--probe-edit` 和 `--conform` 共用）。
+    private static func writeBackEdit(api: MobileDeviceAPI,
+                                      afc: UnsafeMutableRawPointer,
+                                      path: String,
+                                      udid: String) throws {
+        let data = try Data(contentsOf: URL(fileURLWithPath: path))
+        say("写回：\(ByteCountFormatter.string(fromByteCount: Int64(data.count), countStyle: .file))")
+        let temp = "/PhotoData/Photos.sqlite.new"
+        try? api.removePath(afc, path: temp)
+        let written = try api.writeFile(afc, path: temp, data: data)
+        guard written == Int64(data.count) else {
+            throw NSError(domain: "cmi.edit", code: 4, userInfo: [
+                NSLocalizedDescriptionKey: "写入字节数不对：\(written) / \(data.count)"
+            ])
+        }
+        try api.renamePath(afc, from: temp, to: "/PhotoData/Photos.sqlite")
+        try? api.removePath(afc, path: "/PhotoData/Photos.sqlite-wal")
+        try? api.removePath(afc, path: "/PhotoData/Photos.sqlite-shm")
+        say("已替换 Photos.sqlite（旧 WAL/SHM 已清）")
+        do {
+            try PhotoDaemon.restartLibrary(udid: udid)
+            say("相册服务已重启")
+        } catch {
+            say("重启相册失败：\(error.localizedDescription)（重启 iPhone 后生效）")
+        }
+    }
+
+    private static func quoteSQL(_ value: String) -> String {        "'" + value.replacingOccurrences(of: "'", with: "''") + "'"
+    }
+
+    /// 探针用：不管列是什么类型，都尽力打成一个字符串。
+    private static func dumpRow(_ db: SQLiteDB, table: String, row: SQLiteDB.Row) -> String {
+        db.columns(of: table).map { column in
+            if let text = row.string(column) { return "\(column)=\(text)" }
+            let number = row.int64(column)
+            if number != 0 { return "\(column)=\(number)" }
+            let real = row.double(column)
+            if real != 0 { return "\(column)=\(real)" }
+            return "\(column)=0"
+        }.joined(separator: "  ")
     }
 
     /// 把改好的 Photos.sqlite 写回手机：先写 .new，再原子替换，最后清掉旧 WAL/SHM。

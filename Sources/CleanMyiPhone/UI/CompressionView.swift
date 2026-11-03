@@ -83,6 +83,11 @@ struct CompressionView: View {
                 .labelsHidden()
                 .frame(width: 68)
                 .help("缩略图视图 / 列表视图")
+
+                // 格子大小可调（和照片页、回收站同一个值）
+                if mode == .grid {
+                    ThumbSizeSlider()
+                }
             }
         }
     }
@@ -148,7 +153,8 @@ struct CompressionView: View {
 
     private var grid: some View {
         ScrollView {
-            LazyVGrid(columns: [GridItem(.adaptive(minimum: 104), spacing: 8)], spacing: 8) {
+            // 和照片页 / 回收站共用同一个格子宽度（`store.thumbCell`）
+            LazyVGrid(columns: [GridItem(.adaptive(minimum: store.thumbCell), spacing: 8)], spacing: 8) {
                 ForEach(shown) { entry in
                     cell(entry)
                 }
@@ -210,27 +216,28 @@ struct CompressionView: View {
                         .foregroundStyle(.tertiary)
                 }
             }
-            .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+            .clipShape(RoundedRectangle(cornerRadius: 8 * store.thumbScale, style: .continuous))
             .overlay {
-                RoundedRectangle(cornerRadius: 8, style: .continuous)
-                    .strokeBorder(selected ? Color.accentColor : Color.clear, lineWidth: 3)
+                RoundedRectangle(cornerRadius: 8 * store.thumbScale, style: .continuous)
+                    .strokeBorder(selected ? Color.accentColor : Color.clear,
+                                  lineWidth: 3 * store.thumbScale)
             }
             .overlay(alignment: .bottomLeading) {
                 Text(ByteCountFormatter.string(fromByteCount: entry.asset.byteSize, countStyle: .file))
-                    .font(.system(size: 9, weight: .semibold))
-                    .padding(.horizontal, 4)
-                    .padding(.vertical, 1)
+                    .font(.system(size: 9 * store.thumbScale, weight: .semibold))
+                    .padding(.horizontal, 4 * store.thumbScale)
+                    .padding(.vertical, 1 * store.thumbScale)
                     .background(Capsule().fill(.black.opacity(0.55)))
                     .foregroundStyle(.white)
-                    .padding(6)
+                    .padding(6 * store.thumbScale)
             }
             .overlay(alignment: .topTrailing) {
                 Image(systemName: "checkmark.circle.fill")
-                    .font(.system(size: 15))
+                    .font(.system(size: 15 * store.thumbScale))
                     .symbolRenderingMode(.palette)
                     .foregroundStyle(.white, Color.accentColor)
                     .shadow(color: .black.opacity(0.35), radius: 2, y: 1)
-                    .padding(6)
+                    .padding(6 * store.thumbScale)
                     .opacity(selected ? 1 : 0)
             }
             .background(CompressionFrameReporter(id: entry.id))

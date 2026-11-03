@@ -80,6 +80,11 @@ struct TrashView: View {
                 .labelsHidden()
                 .frame(width: 68)
                 .help("缩略图视图 / 列表视图")
+
+                // 格子大小可调（和照片页、压缩站同一个值）
+                if mode == .grid {
+                    ThumbSizeSlider()
+                }
             }
         }
     }
@@ -144,7 +149,8 @@ struct TrashView: View {
 
     private var grid: some View {
         ScrollView {
-            LazyVGrid(columns: [GridItem(.adaptive(minimum: 104), spacing: 8)], spacing: 8) {
+            // 格子宽度和照片页共用同一个设置（`store.thumbCell`，顶栏那根滑杆 / ⌘+ ⌘-）
+            LazyVGrid(columns: [GridItem(.adaptive(minimum: store.thumbCell), spacing: 8)], spacing: 8) {
                 ForEach(shown) { entry in
                     cell(entry)
                 }
@@ -206,27 +212,28 @@ struct TrashView: View {
                         .foregroundStyle(.tertiary)
                 }
             }
-            .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+            .clipShape(RoundedRectangle(cornerRadius: 8 * store.thumbScale, style: .continuous))
             .overlay {
-                RoundedRectangle(cornerRadius: 8, style: .continuous)
-                    .strokeBorder(selected ? Color.accentColor : Color.clear, lineWidth: 3)
+                RoundedRectangle(cornerRadius: 8 * store.thumbScale, style: .continuous)
+                    .strokeBorder(selected ? Color.accentColor : Color.clear,
+                                  lineWidth: 3 * store.thumbScale)
             }
             .overlay(alignment: .bottomLeading) {
                 Text(ByteCountFormatter.string(fromByteCount: entry.byteSize, countStyle: .file))
-                    .font(.system(size: 9, weight: .semibold))
-                    .padding(.horizontal, 4)
-                    .padding(.vertical, 1)
+                    .font(.system(size: 9 * store.thumbScale, weight: .semibold))
+                    .padding(.horizontal, 4 * store.thumbScale)
+                    .padding(.vertical, 1 * store.thumbScale)
                     .background(Capsule().fill(.black.opacity(0.55)))
                     .foregroundStyle(.white)
-                    .padding(6)
+                    .padding(6 * store.thumbScale)
             }
             .overlay(alignment: .topTrailing) {
                 Image(systemName: "checkmark.circle.fill")
-                    .font(.system(size: 15))
+                    .font(.system(size: 15 * store.thumbScale))
                     .symbolRenderingMode(.palette)
                     .foregroundStyle(.white, Color.accentColor)
                     .shadow(color: .black.opacity(0.35), radius: 2, y: 1)
-                    .padding(6)
+                    .padding(6 * store.thumbScale)
                     .opacity(selected ? 1 : 0)
             }
             .background(TrashFrameReporter(id: entry.id))
@@ -264,7 +271,18 @@ struct TrashView: View {
             .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
 
             VStack(alignment: .leading, spacing: 2) {
-                Text(entry.fileName).font(.callout).lineLimit(1)
+                HStack(spacing: 6) {
+                    Text(entry.fileName).font(.callout).lineLimit(1)
+                    if entry.reason == .compressed {
+                        Text("已压缩待删除")
+                            .font(.system(size: 9, weight: .semibold))
+                            .padding(.horizontal, 5)
+                            .padding(.vertical, 1)
+                            .background(Capsule().fill(Color.brown.opacity(0.18)))
+                            .foregroundStyle(.brown)
+                            .fixedSize()
+                    }
+                }
                 Text("\(entry.createdAt.formatted(.dateTime.year().month().day().hour().minute())) · \(entry.folder)")
                     .font(.caption2)
                     .foregroundStyle(.secondary)
@@ -330,6 +348,14 @@ struct TrashView: View {
                 .font(.callout)
                 .foregroundStyle(.secondary)
                 .monospacedDigit()
+
+            // 压缩自动标进来的和自己手标的分开报（用户要求：别混在一起）
+            if store.trash.compressedCount > 0 {
+                Text("其中 \(store.trash.compressedCount) 项已压缩待删除")
+                    .font(.caption2)
+                    .foregroundStyle(.brown)
+                    .lineLimit(1)
+            }
 
             if store.isPurging {
                 HStack(spacing: 5) {

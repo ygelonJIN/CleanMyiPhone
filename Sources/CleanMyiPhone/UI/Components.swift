@@ -127,6 +127,34 @@ struct SearchField: View {
     }
 }
 
+/// 缩略图大小：一根小滑杆，左边「密」右边「疏」。
+///
+/// 2026-11 用户要求：**缩略图不许定死大小**。照片页 / 回收站 / 压缩站三个网格共用
+/// `store.thumbCell`（只在网格视图里出现，列表模式没有格子可调）。
+/// 宽度钉死 103pt：顶栏宽度是算准的（见 AGENTS.md 的顶栏宽度表），这里不能随字号浮动。
+struct ThumbSizeSlider: View {
+    @Environment(AppStore.self) private var store
+
+    var body: some View {
+        HStack(spacing: 5) {
+            Image(systemName: "square.grid.3x3.fill")
+                .font(.system(size: 9.5))
+                .foregroundStyle(.tertiary)
+            Slider(value: Binding(get: { store.thumbCell },
+                                  set: { store.setThumbCell($0) }),
+                   in: AppStore.thumbCellMin...AppStore.thumbCellMax)
+                .controlSize(.mini)
+                .frame(width: 70)
+                .help("拖动调整缩略图大小（⌘+ 放大 · ⌘- 缩小）")
+            Image(systemName: "square.grid.2x2")
+                .font(.system(size: 11))
+                .foregroundStyle(.tertiary)
+        }
+        .frame(width: 103)
+        .help("缩略图大小：\(Int(store.thumbCell)) pt（⌘+ 放大 · ⌘- 缩小）")
+    }
+}
+
 // MARK: - 无顶部栏的浮动标题行
 
 private struct ToggleSidebarKey: EnvironmentKey {

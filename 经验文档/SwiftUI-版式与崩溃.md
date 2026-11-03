@@ -2,7 +2,7 @@
 
 **什么时候读**：动界面、加图表、改侧栏、遇到闪退或界面乱跳时。
 
-**包含什么**：本机（macOS 27 / Xcode 27 / Swift 6.2 运行时）上踩到的 SwiftUI 崩溃与版式坑，以及"加载中布局乱跳"的根治办法。
+**包含什么**：本机（macOS 27 / Xcode 27 / Swift 6.2 运行时）上踩到的 SwiftUI 崩溃与版式坑、"加载中布局乱跳"的根治办法，以及**「中间标题 + 右侧一排按钮」这种顶栏怎么排才不重叠**（第十四节）。
 
 **不用读**：只调数据层时不用看。
 
@@ -174,3 +174,65 @@ init() {
 `lazy var` / `@ObservationIgnored` 缓存字典）。这个工程里已经栽过两次：侧栏计数（`countCache`）
 和这里的压缩参数。
 
+
+## 十四、中间标题 + 右侧一排按钮：别用固定 padding 的 ZStack
+
+2026-11 用户报「预览页窗口小的时候，右上角的快捷键按钮和中间的文件名重叠」。现场是这样的：
+
+```swift
+// ❌ 名字固定两侧各留 340pt，键帽那一排右对齐 —— 两个都按自己的理想宽度画，ZStack 允许它们重叠
+ZStack {
+    titleBlock.padding(.horizontal, 340)
+    HStack { closeButton; Spacer(); hintRow }
+}
+```
+
+键帽那一排（空格 / ←→ / ⏎ / ⌫ / -，中文标签）自然宽度 **240–520pt**，而默认 1180 窗口的内容区
+只有 **762pt**：名字两侧各留 340 之后只剩 82pt，和 500 多宽的键帽排必然压上。**固定常量对不上就会重叠，
+而 SwiftUI 的 ZStack 不会替你挡住。**
+
+### 正确做法：先量按钮排的自然宽度，再决定"居中"还是"换行"
+
+1. 把右侧那一排包成**不许被压缩**的独立视图：
+   ```swift
+   hintRow
+       .fixedSize(horizontal: true, vertical: false)   // 不许压扁
+       .layoutPriority(1)                              // 抢宽度时优先给它
+       .background(GeometryReader { geo in
+           Color.clear.preference(key: HintRowWidthKey.self, value: geo.size.width)
+       })
+   ```
+   ⚠️ **必须 `.fixedSize`**：不固定的话，窄窗口里 HStack 会把它压小 → 量出来的宽度跟着变 →
+   「居中 / 换行」的判据跟着变 → 一会儿居一会换，界面来回抖。固定之后量到的是**自然宽度**，
+   与当前排法无关，判断才稳定（也不会有 preference 反馈环）。
+2. 外层拿到宽度（`GeometryReader { proxy in … }` 里减掉自己的左右内边距）后分两档：
+   ```swift
+   let rowWidth = max(measuredRowWidth, 24)
+   if available - rowWidth * 2 >= 150 {
+       // 两侧各留出这一排的宽度：名字真正居中，谁也不压谁
+       ZStack { titleBlock.padding(.horizontal, rowWidth); HStack { close; Spacer(); hintRow } }
+   } else {
+       // 装不下就把键帽挪到第二行，名字独占一行
+       VStack(spacing: 8) { HStack { close; titleBlock; Color.clear.frame(width: 24) }; HStack { Spacer(); hintRow } }
+   }
+   ```
+3. **窄了只缩、不许删字**（2026-11 用户明确要求：「不要删掉对应的文字，可以只是缩小」）：
+   键帽那一排做三档密度（`HintDensity`：字号 12 / 10.5 / 9.5，内边距和间距一起按档收），
+   **文字一个都不删**，含义不用藏进 tooltip。分档门槛要跟「单行居中需要 `本排宽度 × 2 + 名字 150`」
+   对齐（本机 1100 / 860），否则会出现「明明缩一档就能单行、却因为还挂大一档而换行」的台阶。
+   真的缩到底也放不下，才把这排挪到第二行。
+
+### 顺带三条
+
+- 名字那一块自己也要能截断：文件名 `lineLimit(1) + truncationMode(.middle)`，
+  下面那行读数 `minimumScaleFactor(0.7)`，状态胶囊 `.fixedSize()` + `.layoutPriority(1)`（先缩读数）。
+- 信息条同理：窗口窄就用 `available` 判断**收起次要列**（本机 < 660 收「类型/格式/相簿」），
+  否则被挤掉的会是 `Spacer()` 右边那块「已选 N 项」。
+- 这类"按宽度换排法"的判断**只看容器宽度**，不要混进测量结果里当条件（会成环）。
+  测量值只用来算「留多少白」。
+
+### 顺带：`KeyMonitor` 会抢走菜单快捷键
+
+窗口级 `NSEvent` local monitor 比菜单**先**看到事件。`handleKeyEvent` 里如果只按 keyCode 判断，
+`⌘-` 会被当成「标记压缩」吞掉，菜单里的 `⌘-`（缩小缩略图）就永远不生效。
+规矩：**带 ⌘ 的组合键一律 `return false` 交给菜单**，只有 ⌘A 这类确实要自己接的才拦。

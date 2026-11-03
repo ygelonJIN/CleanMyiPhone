@@ -11,8 +11,10 @@ struct PhotosView: View {
         @Bindable var store = store
 
         VStack(spacing: 0) {
-            // 顶栏没有标题，控件组整条居中；每个控件都收窄过（升降序改成文字），
-            // 合计 ≤ 452pt，配内容区最小宽 500 任何窗口尺寸都不裁。
+            // 顶栏没有标题，控件组整条居中；每个控件都收窄过（升降序改成文字）。
+            // 宽度预算（网格视图，最宽的那一档）：搜索 100 + 排序 100 + 升降 44 +
+            // 分组 84 + 视图 68 + 缩略图大小 103 + 刷新 22 + 间距 48 = 569，
+            // + 左右内边距 40 = 609 ≤ 内容区最小 610。列表视图没有缩略图大小那一根（-111）。
             // 那层横向 ScrollView 已经删掉：宽度本来就够，兜底那层反而是裁刷新按钮的元凶。
             PageToolbar {
                 SearchField(prompt: "搜索照片", text: $store.searchText, width: 100)
@@ -61,6 +63,12 @@ struct PhotosView: View {
                 .frame(width: 68)
                 .help("缩略图视图 / 列表视图")
 
+                // 缩略图大小：只在网格视图里出现（列表模式没有格子可调）。
+                // 2026-11 用户要求：不许定死大小，要能自己调。
+                if store.viewMode == .grid {
+                    ThumbSizeSlider()
+                }
+
                 refreshButton
             }
 
@@ -102,6 +110,9 @@ struct PhotosView: View {
         }
         .sheet(isPresented: $showConversion) {
             ConversionSheet()
+        }
+        .sheet(isPresented: $store.moveSheetPresented) {
+            MoveToAlbumSheet()
         }
     }
 
@@ -231,7 +242,9 @@ struct PhotosView: View {
                         .lineLimit(1)
                 }
                 .buttonStyle(.plain)
-                .help("已标记回收 \(store.trash.count) 项：现在占 \(AppStore.sizeText(store.trash.totalBytes))，彻底删掉后归 0。点开进回收站，那里删才真正动设备")
+                .help("已标记回收 \(store.trash.count) 项"
+                      + (store.trash.compressedCount > 0 ? "（其中 \(store.trash.compressedCount) 项是压缩后自动标的「已压缩待删除」）" : "")
+                      + "：现在占 \(AppStore.sizeText(store.trash.totalBytes))，彻底删掉后归 0。点开进回收站，那里删才真正动设备")
             }
 
             if store.compression.count > 0, store.selection.isEmpty {
@@ -248,6 +261,30 @@ struct PhotosView: View {
                 }
                 .buttonStyle(.plain)
                 .help("待压缩 \(store.compression.count) 张：现在 \(AppStore.sizeText(change.before))，按标记时选的比例/格式/质量压完约 \(AppStore.sizeText(change.after))（预估，不是整库占比）。点开进压缩站，那里压才真正动设备")
+            }
+
+            if store.edits.count > 0, store.selection.isEmpty {
+                Button {
+                    store.select(.edits)
+                } label: {
+                    Label("\(store.edits.count) 项未写回", systemImage: "square.and.pencil")
+                        .font(.caption2)
+                        .foregroundStyle(.pink)
+                        .monospacedDigit()
+                        .lineLimit(1)
+                }
+                .buttonStyle(.plain)
+                .help("收藏 / 移动相簿 / 新建相簿都还只在本机。点开进修改站，那里点「写回手机」才真的改 iPhone")
+            }
+
+            // PTP 通道断了、列表是从相册库兜底来的：得说一句，否则用户以为照片真的没了
+            if store.usingLibraryFallback, store.selection.isEmpty {
+                Label("照片通道断开 · 列表来自相册库", systemImage: "exclamationmark.triangle")
+                    .font(.caption2)
+                    .foregroundStyle(.orange)
+                    .lineLimit(1)
+                    .help("PTP 照片目录没枚举出来，这份列表是用相册库补的：浏览/预览/收藏照常，删除会失败。"
+                          + "先点右上角刷新；还不行就拔插一次数据线")
             }
 
             if let message = store.provisionalMessage {
@@ -272,6 +309,24 @@ struct PhotosView: View {
                 Text("已选 \(store.selection.count) 项 · \(AppStore.sizeText(store.selectedBytes))")
                     .font(.callout.weight(.semibold))
                     .monospacedDigit()
+
+                // 收藏 / 移动相簿：都只是暂存，不动设备
+                Button {
+                    store.toggleFavoriteSelection()
+                } label: {
+                    Label(store.selectedAssets.contains { !store.displayedFavorite($0) } ? "收藏" : "取消收藏",
+                          systemImage: "heart")
+                }
+                .controlSize(.small)
+                .help("只暂存、不动手机：到「修改站」点「写回手机」才真的改 iPhone")
+
+                Button {
+                    store.moveSheetPresented = true
+                } label: {
+                    Label("移到相簿", systemImage: "rectangle.stack")
+                }
+                .controlSize(.small)
+                .help("把选中的项移进另一本相簿，或者当场新建一本（同样只暂存）")
 
                 // 标记不二次确认：回收站本身就是那道保险
                 Button {

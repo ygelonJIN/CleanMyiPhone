@@ -79,6 +79,12 @@ struct MainSidebarView: View {
                     .countBadge(store.compression.count)
                     .tag(AppStore.SidebarItem.compression)
                     .help("标记待压缩的照片都在这儿；这里点「开始压缩」才真的动设备（整批只写一次相册库）")
+
+                // 修改站：收藏 / 移动相簿 / 新建相簿都先攒着，到这儿一次写回
+                Label("修改站", systemImage: "square.and.pencil")
+                    .countBadge(store.edits.badgeCount)
+                    .tag(AppStore.SidebarItem.edits)
+                    .help("收藏、移动相簿、新建相簿都只是暂存；这儿点「写回手机」才真的改 iPhone（整批只写一次相册库）")
             }
         }
         .listStyle(.sidebar)

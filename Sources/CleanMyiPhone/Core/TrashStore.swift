@@ -11,6 +11,21 @@ import Observation
 @Observable
 final class TrashStore {
 
+    /// 为什么进的回收站。
+    /// 2026-11 用户要求：**压缩成功后自动标记的原图**要和「你自己手标的」分开，
+    /// 前者在界面上叫「已压缩待删除」，一眼能看出这批是我压完留下的垃圾。
+    enum Reason: String, Codable, Hashable {
+        case manual
+        case compressed
+
+        var label: String {
+            switch self {
+            case .manual: return "手动标记"
+            case .compressed: return "已压缩待删除"
+            }
+        }
+    }
+
     struct Entry: Codable, Identifiable, Hashable {
         let id: String          // Asset.id
         let fileName: String
@@ -20,6 +35,7 @@ final class TrashStore {
         let kindRaw: String
         let deviceID: String
         let markedAt: Date
+        var reason: Reason = .manual
 
         var isVideo: Bool { kindRaw == "video" }
     }
@@ -32,6 +48,9 @@ final class TrashStore {
 
     var count: Int { entries.count }
     var totalBytes: Int64 { entries.reduce(0) { $0 + $1.byteSize } }
+    /// 其中多少项是「压缩成功后自动标进来的」
+    var compressedCount: Int { entries.reduce(0) { $0 + ($1.reason == .compressed ? 1 : 0) } }
+    var manualCount: Int { entries.count - compressedCount }
     var ids: Set<Asset.ID> { Set(byID.keys) }
 
     /// 这一项在不在回收站（O(1)）
@@ -45,7 +64,7 @@ final class TrashStore {
 
     // MARK: - 增删
 
-    func add(_ assets: [Asset], deviceID: String) {
+    func add(_ assets: [Asset], deviceID: String, reason: Reason = .manual) {
         let now = Date()
         var map = byID
         for asset in assets {
@@ -57,7 +76,10 @@ final class TrashStore {
                 createdAt: asset.createdAt,
                 kindRaw: asset.kind.rawValue,
                 deviceID: deviceID,
-                markedAt: now
+                markedAt: now,
+                // 已经在站里的保留原来的理由：压缩产生的条目再被手标一次，
+                // 也不该丢掉「这张是压缩过的」这个事实
+                reason: map[asset.id]?.reason ?? reason
             )
         }
         entries = map.values.sorted { $0.markedAt > $1.markedAt }

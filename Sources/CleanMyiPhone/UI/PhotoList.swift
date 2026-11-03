@@ -151,6 +151,24 @@ struct PhotoRow: View {
                 store.toggle(asset)
             }
         }
+        .contextMenu {
+            Button(store.displayedFavorite(asset) ? "取消收藏" : "收藏") {
+                store.toggleFavorite(store.prepareContext(asset))
+            }
+            Button("移动到相簿…") {
+                store.prepareContext(asset)
+                store.moveSheetPresented = true
+            }
+            Divider()
+            Button("标记回收") {
+                store.prepareContext(asset)
+                store.markSelectedForRecycle()
+            }
+            Button("空格预览") {
+                store.prepareContext(asset)
+                store.openPreview()
+            }
+        }
         .help("\(asset.fileName)\n\(asset.dateText)\n\(asset.sizeText) · \(asset.resolutionText)"
               + (compression.map { "\n\($0.label)" } ?? ""))
     }

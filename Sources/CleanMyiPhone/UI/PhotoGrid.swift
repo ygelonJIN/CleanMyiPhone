@@ -11,7 +11,9 @@ struct PhotoGrid: View {
     var body: some View {
         GeometryReader { proxy in
             let spacing: CGFloat = 8
-            let minCell: CGFloat = 118
+            // 格子宽度**由用户调**（顶栏那根滑杆 / ⌘+ ⌘-），不再定死 118。
+            // 网格只负责按可用宽度排几列：窗口拉宽多排一列，格子大小不变。
+            let minCell = store.thumbCell
             let usable = max(proxy.size.width - spacing, minCell)
             let cols = max(1, Int(usable / (minCell + spacing)))
 
@@ -106,10 +108,18 @@ struct PhotoCell: View {
     private var compressionProfile: ConversionProfile? { store.compressionProfile(for: asset.id) }
     private var compression: CompressionDisplay? { store.compressionDisplay(for: asset) }
     private var isCompressedCopy: Bool { compression?.role == .copy }
+    /// 暂存成收藏 / 取消收藏（还没写回手机）
+    private var stagedFavorite: Bool? { store.edits.favorite(for: asset.id) }
+    /// 暂存要移到哪本相簿
+    private var stagedAlbum: PhotoEditQueue.AlbumRef? { store.edits.moveTarget(for: asset.id) }
     /// 缩略图到了没有：新的一帧图要淡入，不能"啪"地出现
     private var hasThumbnail: Bool { store.thumbnails[asset.id] != nil }
 
-    private let corner: CGFloat = 8
+    /// 圆角 / 角标 / 内边距都按格子大小缩放（`store.thumbScale`：84pt → 0.78，200pt → 1.7）。
+    /// 格子宽度可调之后，写死的 6pt 内边距在小格子里挤成一团、在大格子里又像飘着。
+    private var k: CGFloat { store.thumbScale }
+    private func s(_ v: CGFloat) -> CGFloat { v * k }
+    private var corner: CGFloat { s(8) }
 
     var body: some View {
         Rectangle()
@@ -121,12 +131,12 @@ struct PhotoCell: View {
             .overlay { stateTint }
             .overlay(alignment: .topLeading) { leadingBadges }
             .overlay(alignment: .topTrailing) { cornerBadge }
-            .overlay(alignment: .bottomLeading) { durationBadge }
+            .overlay(alignment: .bottomLeading) { bottomLeadingBadges }
             .overlay(alignment: .bottomTrailing) { sizeBadge }
             .overlay { stateRing }
             // 悬停的"抬起来"：柔和的大阴影（苹果那种悬浮感，不是套两层框）
             .shadow(color: .black.opacity(hovering ? 0.34 : 0),
-                    radius: hovering ? 14 : 0, y: hovering ? 5 : 0)
+                    radius: hovering ? s(14) : 0, y: hovering ? s(5) : 0)
             .background(CellFrameReporter(asset: asset))
             .overlay {
                 // 悬停层顺带记下这一格在 root 坐标系里的位置：预览卡片从这儿长出来
@@ -160,6 +170,23 @@ struct PhotoCell: View {
                     store.extend(to: asset)
                 } else {
                     store.toggle(asset)
+                }
+            }
+            .contextMenu {
+                Button(store.displayedFavorite(asset) ? "取消收藏" : "收藏") {
+                    store.toggleFavorite(store.prepareContext(asset))
+                }
+                Button("移动到相簿…") {
+                    store.prepareContext(asset)
+                    store.moveSheetPresented = true
+                }
+                Divider()
+                Button("标记回收") {
+                    store.markSelectedForRecycle()
+                }
+                Button("空格预览") {
+                    store.prepareContext(asset)
+                    store.openPreview()
                 }
             }
             .help("\(asset.fileName)\n\(asset.dateText)\n\(asset.sizeText) · \(asset.resolutionText)"
@@ -202,12 +229,13 @@ struct PhotoCell: View {
     }
 
     private var ringWidth: CGFloat {
-        if isSelected { return 3 }
-        if isPending { return 2.5 }
-        if isQueuedForCompression { return 2.5 }
-        if isCompressedCopy { return 2.5 }
+        // 描边跟着格子缩：200pt 的大格子上 3pt 太细、84pt 的小格子上太粗
+        if isSelected { return s(3) }
+        if isPending { return s(2.5) }
+        if isQueuedForCompression { return s(2.5) }
+        if isCompressedCopy { return s(2.5) }
         // 2pt：白底照片上也看得见，又不至于像"套了个框"（3pt + 外圈白晕＝丑）
-        if hovering { return 2 }
+        if hovering { return s(2) }
         return 0
     }
 
@@ -233,13 +261,13 @@ struct PhotoCell: View {
                 ZStack {
                     Rectangle().fill(Color.black.opacity(0.18))
                     Image(systemName: "play.fill")
-                        .font(.system(size: 22, weight: .semibold))
+                        .font(.system(size: s(22), weight: .semibold))
                         .foregroundStyle(.white.opacity(0.85))
                 }
                 .transition(.opacity)
             } else {
                 Image(systemName: asset.kind.symbol)
-                    .font(.system(size: 20, weight: .light))
+                    .font(.system(size: s(20), weight: .light))
                     .foregroundStyle(.tertiary)
                     .transition(.opacity)
             }
@@ -251,29 +279,29 @@ struct PhotoCell: View {
     /// 左上角：云朵 + **垃圾桶**。垃圾桶比原来大一号 —— 用户要的就是"左上角一眼看到垃圾桶"。
     @ViewBuilder
     private var leadingBadges: some View {
-        HStack(spacing: 4) {
+        HStack(spacing: s(3)) {
             if asset.isCloudOnly {
-                iconBadge("icloud.and.arrow.down")
+                iconBadge("icloud.and.arrow.down", size: s(8), pad: s(3.5))
                     .transition(.badge)
             }
             if isPending {
-                iconBadge("trash.fill", glyph: .white, fill: .orange, size: 10, pad: 4.5)
+                iconBadge("trash.fill", glyph: .white, fill: .orange, size: s(10), pad: s(4.5))
                     .shadow(color: .black.opacity(0.3), radius: 2, y: 1)
                     .transition(.badge)
             }
             // 待压缩：浅黄胶囊 + 深色字（黄底压白字读不出来）。
             // 文字从「待压缩」换成**这张会怎么压**：`60%·HEIC·Q80`（用户要每格都能看出参数）。
             if isQueuedForCompression && !isPending && !isCompressedCopy {
-                HStack(spacing: 2) {
+                HStack(spacing: s(2)) {
                     Image(systemName: "arrow.down.right.and.arrow.up.left")
-                        .font(.system(size: 6.5, weight: .bold))
+                        .font(.system(size: s(6.5), weight: .bold))
                     Text(compressionProfile?.badgeText ?? "待压缩")
-                        .font(.system(size: 8, weight: .bold))
+                        .font(.system(size: s(8), weight: .bold))
                         .lineLimit(1)
                         .minimumScaleFactor(0.7)
                 }
-                .padding(.horizontal, 4)
-                .padding(.vertical, 1.5)
+                .padding(.horizontal, s(4))
+                .padding(.vertical, s(1.5))
                 .background(Capsule().fill(Color.yellow.opacity(0.95)))
                 .foregroundStyle(Color.black.opacity(0.78))
                 .shadow(color: .black.opacity(0.25), radius: 1, y: 0.5)
@@ -281,9 +309,9 @@ struct PhotoCell: View {
             }
             if isCompressedCopy {
                 Text("已压缩")
-                    .font(.system(size: 8, weight: .bold))
-                    .padding(.horizontal, 4)
-                    .padding(.vertical, 1.5)
+                    .font(.system(size: s(8), weight: .bold))
+                    .padding(.horizontal, s(4))
+                    .padding(.vertical, s(1.5))
                     .background(Capsule().fill(Color.green))
                     .foregroundStyle(.white)
                     .shadow(color: .black.opacity(0.25), radius: 1, y: 0.5)
@@ -293,7 +321,7 @@ struct PhotoCell: View {
         .animation(Motion.pop, value: isPending)
         .animation(Motion.pop, value: isCompressedCopy)
         .animation(Motion.pop, value: isQueuedForCompression)
-        .padding(6)
+        .padding(s(6))
     }
 
     /// 右上角只有「选中」那个勾。
@@ -303,26 +331,58 @@ struct PhotoCell: View {
     private var cornerBadge: some View {
         if isSelected {
             Image(systemName: "checkmark.circle.fill")
-                .font(.system(size: 16))
+                .font(.system(size: s(16)))
                 .symbolRenderingMode(.palette)
                 .foregroundStyle(.white, Color.accentColor)
                 .shadow(color: .black.opacity(0.35), radius: 2, y: 1)
-                .padding(6)
+                .padding(s(6))
                 .transition(.badge)
         }
     }
 
+    /// 左下：**暂存状态**（♥ 收藏 / → 相簿）+ 时长。
+    /// 暂存的东西必须一眼看得见，否则用户不知道「手机还没改」。
     @ViewBuilder
-    private var durationBadge: some View {
-        if let duration = asset.durationText {
-            Text(duration)
-                .font(.system(size: 9, weight: .semibold).monospacedDigit())
-                .padding(.horizontal, 4)
-                .padding(.vertical, 1)
-                .background(Capsule().fill(.black.opacity(0.55)))
+    private var bottomLeadingBadges: some View {
+        HStack(spacing: s(3)) {
+            if let stagedFavorite {
+                Image(systemName: stagedFavorite ? "heart.fill" : "heart.slash.fill")
+                    .font(.system(size: s(8), weight: .bold))
+                    .foregroundStyle(.white)
+                    .padding(s(3))
+                    .background(Circle().fill(Color.pink.opacity(0.92)))
+                    .shadow(color: .black.opacity(0.25), radius: 1, y: 0.5)
+                    .transition(.badge)
+                    .help(stagedFavorite ? "本机暂存：收藏（还没写回手机）" : "本机暂存：取消收藏（还没写回手机）")
+            }
+            if let stagedAlbum {
+                HStack(spacing: s(2)) {
+                    Image(systemName: "rectangle.stack.fill")
+                        .font(.system(size: s(6.5), weight: .bold))
+                    Text(String(stagedAlbum.title.prefix(8)))
+                        .font(.system(size: s(8), weight: .bold))
+                        .lineLimit(1)
+                }
+                .padding(.horizontal, s(4))
+                .padding(.vertical, s(1.5))
+                .background(Capsule().fill(Color.pink.opacity(0.92)))
                 .foregroundStyle(.white)
-                .padding(6)
+                .shadow(color: .black.opacity(0.25), radius: 1, y: 0.5)
+                .transition(.badge)
+                .help("本机暂存：移到「\(stagedAlbum.title)」（还没写回手机）")
+            }
+            if let duration = asset.durationText {
+                Text(duration)
+                    .font(.system(size: s(9), weight: .semibold).monospacedDigit())
+                    .padding(.horizontal, s(4))
+                    .padding(.vertical, s(1))
+                    .background(Capsule().fill(.black.opacity(0.55)))
+                    .foregroundStyle(.white)
+            }
         }
+        .animation(Motion.pop, value: stagedFavorite)
+        .animation(Motion.pop, value: stagedAlbum)
+        .padding(s(6))
     }
 
     @ViewBuilder
@@ -333,33 +393,33 @@ struct PhotoCell: View {
                 Text(compression.formatPercentLabel)
                 Text(compression.qualitySizeLabel)
             }
-            .font(.system(size: 7.5, weight: .semibold))
+            .font(.system(size: s(7.5), weight: .semibold))
             .lineLimit(1)
             .minimumScaleFactor(0.7)
             .foregroundStyle(.white)
-            .padding(.horizontal, 5)
-            .padding(.vertical, 2)
+            .padding(.horizontal, s(5))
+            .padding(.vertical, s(2))
             .background(
-                RoundedRectangle(cornerRadius: 4, style: .continuous)
+                RoundedRectangle(cornerRadius: s(4), style: .continuous)
                     .fill(Color.green.opacity(0.92))
             )
-            .padding(6)
+            .padding(s(6))
         } else {
             Text(asset.sizeText)
-                .font(.system(size: 9, weight: .semibold))
-                .padding(.horizontal, 4)
-                .padding(.vertical, 1)
+                .font(.system(size: s(9), weight: .semibold))
+                .padding(.horizontal, s(4))
+                .padding(.vertical, s(1))
                 .background(Capsule().fill(.black.opacity(0.55)))
                 .foregroundStyle(.white)
-                .padding(6)
+                .padding(s(6))
         }
     }
 
     private func iconBadge(_ symbol: String,
                            glyph: Color = .white,
                            fill: Color = .black.opacity(0.55),
-                           size: CGFloat = 8,
-                           pad: CGFloat = 3.5) -> some View {
+                           size: CGFloat,
+                           pad: CGFloat) -> some View {
         Image(systemName: symbol)
             .font(.system(size: size, weight: .semibold))
             .padding(pad)
