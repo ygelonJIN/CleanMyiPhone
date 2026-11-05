@@ -70,7 +70,7 @@
 - 点选只负责「选中」，不碰预览；空格预览的是**鼠标悬停**的那一项（`hoveredID`），没悬停才退回已选。
 - 鼠标离开格子时不要立刻清 `hoveredID`：预览层盖上来会触发 leave，清了空格就失效。只在新格子 hover 时覆盖。
 - 预览层放在 `NavigationSplitView` 外层（`ZStack` 或 `.overlay`），不要在页面内部再放一份，否则会渲染两层。
-- 预览里 ←→ 切项、⏎/S 选中、⌫ 标记 / 取消标记、空格关；**标记和选中都不自动翻页**，状态胶囊当场变就是反馈。预览不改选中集合之外的任何东西。
+- 预览里 ←→ 切项、⏎/S 选中、⌫ 标记 / 取消标记、**Y 标记压缩、L 收藏、M 展开「移入相簿」**、空格关；**标记和选中都不自动翻页**，状态胶囊当场变就是反馈。预览不改选中集合之外的任何东西。
 
 ## 八、环形图悬停与指向线
 
@@ -187,40 +187,37 @@ ZStack {
 }
 ```
 
-键帽那一排（空格 / ←→ / ⏎ / ⌫ / -，中文标签）自然宽度 **240–520pt**，而默认 1180 窗口的内容区
+键帽那一排（空格 / ←→ / ⏎ / ⌫ / Y / L / M，中文标签）自然宽度 **500–680pt**，而默认 1180 窗口的内容区
 只有 **762pt**：名字两侧各留 340 之后只剩 82pt，和 500 多宽的键帽排必然压上。**固定常量对不上就会重叠，
 而 SwiftUI 的 ZStack 不会替你挡住。**
 
-### 正确做法：先量按钮排的自然宽度，再决定"居中"还是"换行"
+### 现在（2026-11 再改）：固定两行，键帽整排居中
 
-1. 把右侧那一排包成**不许被压缩**的独立视图：
-   ```swift
-   hintRow
-       .fixedSize(horizontal: true, vertical: false)   // 不许压扁
-       .layoutPriority(1)                              // 抢宽度时优先给它
-       .background(GeometryReader { geo in
-           Color.clear.preference(key: HintRowWidthKey.self, value: geo.size.width)
-       })
-   ```
-   ⚠️ **必须 `.fixedSize`**：不固定的话，窄窗口里 HStack 会把它压小 → 量出来的宽度跟着变 →
-   「居中 / 换行」的判据跟着变 → 一会儿居一会换，界面来回抖。固定之后量到的是**自然宽度**，
-   与当前排法无关，判断才稳定（也不会有 preference 反馈环）。
-2. 外层拿到宽度（`GeometryReader { proxy in … }` 里减掉自己的左右内边距）后分两档：
-   ```swift
-   let rowWidth = max(measuredRowWidth, 24)
-   if available - rowWidth * 2 >= 150 {
-       // 两侧各留出这一排的宽度：名字真正居中，谁也不压谁
-       ZStack { titleBlock.padding(.horizontal, rowWidth); HStack { close; Spacer(); hintRow } }
-   } else {
-       // 装不下就把键帽挪到第二行，名字独占一行
-       VStack(spacing: 8) { HStack { close; titleBlock; Color.clear.frame(width: 24) }; HStack { Spacer(); hintRow } }
-   }
-   ```
-3. **窄了只缩、不许删字**（2026-11 用户明确要求：「不要删掉对应的文字，可以只是缩小」）：
-   键帽那一排做三档密度（`HintDensity`：字号 12 / 10.5 / 9.5，内边距和间距一起按档收），
-   **文字一个都不删**，含义不用藏进 tooltip。分档门槛要跟「单行居中需要 `本排宽度 × 2 + 名字 150`」
-   对齐（本机 1100 / 860），否则会出现「明明缩一档就能单行、却因为还挂大一档而换行」的台阶。
-   真的缩到底也放不下，才把这排挪到第二行。
+用户后来要求「预览页的键帽也居中」「预览和缩略图页的键帽大小一样」，所以「宽窗口单行居中 +
+键帽贴右」那套自适应被替换掉了，原因是：同一个窗口下键帽一会儿贴右、一会儿换行，
+和照片页那条**居中**的快捷键条对不上；用户要的是两处都居中、字号一致。
+
+现在的排法（`PreviewOverlay.topBar`）：
+
+- **第一行**：关闭按钮 + 名字，左右各补一块等宽空位（右侧 `Color.clear.frame(width: 24)`），
+  名字才是真的居中；
+- **第二行**：键帽整排居中（`.frame(maxWidth: .infinity, alignment: .center)`）；
+- 键帽那一排用 `ViewThatFits` 依次试 `HintDensity` 的 `.normal → .compact → .tiny`，
+  **每一档文字都完整**，只是整排缩小；不再用窗口宽度阈值挑档（`HintDensity.forWidth` 已删），
+  因为预览和照片页要用**同一套字号**（同一档）。
+- 不再需要 `GeometryReader` + preference 量自然宽度：`ViewThatFits` 自己按真实宽度挑档，
+  也不会出现「测出来的宽度变了 → 判据跟着变」的反馈环。
+
+历史做法（先量按钮排自然宽度、够宽就单行居中、否则换行）只适合「标题在中间、按钮贴右」
+的顶栏；本项目预览和照片页现在是**居中两行**，不要退回那套。
+
+### 照片页的快捷键条：用 `ViewThatFits`，不删字
+
+缩略图 / 列表页顶栏下面那条 7 颗键帽（空格 / ←→ / ⏎ / ⌫ / Y / L / M）和预览顶栏**共用**
+`UI/Components.swift` 的 `ShortcutKeyButton`。宽度不够时用 `ViewThatFits` 依次试
+**一行 normal → 两行 normal（4 + 3）→ 一行 compact → 一行 tiny**：优先保持和预览一样的
+12pt，宁可折成两行也不先缩小；**每一档文字都完整**，不用 `lineLimit` 截断、不删某一颗。
+它不在 `PageToolbar` 的宽度预算里（是单独一行），所以照片页顶栏那 569pt 的账不用重算。
 
 ### 顺带三条
 
@@ -228,11 +225,10 @@ ZStack {
   下面那行读数 `minimumScaleFactor(0.7)`，状态胶囊 `.fixedSize()` + `.layoutPriority(1)`（先缩读数）。
 - 信息条同理：窗口窄就用 `available` 判断**收起次要列**（本机 < 660 收「类型/格式/相簿」），
   否则被挤掉的会是 `Spacer()` 右边那块「已选 N 项」。
-- 这类"按宽度换排法"的判断**只看容器宽度**，不要混进测量结果里当条件（会成环）。
-  测量值只用来算「留多少白」。
+- 键帽排优先用 `ViewThatFits` 挑档，**不要再自己 measure + 回写状态**；测量值一旦参与排法判断就容易成环。
 
 ### 顺带：`KeyMonitor` 会抢走菜单快捷键
 
-窗口级 `NSEvent` local monitor 比菜单**先**看到事件。`handleKeyEvent` 里如果只按 keyCode 判断，
-`⌘-` 会被当成「标记压缩」吞掉，菜单里的 `⌘-`（缩小缩略图）就永远不生效。
+窗口级 `NSEvent` local monitor 比菜单**先**看到事件。`handleKeyEvent` 里如果只按 keyCode / 字符判断，
+`⌘-`、`⌘1` 这类菜单快捷键会被本地监听先吞掉（菜单里的「缩小缩略图 / 切换视图」就永远不生效）。
 规矩：**带 ⌘ 的组合键一律 `return false` 交给菜单**，只有 ⌘A 这类确实要自己接的才拦。

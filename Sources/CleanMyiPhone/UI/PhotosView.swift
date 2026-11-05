@@ -11,71 +11,77 @@ struct PhotosView: View {
         @Bindable var store = store
 
         VStack(spacing: 0) {
-            // 顶栏没有标题，控件组整条居中；每个控件都收窄过（升降序改成文字）。
-            // 宽度预算（网格视图，最宽的那一档）：搜索 100 + 排序 100 + 升降 44 +
-            // 分组 84 + 视图 68 + 缩略图大小 103 + 刷新 22 + 间距 48 = 569，
-            // + 左右内边距 40 = 609 ≤ 内容区最小 610。列表视图没有缩略图大小那一根（-111）。
-            // 那层横向 ScrollView 已经删掉：宽度本来就够，兜底那层反而是裁刷新按钮的元凶。
-            PageToolbar {
-                SearchField(prompt: "搜索照片", text: $store.searchText, width: 100)
+            if !store.needsConnection {
+                // 顶栏没有标题，控件组整条居中；每个控件都收窄过（升降序改成文字）。
+                // 宽度预算（网格视图，最宽的那一档）：搜索 100 + 排序 100 + 升降 44 +
+                // 分组 84 + 视图 68 + 缩略图大小 103 + 刷新 22 + 间距 48 = 569，
+                // + 左右内边距 40 = 609 ≤ 内容区最小 610。列表视图没有缩略图大小那一根（-111）。
+                // 那层横向 ScrollView 已经删掉：宽度本来就够，兜底那层反而是裁刷新按钮的元凶。
+                PageToolbar {
+                    SearchField(prompt: "搜索照片", text: $store.searchText, width: 100)
 
-                // 主打功能：排序与视图都放大、放显眼
-                Picker("排序", selection: $store.sortKey) {
-                    ForEach(SortKey.allCases) { key in
-                        Text(key.label).tag(key)
-                    }
-                }
-                .pickerStyle(.segmented)
-                .labelsHidden()
-                .frame(width: 100)
-                .help("排序方式：按时间 / 按大小")
-
-                // 升 / 降序用**文字**，不用箭头（用户定的）
-                Button {
-                    store.ascending.toggle()
-                } label: {
-                    Text(store.ascending ? "升序" : "降序")
-                        .font(.system(size: 11.5, weight: .medium))
-                        .frame(width: 44, height: 20)
-                }
-                .buttonStyle(.bordered)
-                .help(store.ascending ? "当前升序 · 点一下改为降序" : "当前降序 · 点一下改为升序")
-
-                if store.showsDateSections {
-                    Picker("分组", selection: $store.dateGrouping) {
-                        ForEach(AppStore.DateGrouping.allCases) { mode in
-                            Text(mode.label).tag(mode)
+                    // 主打功能：排序与视图都放大、放显眼
+                    Picker("排序", selection: $store.sortKey) {
+                        ForEach(SortKey.allCases) { key in
+                            Text(key.label).tag(key)
                         }
                     }
                     .pickerStyle(.segmented)
                     .labelsHidden()
-                    .frame(width: 84)
-                    .help("按日 / 按月 / 按年分组显示")
-                }
+                    .frame(width: 100)
+                    .help("排序方式：按时间 / 按大小")
 
-                Picker("视图", selection: $store.viewMode) {
-                    ForEach(ViewMode.allCases) { mode in
-                        Image(systemName: mode.symbol).tag(mode)
+                    // 升 / 降序用**文字**，不用箭头（用户定的）
+                    Button {
+                        store.ascending.toggle()
+                    } label: {
+                        Text(store.ascending ? "升序" : "降序")
+                            .font(.system(size: 11.5, weight: .medium))
+                            .frame(width: 44, height: 20)
                     }
-                }
-                .pickerStyle(.segmented)
-                .labelsHidden()
-                .frame(width: 68)
-                .help("缩略图视图 / 列表视图")
+                    .buttonStyle(.bordered)
+                    .help(store.ascending ? "当前升序 · 点一下改为降序" : "当前降序 · 点一下改为升序")
 
-                // 缩略图大小：只在网格视图里出现（列表模式没有格子可调）。
-                // 2026-11 用户要求：不许定死大小，要能自己调。
-                if store.viewMode == .grid {
-                    ThumbSizeSlider()
+                    if store.showsDateSections {
+                        Picker("分组", selection: $store.dateGrouping) {
+                            ForEach(AppStore.DateGrouping.allCases) { mode in
+                                Text(mode.label).tag(mode)
+                            }
+                        }
+                        .pickerStyle(.segmented)
+                        .labelsHidden()
+                        .frame(width: 84)
+                        .help("按日 / 按月 / 按年分组显示")
+                    }
+
+                    Picker("视图", selection: $store.viewMode) {
+                        ForEach(ViewMode.allCases) { mode in
+                            Image(systemName: mode.symbol).tag(mode)
+                        }
+                    }
+                    .pickerStyle(.segmented)
+                    .labelsHidden()
+                    .frame(width: 68)
+                    .help("缩略图视图 / 列表视图")
+
+                    // 缩略图大小：只在网格视图里出现（列表模式没有格子可调）。
+                    // 2026-11 用户要求：不许定死大小，要能自己调。
+                    if store.viewMode == .grid {
+                        ThumbSizeSlider()
+                    }
+
+                    refreshButton
                 }
 
-                refreshButton
+                // 缩略图 / 列表页的完整快捷键条（和预览顶栏同一套键帽、同样可点）。
+                // 窄窗口只**整体缩小**（按 HintDensity 三档），不删任何文字。
+                shortcutBar
+
+                Divider()
             }
 
-            Divider()
-
             HStack(spacing: 0) {
-                if store.section == .albums {
+                if store.section == .albums, !store.needsConnection {
                     AlbumRail()
                         .frame(minWidth: 190, idealWidth: 190, maxWidth: 190)
                     Divider()
@@ -84,18 +90,35 @@ struct PhotosView: View {
                     // 最小宽度只保证「两列」：再窄宁可窗口不放行，也不裁图
                     .frame(minWidth: 260, maxWidth: .infinity, maxHeight: .infinity)
                     .layoutPriority(1)
+                    // 按 M 展开的「移到相簿」快捷面：**浮在网格上**，不挤占网格高度。
+                    // 淡遮罩负责「点外面收起」，卡片本身吃点击和拖放。
+                    .overlay {
+                        if store.albumPanelOpen {
+                            ZStack(alignment: .top) {
+                                Color.black.opacity(0.10)
+                                    .contentShape(Rectangle())
+                                    .onTapGesture { store.albumPanelOpen = false }
+                                AlbumShortcutPanel()
+                                    .transition(.scale(scale: 0.98, anchor: .top).combined(with: .opacity))
+                            }
+                            .transition(.opacity)
+                        }
+                    }
                     // 换页（侧栏 / 相簿 / 视图）时整块淡入 + 微缩，不是"啪"地出现
                     .pageReveal(store.pageKey)
             }
 
-            Divider()
-            bottomBar
+            if !store.needsConnection {
+                Divider()
+                bottomBar
+            }
         }
         // 换排序 / 换升降序 / 换相簿：让所有格子重新走一遍取图流程。
         // 光靠 ForEach 复用不会重发 `.task(id:)`，而且上一屏排队的请求要立刻作废。
         .onChange(of: store.sortKey) { _, _ in store.bumpThumbEpoch() }
         .onChange(of: store.ascending) { _, _ in store.bumpThumbEpoch() }
         .onChange(of: store.sidebarItem) { _, _ in store.bumpThumbEpoch() }
+        .animation(Motion.fade, value: store.albumPanelOpen)
         // 相册库还没读完：整页盖一层进度，读完自动撤。
         // 这段时间预览也开不了（没有库就拿不到设备上的真实路径）。
         .overlay {
@@ -110,9 +133,6 @@ struct PhotosView: View {
         }
         .sheet(isPresented: $showConversion) {
             ConversionSheet()
-        }
-        .sheet(isPresented: $store.moveSheetPresented) {
-            MoveToAlbumSheet()
         }
     }
 
@@ -218,6 +238,105 @@ struct PhotosView: View {
         .disabled(store.isScanning)
     }
 
+    // MARK: - 快捷键条
+
+    /// 和预览顶栏那排一模一样的 7 颗键帽：空格 / ←→ / ⏎ / ⌫ / Y / L / M。
+    /// `ViewThatFits` 先试「一行 normal」；内容区窄到一行放不下时**换成两行 normal**，
+    /// 这样字号和预览始终一致（不会因为缩略图页更窄就比预览小一档）。
+    /// 再窄才退到 compact / tiny —— 每一档文字都完整，不截断、不删。
+    private var shortcutBar: some View {
+        ViewThatFits(in: .horizontal) {
+            shortcutRow(.normal)
+            shortcutTwoRows(.normal)
+            shortcutRow(.compact)
+            shortcutRow(.tiny)
+        }
+        .frame(maxWidth: .infinity, alignment: .center)
+        .padding(.horizontal, 8)
+        .padding(.bottom, 7)
+    }
+
+    private enum ShortcutKey: Hashable, CaseIterable {
+        case space, prev, enter, recycle, compress, favorite, move
+    }
+
+    /// 键盘里按 `handleKeyEvent` 的同一套动作（`shortcutRecycle` 等）；
+    /// 没选中任何东西时，会先把光标那一张选上再执行。
+    private func shortcutRow(_ density: HintDensity) -> some View {
+        HStack(spacing: density.spacing) {
+            ForEach(ShortcutKey.allCases, id: \.self) { key in
+                shortcutButton(key, density)
+            }
+        }
+        .fixedSize(horizontal: true, vertical: false)
+    }
+
+    /// 一行放不下时的两行版：前 4 颗 + 后 3 颗，**仍然是 normal 字号**。
+    private func shortcutTwoRows(_ density: HintDensity) -> some View {
+        VStack(spacing: 6) {
+            HStack(spacing: density.spacing) {
+                shortcutButton(.space, density)
+                shortcutButton(.prev, density)
+                shortcutButton(.enter, density)
+                shortcutButton(.recycle, density)
+            }
+            HStack(spacing: density.spacing) {
+                shortcutButton(.compress, density)
+                shortcutButton(.favorite, density)
+                shortcutButton(.move, density)
+            }
+        }
+        .fixedSize(horizontal: true, vertical: true)
+    }
+
+    @ViewBuilder
+    private func shortcutButton(_ key: ShortcutKey, _ density: HintDensity) -> some View {
+        switch key {
+        case .space:
+            ShortcutKeyButton(key: "空格", label: "预览", density: density) {
+                store.openPreview()
+            }
+        case .prev:
+            ShortcutKeyButton(key: "← →", label: "下一张", density: density) {
+                store.move(dx: 1, extend: false)
+            }
+        case .enter:
+            ShortcutKeyButton(key: "⏎",
+                              label: store.isCursorSelected ? "取消选中" : "选中",
+                              density: density) {
+                store.toggleSelectionAtCursor()
+            }
+        case .recycle:
+            ShortcutKeyButton(key: "⌫",
+                              label: store.shortcutAllPending ? "取消删除" : "标记回收",
+                              density: density,
+                              active: store.shortcutAllPending) {
+                store.shortcutRecycle()
+            }
+        case .compress:
+            ShortcutKeyButton(key: "Y",
+                              label: store.shortcutAllQueuedForCompression ? "取消压缩" : "标记压缩",
+                              density: density,
+                              active: store.shortcutAllQueuedForCompression) {
+                store.shortcutCompression()
+            }
+        case .favorite:
+            ShortcutKeyButton(key: "L",
+                              label: store.shortcutAllFavorite ? "取消收藏" : "收藏",
+                              density: density,
+                              active: store.shortcutAllFavorite) {
+                store.shortcutFavorite()
+            }
+        case .move:
+            ShortcutKeyButton(key: "M",
+                              label: store.albumPanelOpen ? "收起相簿" : "移到相簿",
+                              density: density,
+                              active: store.albumPanelOpen) {
+                store.shortcutMove()
+            }
+        }
+    }
+
     private var bottomBar: some View {
         HStack(spacing: 12) {
             Text("\(store.visibleAssets.count) 项 · \(AppStore.sizeText(store.visibleBytes))")
@@ -320,32 +439,69 @@ struct PhotosView: View {
                 .controlSize(.small)
                 .help("只暂存、不动手机：到「修改站」点「写回手机」才真的改 iPhone")
 
-                Button {
-                    store.moveSheetPresented = true
-                } label: {
-                    Label("移到相簿", systemImage: "rectangle.stack")
+                // 移到相簿：这批已经全部暂存过移动 → 翻成「取消移入」
+                // （2026-11 用户定的新交互：点已标记的格子 = 选中，撤销靠底栏这颗）
+                if store.selectionAllMoved {
+                    Button {
+                        store.unmarkSelectedMoves()
+                    } label: {
+                        Label("取消移入", systemImage: "rectangle.stack.badge.minus")
+                    }
+                    .controlSize(.small)
+                    .help("撤销这批的「移到相簿」暂存（只撤销本机，不动手机）")
+                } else {
+                    Button {
+                        store.toggleAlbumPanel()
+                    } label: {
+                        Label(store.albumPanelOpen ? "收起相簿" : "移到相簿",
+                              systemImage: "rectangle.stack")
+                    }
+                    .controlSize(.small)
+                    .help(store.albumPanelOpen
+                          ? "收起「移到相簿」快捷面（M / Esc）"
+                          : "展开「移到相簿」快捷面：面板里按相簿右边的键直接移入（只暂存，不动手机）")
                 }
-                .controlSize(.small)
-                .help("把选中的项移进另一本相簿，或者当场新建一本（同样只暂存）")
 
-                // 标记不二次确认：回收站本身就是那道保险
-                Button {
-                    store.markSelectedForRecycle()
-                } label: {
-                    Label("标记回收", systemImage: "trash")
+                // 标记不二次确认：回收站本身就是那道保险。
+                // 全选中都已标回收时，这颗翻成「取消删除」。
+                if store.selectionAllPending {
+                    Button {
+                        store.unmark(store.selection)
+                    } label: {
+                        Label("取消删除", systemImage: "trash.slash")
+                    }
+                    .controlSize(.small)
+                    .help("把这批从回收站名单里撤掉（只撤销本机标记，不动手机）")
+                } else {
+                    Button {
+                        store.markSelectedForRecycle()
+                    } label: {
+                        Label("标记回收", systemImage: "trash")
+                    }
+                    .controlSize(.small)
+                    .help("打上回收标记（不需要二次确认），到回收站点「彻底删除」才真正从 iPhone 上删掉。同一项只能带一个标记：已经在压缩站的会被移出")
                 }
-                .controlSize(.small)
-                .help("打上回收标记（不需要二次确认），到回收站点「彻底删除」才真正从 iPhone 上删掉。同一项只能带一个标记：已经在压缩站的会被移出")
 
                 // 「标记压缩」和「标记回收」同一套：只有选中了才出现、同一个位置、同一种按钮。
                 // 点它只打开参数面板（那里面也只是标记），真压缩在「压缩站」。
-                Button {
-                    showConversion = true
-                } label: {
-                    Label("标记压缩", systemImage: "arrow.down.right.and.arrow.up.left")
+                // 全选中都已待压缩时，这颗翻成「取消压缩」。
+                if store.selectionAllQueuedForCompression {
+                    Button {
+                        store.unmarkCompression(store.selection)
+                    } label: {
+                        Label("取消压缩", systemImage: "arrow.uturn.backward")
+                    }
+                    .controlSize(.small)
+                    .help("把这批从压缩站名单里撤掉（只撤销本机标记，不动手机）")
+                } else {
+                    Button {
+                        showConversion = true
+                    } label: {
+                        Label("标记压缩", systemImage: "arrow.down.right.and.arrow.up.left")
+                    }
+                    .controlSize(.small)
+                    .help("只标记、不动手机：到「压缩站」确认后才真压。同一项只能带一个标记：已标回收的会被切到待压缩")
                 }
-                .controlSize(.small)
-                .help("只标记、不动手机：到「压缩站」确认后才真压。同一项只能带一个标记：已标回收的会被切到待压缩")
 
                 Button("取消选择") { store.clearSelection() }
                     .controlSize(.small)
@@ -394,12 +550,9 @@ struct PhotosView: View {
 struct AlbumRail: View {
     @Environment(AppStore.self) private var store
 
-    private var albums: [PhotoLibraryIndex.Album] {
-        store.libraryAlbums.sorted { lhs, rhs in
-            if lhs.count != rhs.count { return lhs.count > rhs.count }
-            return lhs.title.localizedStandardCompare(rhs.title) == .orderedAscending
-        }
-    }
+    /// 顺序和 `AppStore.albumShortcutItems` 共用一份（`albumsByDisplayOrder`），
+    /// 否则行上的键帽和实际按下的键会错位。
+    private var albums: [PhotoLibraryIndex.Album] { store.albumsByDisplayOrder }
 
     var body: some View {
         ScrollView {

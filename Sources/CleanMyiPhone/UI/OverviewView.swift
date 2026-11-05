@@ -14,35 +14,41 @@ struct OverviewView: View {
         VStack(alignment: .leading, spacing: 0) {
             // 概览**没有顶栏**（用户定的）：刷新入口在左下角侧栏那两颗按钮里，
             // 页面上不再放一颗「重新读取」，省掉一整条空栏。
-            ScrollView {
-                VStack(alignment: .leading, spacing: 20) {
-                    if store.needsConnection {
-                        emptyConnect
-                    } else if !store.hasStats {
-                        // 全屏遮罩盖在上面了，这里不重复放转圈
-                        Color.clear.frame(height: 240)
-                    } else {
-                        usageBlock
-                        cardGrid
-                        // 并排时每块的横条会被压到只剩几像素（"挤成一团"就是这么来的）。
-                        // 宽度不够就改成上下排，横条才有地方长。
-                        if contentWidth >= 620 {
-                            HStack(alignment: .top, spacing: 20) {
-                                photoTypeBlock
-                                albumBlock
-                            }
-                        } else {
-                            VStack(spacing: 20) {
-                                photoTypeBlock
-                                albumBlock
+            Group {
+                if store.needsConnection {
+                    // 空态**必须在内容区正中**，不能塞进 ScrollView 顶部（2026-11 用户报的）
+                    emptyConnect
+                } else {
+                    ScrollView {
+                        VStack(alignment: .leading, spacing: 20) {
+                            if !store.hasStats {
+                                // 全屏遮罩盖在上面了，这里不重复放转圈
+                                Color.clear.frame(height: 240)
+                            } else {
+                                usageBlock
+                                cardGrid
+                                // 并排时每块的横条会被压到只剩几像素（"挤成一团"就是这么来的）。
+                                // 宽度不够就改成上下排，横条才有地方长。
+                                if contentWidth >= 620 {
+                                    HStack(alignment: .top, spacing: 20) {
+                                        photoTypeBlock
+                                        albumBlock
+                                    }
+                                } else {
+                                    VStack(spacing: 20) {
+                                        photoTypeBlock
+                                        albumBlock
+                                    }
+                                }
                             }
                         }
+                        .padding(.horizontal, 18)
+                        .padding(.top, 16)
+                        .padding(.bottom, 20)
                     }
                 }
-                .padding(.horizontal, 18)
-                .padding(.top, 16)
-                .padding(.bottom, 20)
             }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
             // 和照片页**同一套**：整块淡入 + 从 0.985 微缩，0.85 秒（`Motion.page`）。
             // 只在外层做一次 —— 卡片、占比条、两个排行都不各自动，
             // 不做错峰、不做数字跳变，眼感和照片页换页完全一致。
@@ -361,8 +367,7 @@ struct OverviewView: View {
                 .buttonStyle(.borderedProminent)
                 .controlSize(.small)
         }
-        .frame(maxWidth: .infinity)
-        .padding(.vertical, 60)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 
 }

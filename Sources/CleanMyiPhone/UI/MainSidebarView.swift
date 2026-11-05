@@ -24,7 +24,12 @@ struct MainSidebarView: View {
     /// 有数 → `1234 · 4.2 GB`；还在算 → `加载中…`；库读不到 → `—`
     @ViewBuilder
     private func metric(for filter: LibraryFilter) -> some View {
-        if let value = store.filterMetrics[filter] {
+        if store.needsConnection {
+            // 没连设备时不再显示上一轮的旧数字（会让人以为手机还在）
+            Text("—")
+                .font(.caption.monospacedDigit())
+                .foregroundStyle(.quaternary)
+        } else if let value = store.filterMetrics[filter] {
             Text("\(value.count) · \(AppStore.sizeText(value.bytes))")
                 .font(.caption.monospacedDigit())
                 .foregroundStyle(.tertiary)
@@ -97,7 +102,11 @@ struct MainSidebarView: View {
         HStack(spacing: 8) {
             Label("相簿", systemImage: "rectangle.stack")
             Spacer(minLength: 6)
-            if store.libraryAlbums.isEmpty {
+            if store.needsConnection {
+                Text("—")
+                    .font(.caption.monospacedDigit())
+                    .foregroundStyle(.quaternary)
+            } else if store.libraryAlbums.isEmpty {
                 if store.metricsLibraryUnavailable {
                     Text("—")
                         .font(.caption.monospacedDigit())

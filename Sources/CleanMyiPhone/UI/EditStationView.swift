@@ -51,8 +51,8 @@ struct EditStationView: View {
         if !store.edits.hasWork {
             EmptyStateView(icon: "square.and.pencil",
                            title: "还没有暂存的修改",
-                           message: "在照片页点 ♥ 收藏、或者「移动到相簿…」。这些改动只在本机，"
-                                 + "到这儿点「写回手机」才真的改到 iPhone 上（一批约 1 分钟）。")
+                           message: "在照片页点「收藏」或「移到相簿…」，预览里按 L 收藏、M 移入相簿。"
+                                 + "这些改动只在本机，到这儿点「写回手机」才真的改到 iPhone 上（一批约 1 分钟）。")
         } else {
             ScrollView {
                 LazyVStack(spacing: 0) {
@@ -251,117 +251,6 @@ struct EditStationView: View {
 
 /// 「移动到相簿…」面板：选一本已有的，或者当场新建一本。
 /// **选完只是暂存**，真正写回在修改站里。
-struct MoveToAlbumSheet: View {
-    @Environment(AppStore.self) private var store
-    @Environment(\.dismiss) private var dismiss
-
-    @State private var newTitle = ""
-    @State private var search = ""
-
-    private var albums: [PhotoLibraryIndex.Album] {
-        let needle = search.trimmingCharacters(in: .whitespaces)
-        let list = store.libraryAlbums
-        guard !needle.isEmpty else { return list }
-        return list.filter { $0.title.localizedStandardContains(needle) }
-    }
-
-    private var fromAlbum: PhotoLibraryIndex.Album? {
-        guard let id = store.albumFilter else { return nil }
-        return store.libraryAlbums.first { $0.id == id }
-    }
-
-    private var count: Int { store.selection.count }
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            VStack(alignment: .leading, spacing: 3) {
-                Text("把选中的 \(count) 项移到相簿")
-                    .font(.headline)
-                if let fromAlbum {
-                    Text("会从「\(fromAlbum.title)」里移出")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                } else {
-                    Text("只加入相簿，不从别处移出")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
-            }
-
-            HStack(spacing: 8) {
-                TextField("新建相簿名", text: $newTitle)
-                    .textFieldStyle(.roundedBorder)
-                    .onSubmit { createAndMove() }
-                Button("新建并移入") { createAndMove() }
-                    .disabled(newTitle.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
-            }
-
-            Divider()
-
-            SearchField(prompt: "搜索相簿", text: $search, width: 200)
-
-            ScrollView {
-                LazyVStack(spacing: 0) {
-                    ForEach(albums) { album in
-                        Button {
-                            store.stageMoveSelection(to: .init(id: album.id, title: album.title))
-                            dismiss()
-                        } label: {
-                            HStack(spacing: 10) {
-                                Image(systemName: "rectangle.stack")
-                                    .font(.system(size: 12))
-                                    .foregroundStyle(.secondary)
-                                    .frame(width: 18)
-                                Text(album.title)
-                                    .lineLimit(1)
-                                Spacer(minLength: 8)
-                                Text("\(album.count) 项")
-                                    .font(.caption.monospacedDigit())
-                                    .foregroundStyle(.tertiary)
-                            }
-                            .padding(.horizontal, 8)
-                            .padding(.vertical, 5)
-                            .contentShape(Rectangle())
-                        }
-                        .buttonStyle(.plain)
-                    }
-                    if albums.isEmpty {
-                        Text(search.isEmpty ? "没有相簿" : "没有匹配的相簿")
-                            .font(.caption)
-                            .foregroundStyle(.tertiary)
-                            .padding(.vertical, 12)
-                    }
-                }
-            }
-            .frame(maxHeight: 240)
-
-            Divider()
-
-            HStack {
-                if fromAlbum != nil {
-                    Button("只从当前相簿移出") {
-                        store.stageMoveSelection(to: nil)
-                        dismiss()
-                    }
-                    .help("不加入别的相簿，只把它从「\(fromAlbum?.title ?? "")」拿掉")
-                }
-                Spacer()
-                Button("取消") { dismiss() }
-                    .keyboardShortcut(.cancelAction)
-            }
-        }
-        .padding(18)
-        .frame(width: 420, height: 480)
-    }
-
-    private func createAndMove() {
-        let title = newTitle.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !title.isEmpty else { return }
-        store.stageNewAlbumAndMove(title: title)
-        dismiss()
-    }
-}
-
 /// 写回手机的遮罩 / 结果单：**overlay 不是 sheet**（和彻底删除同一套理由：
 /// sheet 刚 dismiss 再 present 会被 SwiftUI 顶掉，而且长过程必须盖死整窗）。
 struct EditStatusOverlay: View {

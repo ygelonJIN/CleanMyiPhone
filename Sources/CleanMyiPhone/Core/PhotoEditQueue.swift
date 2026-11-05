@@ -70,6 +70,12 @@ final class PhotoEditQueue {
     /// 这张要移到哪本相簿（没移动返回 nil）
     func moveTarget(for id: Asset.ID) -> AlbumRef? { byID[id]?.moveTo }
 
+    /// 这张有「移入 / 移出相簿」的暂存吗（两个方向都算）
+    func hasMove(_ id: Asset.ID) -> Bool {
+        guard let entry = byID[id] else { return false }
+        return entry.moveFrom != nil || entry.moveTo != nil
+    }
+
     /// 这张要从哪本相簿移出
     func moveSource(for id: Asset.ID) -> Int? { byID[id]?.moveFrom }
 
@@ -105,6 +111,18 @@ final class PhotoEditQueue {
                 entry.moveFrom = nil
                 entry.moveTo = nil
             }
+            entry.markedAt = Date()
+            store(entry)
+        }
+    }
+
+    /// 撤掉这些项的「移动相簿」暂存（收藏改动保留；两者都空了条目就消失）。
+    /// 2026-11 用户定的新交互：点已暂存移动的格子 = 选中，然后在底栏点「取消移入」走这里。
+    func clearMoves(_ ids: some Sequence<Asset.ID>) {
+        for id in ids {
+            guard var entry = byID[id] else { continue }
+            entry.moveFrom = nil
+            entry.moveTo = nil
             entry.markedAt = Date()
             store(entry)
         }

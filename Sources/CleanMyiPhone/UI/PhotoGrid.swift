@@ -24,7 +24,9 @@ struct PhotoGrid: View {
                 LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: spacing),
                                          count: cols),
                           spacing: spacing,
-                          pinnedViews: []) {
+                          // 2026-11 用户定的：日期标题**吸顶**（和列表一样），
+                          // 但样式用网格这一套（纯文字 + 页面底色，不是列表那条 `.bar` 白条）
+                          pinnedViews: [.sectionHeaders]) {
                     if store.showsDateSections {
                         ForEach(store.assetSections, id: \.id) { section in
                             Section {
@@ -32,7 +34,7 @@ struct PhotoGrid: View {
                                     PhotoCell(asset: asset)
                                 }
                             } header: {
-                                DateHeader(title: section.title, count: section.assets.count)
+                                DateHeader(title: section.title, count: section.assets.count, pinned: true)
                                     .gridCellColumns(cols)
                             }
                         }
@@ -66,7 +68,7 @@ struct PhotoGrid: View {
 struct DateHeader: View {
     let title: String
     let count: Int
-    /// 吸顶（列表模式）时要一块底，否则文字和下面的行糊在一起
+    /// 吸顶（列表 / 网格都吸）时要一块底，否则格子会从字底下穿过去
     var pinned = false
 
     var body: some View {
@@ -84,8 +86,11 @@ struct DateHeader: View {
         .padding(.bottom, 6)
         .background {
             if pinned {
+                // 吸顶必须有一块不透明底，否则缩略图会从日期字底下穿过去。
+                // 用**页面底色**（`.background`）而不是 `.bar`：列表那条白条就是这么来的，
+                // 用户要的是网格这种「看不出底色」的观感 —— 盖住内容，但不额外加一层灰。
                 Rectangle()
-                    .fill(.bar)
+                    .fill(.background)
                     .padding(.horizontal, -8)
             }
         }
@@ -176,13 +181,23 @@ struct PhotoCell: View {
                 Button(store.displayedFavorite(asset) ? "取消收藏" : "收藏") {
                     store.toggleFavorite(store.prepareContext(asset))
                 }
-                Button("移动到相簿…") {
-                    store.prepareContext(asset)
-                    store.moveSheetPresented = true
+                // 2026-11 用户定的新交互：已暂存 / 已标记的项，右键菜单也翻成「取消…」
+                if store.edits.hasMove(asset.id) {
+                    Button("取消移入相簿") { store.unmarkMoves([asset.id]) }
+                } else {
+                    Button("移动到相簿…") {
+                        store.prepareContext(asset)
+                        store.albumPanelOpen = true
+                    }
                 }
                 Divider()
-                Button("标记回收") {
-                    store.markSelectedForRecycle()
+                if store.isPending(asset.id) {
+                    Button("取消删除") { store.unmark([asset.id]) }
+                } else {
+                    Button("标记回收") {
+                        store.prepareContext(asset)
+                        store.markSelectedForRecycle()
+                    }
                 }
                 Button("空格预览") {
                     store.prepareContext(asset)
@@ -191,7 +206,7 @@ struct PhotoCell: View {
             }
             .help("\(asset.fileName)\n\(asset.dateText)\n\(asset.sizeText) · \(asset.resolutionText)"
                   + (compression.map { "\n\($0.label)" } ?? "")
-                  + (compressionProfile.map { "\n标记压缩：\($0.label)（再点一次取消）" } ?? "")
+                  + (compressionProfile.map { "\n标记压缩：\($0.label)（选中后底栏「取消压缩」或预览里按 Y 撤销）" } ?? "")
                   + "\n空格预览 · 拖动框选 · ⇧ 点连选")
     }
 
@@ -279,54 +294,90 @@ struct PhotoCell: View {
     /// 左上角：云朵 + **垃圾桶**。垃圾桶比原来大一号 —— 用户要的就是"左上角一眼看到垃圾桶"。
     @ViewBuilder
     private var leadingBadges: some View {
-        HStack(spacing: s(3)) {
-            if asset.isCloudOnly {
-                iconBadge("icloud.and.arrow.down", size: s(8), pad: s(3.5))
-                    .transition(.badge)
-            }
-            if isPending {
-                iconBadge("trash.fill", glyph: .white, fill: .orange, size: s(10), pad: s(4.5))
-                    .shadow(color: .black.opacity(0.3), radius: 2, y: 1)
-                    .transition(.badge)
-            }
-            // 待压缩：浅黄胶囊 + 深色字（黄底压白字读不出来）。
-            // 文字从「待压缩」换成**这张会怎么压**：`60%·HEIC·Q80`（用户要每格都能看出参数）。
-            if isQueuedForCompression && !isPending && !isCompressedCopy {
-                HStack(spacing: s(2)) {
-                    Image(systemName: "arrow.down.right.and.arrow.up.left")
-                        .font(.system(size: s(6.5), weight: .bold))
-                    Text(compressionProfile?.badgeText ?? "待压缩")
-                        .font(.system(size: s(8), weight: .bold))
-                        .lineLimit(1)
-                        .minimumScaleFactor(0.7)
+        // 两行：第一行是状态（云端 / 待删 / 待压缩 / 已压缩），第二行是「→ 相簿名」。
+        // 相簿角标 2026-11 从**左下搬到左上**：放左下时它一宽就压住右下角的体积，
+        // 而左上本来就有一排状态角标，往下叠一行不会挡任何读数。
+        VStack(alignment: .leading, spacing: s(3)) {
+            HStack(spacing: s(3)) {
+                if asset.isCloudOnly {
+                    iconBadge("icloud.and.arrow.down", size: s(8), pad: s(3.5))
+                        .transition(.badge)
                 }
-                .padding(.horizontal, s(4))
-                .padding(.vertical, s(1.5))
-                .background(Capsule().fill(Color.yellow.opacity(0.95)))
-                .foregroundStyle(Color.black.opacity(0.78))
-                .shadow(color: .black.opacity(0.25), radius: 1, y: 0.5)
-                .transition(.badge)
-            }
-            if isCompressedCopy {
-                Text("已压缩")
-                    .font(.system(size: s(8), weight: .bold))
+                if isPending {
+                    iconBadge("trash.fill", glyph: .white, fill: .orange, size: s(10), pad: s(4.5))
+                        .shadow(color: .black.opacity(0.3), radius: 2, y: 1)
+                        .transition(.badge)
+                }
+                // 待压缩：浅黄胶囊 + 深色字（黄底压白字读不出来）。
+                // 文字从「待压缩」换成**这张会怎么压**：`60%·HEIC·Q80`（用户要每格都能看出参数）。
+                if isQueuedForCompression && !isPending && !isCompressedCopy {
+                    HStack(spacing: s(2)) {
+                        Image(systemName: "arrow.down.right.and.arrow.up.left")
+                            .font(.system(size: s(6.5), weight: .bold))
+                        Text(compressionProfile?.badgeText ?? "待压缩")
+                            .font(.system(size: s(8), weight: .bold))
+                            .lineLimit(1)
+                            .minimumScaleFactor(0.7)
+                    }
                     .padding(.horizontal, s(4))
                     .padding(.vertical, s(1.5))
-                    .background(Capsule().fill(Color.green))
-                    .foregroundStyle(.white)
+                    .background(Capsule().fill(Color.yellow.opacity(0.95)))
+                    .foregroundStyle(Color.black.opacity(0.78))
                     .shadow(color: .black.opacity(0.25), radius: 1, y: 0.5)
                     .transition(.badge)
+                }
+                if isCompressedCopy {
+                    Text("已压缩")
+                        .font(.system(size: s(8), weight: .bold))
+                        .padding(.horizontal, s(4))
+                        .padding(.vertical, s(1.5))
+                        .background(Capsule().fill(Color.green))
+                        .foregroundStyle(.white)
+                        .shadow(color: .black.opacity(0.25), radius: 1, y: 0.5)
+                        .transition(.badge)
+                }
+            }
+            if let stagedAlbum {
+                albumBadge(stagedAlbum)
             }
         }
         .animation(Motion.pop, value: isPending)
         .animation(Motion.pop, value: isCompressedCopy)
         .animation(Motion.pop, value: isQueuedForCompression)
+        .animation(Motion.pop, value: stagedAlbum)
         .padding(s(6))
     }
 
+    /// 暂存「移到相簿」的角标：粉色胶囊 + 相簿名。
+    /// **胶囊宽度跟着文字自适应**（`fixedSize`），短名字不会撑成一大块；
+    /// 长名字最多显示 6 个字（再长会顶到右上角的选中勾），全名在 tooltip / 预览 / 列表行里。
+    private func albumBadge(_ album: PhotoEditQueue.AlbumRef) -> some View {
+        HStack(spacing: s(2.5)) {
+            Image(systemName: "rectangle.stack.fill")
+                .font(.system(size: s(8.5), weight: .bold))
+            // 宽度跟着文字走：两个字就两个字的宽（用户 2026-11 报「相簿名太宽」）。
+            // 长名字最多取 6 个字，避免顶到右上角的选中勾；完整名字在 tooltip 里。
+            Text(String(album.title.prefix(6)))
+                .font(.system(size: s(10.5), weight: .bold))
+                .lineLimit(1)
+                .fixedSize()
+        }
+        .padding(.horizontal, s(5))
+        .padding(.vertical, s(2.5))
+        .background(Capsule(style: .continuous).fill(Color.pink.opacity(0.94)))
+        .overlay(
+            Capsule(style: .continuous)
+                .strokeBorder(Color.white.opacity(0.55), lineWidth: s(0.9))
+        )
+        .foregroundStyle(.white)
+        .shadow(color: .black.opacity(0.3), radius: s(2), y: s(1))
+        .transition(.badge)
+        .help("本机暂存：移到「\(album.title)」（还没写回手机）")
+    }
+
     /// 右上角只有「选中」那个勾。
-    /// **不再有取消标记按钮**（2026-11 用户定的）：再点一次已标记的格子就撤销标记，
-    /// 所以取消标记是"点一下"，不需要额外的控件。
+    /// 2026-11 用户改的：**选中和标记分开** —— 已标记的格子也能被选中（勾 + 橙/黄角标同时出现），
+    /// 撤销标记走底栏的「取消删除 / 取消压缩」或右键菜单，不再靠再点一下。
     @ViewBuilder
     private var cornerBadge: some View {
         if isSelected {
@@ -340,36 +391,21 @@ struct PhotoCell: View {
         }
     }
 
-    /// 左下：**暂存状态**（♥ 收藏 / → 相簿）+ 时长。
-    /// 暂存的东西必须一眼看得见，否则用户不知道「手机还没改」。
+    /// 左下：只放**收藏 / 时长**。
+    /// 「→ 相簿名」2026-11 搬到了左上（见 `leadingBadges`）：
+    /// 放左下时它一宽就压住右下角的体积角标，而用户明确说「太宽，挡到存储显示」。
     @ViewBuilder
     private var bottomLeadingBadges: some View {
         HStack(spacing: s(3)) {
             if let stagedFavorite {
                 Image(systemName: stagedFavorite ? "heart.fill" : "heart.slash.fill")
-                    .font(.system(size: s(8), weight: .bold))
+                    .font(.system(size: s(9.5), weight: .bold))
                     .foregroundStyle(.white)
-                    .padding(s(3))
+                    .padding(s(3.5))
                     .background(Circle().fill(Color.pink.opacity(0.92)))
                     .shadow(color: .black.opacity(0.25), radius: 1, y: 0.5)
                     .transition(.badge)
                     .help(stagedFavorite ? "本机暂存：收藏（还没写回手机）" : "本机暂存：取消收藏（还没写回手机）")
-            }
-            if let stagedAlbum {
-                HStack(spacing: s(2)) {
-                    Image(systemName: "rectangle.stack.fill")
-                        .font(.system(size: s(6.5), weight: .bold))
-                    Text(String(stagedAlbum.title.prefix(8)))
-                        .font(.system(size: s(8), weight: .bold))
-                        .lineLimit(1)
-                }
-                .padding(.horizontal, s(4))
-                .padding(.vertical, s(1.5))
-                .background(Capsule().fill(Color.pink.opacity(0.92)))
-                .foregroundStyle(.white)
-                .shadow(color: .black.opacity(0.25), radius: 1, y: 0.5)
-                .transition(.badge)
-                .help("本机暂存：移到「\(stagedAlbum.title)」（还没写回手机）")
             }
             if let duration = asset.durationText {
                 Text(duration)
@@ -381,7 +417,6 @@ struct PhotoCell: View {
             }
         }
         .animation(Motion.pop, value: stagedFavorite)
-        .animation(Motion.pop, value: stagedAlbum)
         .padding(s(6))
     }
 

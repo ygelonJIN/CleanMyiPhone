@@ -262,6 +262,87 @@ struct PageToolbar<Trailing: View>: View {
     }
 }
 
+/// 预览顶栏 / 照片页快捷键条共用的键帽按钮：**键帽 + 完整文字，整颗都能点**。
+/// 样式只有一处定义，两个页面（预览 / 缩略图·列表）不会各长一套。
+/// `active` = 这批现在处于「取消…」状态（取消删除 / 取消压缩 / 取消收藏 / 取消移入）。
+struct ShortcutKeyButton: View {
+    let key: String
+    let label: String
+    let density: HintDensity
+    var active = false
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            HStack(spacing: density.keyToLabel) {
+                Text(key)
+                    .font(.system(size: density.keyFont, weight: .semibold, design: .rounded))
+                    .lineLimit(1)
+                    .fixedSize()
+                    .frame(minWidth: density.keyMinWidth)
+                    .padding(.horizontal, density.keyPadding)
+                    .padding(.vertical, density.keyPaddingV)
+                    .background(
+                        RoundedRectangle(cornerRadius: 5, style: .continuous)
+                            .fill(.quaternary)
+                    )
+                Text(label)
+                    .font(.system(size: density.labelFont, weight: .medium))
+                    .lineLimit(1)
+                    .fixedSize()
+            }
+            .padding(.horizontal, density.buttonPadding)
+            .padding(.vertical, density.buttonPaddingV)
+            .background(
+                RoundedRectangle(cornerRadius: 8, style: .continuous)
+                    .fill(active ? Color.accentColor.opacity(0.16)
+                                 : Color.secondary.opacity(0.10))
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 8, style: .continuous)
+                    .strokeBorder(active ? Color.accentColor.opacity(0.45) : .clear, lineWidth: 1)
+            )
+            .contentShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+        }
+        .buttonStyle(.plain)
+        .help("\(key) · \(label)")
+    }
+}
+
+/// 相簿快捷键的小键帽：相簿栏、预览的「移入相簿」面板、移动面板共用同一颗。
+/// `active` = 正在等这个相簿的第二次确认；`onAccent` = 这一行本身是选中态（强调色底）。
+struct AlbumShortcutKeyCap: View {
+    let key: String
+    var active = false
+    var onAccent = false
+
+    var body: some View {
+        Text(key)
+            .font(.system(size: 10, weight: .semibold, design: .rounded))
+            .monospacedDigit()
+            .lineLimit(1)
+            .fixedSize()
+            .foregroundStyle(active
+                             ? AnyShapeStyle(Color.white)
+                             : (onAccent ? AnyShapeStyle(Color.white.opacity(0.88))
+                                         : AnyShapeStyle(.secondary)))
+            .frame(minWidth: 16)
+            .padding(.horizontal, 4)
+            .padding(.vertical, 1.5)
+            .background(
+                RoundedRectangle(cornerRadius: 4, style: .continuous)
+                    .fill(active
+                          ? AnyShapeStyle(Color.pink)
+                          : (onAccent ? AnyShapeStyle(Color.white.opacity(0.20))
+                                      : AnyShapeStyle(Color.secondary.opacity(0.14))))
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 4, style: .continuous)
+                    .strokeBorder(active ? Color.white.opacity(0.35) : .clear, lineWidth: 1)
+            )
+    }
+}
+
 struct EmptyStateView: View {
     let icon: String
     let title: String

@@ -19,9 +19,9 @@ struct PreviewOverlay: View {
     @State private var livePlaying = false
     /// 进场 / 退场：只驱动缩放和透明度，不参与任何数据
     @State private var presented = false
-    /// 顶栏那一排键帽的**实测**宽度（见 `topBar(available:)`）。
-    /// 用它来算名字两侧要不要对称留白 —— 不靠猜的常量，改标签宽度也不会算错。
-    @State private var hintRowWidth: CGFloat = 0
+    /// 「移入相簿」面板里的新建相簿输入框
+    @State private var showNewAlbumField = false
+    @State private var newAlbumTitle = ""
 
     private var asset: Asset? { store.previewAsset }
 
@@ -42,6 +42,11 @@ struct PreviewOverlay: View {
                 VStack(spacing: 0) {
                     // 传下去的是**内层**宽度：外层有 28pt 左右内边距
                     topBar(available: proxy.size.width - 56)
+                    // 按 M（或点「移入相簿」键帽）展开：每本相簿都是一颗可以直接点的按钮
+                    if store.previewAlbumPicker {
+                        albumPicker
+                            .transition(.opacity)
+                    }
                     media
                         // 从缩略图那一格长出来：锚点就是那一格的中心
                         .scaleEffect(presented ? 1 : 0.72, anchor: anchor)
@@ -51,6 +56,7 @@ struct PreviewOverlay: View {
                 }
                 .padding(.horizontal, 28)
                 .padding(.vertical, 20)
+                .animation(Motion.fade, value: store.previewAlbumPicker)
             }
             .frame(width: proxy.size.width, height: proxy.size.height)
         }
@@ -135,54 +141,24 @@ struct PreviewOverlay: View {
 
     // MARK: - 顶栏
 
-    /// 顶栏排法（2026-11 用户报的「键帽和中间的文件名重叠」）。
+    /// 顶栏：**第一行名字、第二行键帽，键帽整排居中**（2026-11 用户定的）。
     ///
-    /// 以前是「ZStack + 名字固定 `padding(.horizontal, 340)` + 右对齐键帽」：
-    /// 那一排键帽 250–520pt 宽，窗口一窄就和名字抢同一条水平线（默认 1180 窗口下
-    /// 内容区只有 762pt，名字两侧各 340 之后只剩 82pt，必然压上）。
-    ///
-    /// 现在**先量再排**，两种情况都不会重叠：
-    /// · 两侧各留出键帽那一排的宽度还够名字（≥150pt）→ 名字正中、键帽贴右，单行；
-    /// · 不够 → 键帽挪到第二行，名字独占一行（宁可多一行，也不让谁压住谁）。
-    /// ⚠️ 2026-11 用户定：**窄了也不许把键帽上的文字删掉，只许整体缩小**
-    /// （三档字号/内边距，见 `HintDensity`）。实在挤不下才把这一排挪到第二行。
-    @ViewBuilder
+    /// 以前做过「宽窗口单行居中 + 键帽贴右」的自适应：但同一排键帽一会儿贴右、
+    /// 一会儿换行，和照片页那条居中的快捷键条对不上；用户要的是两处都居中、大小一致。
+    /// 现在固定两行：名字那行左右都有等宽留白（右边补一块和关闭按钮同宽的空位），
+    /// 键帽那行用 `ViewThatFits` 挑一档 `HintDensity` 并居中 —— 窄了只整体缩小，不删字。
     private func topBar(available: CGFloat) -> some View {
-        let density = HintDensity.forWidth(available)
-        let rowWidth = max(hintRowWidth, 24)
-        let canCenter = available - rowWidth * 2 >= 150
-
-        Group {
-            if canCenter {
-                ZStack {
-                    // 状态胶囊本身就不短（「待压缩 60%·HEIC·Q80」），名字那一块太窄时先把它收起来，
-                    // 免得它撑破留白、又和键帽压在一起
-                    titleBlock(showsPill: available - rowWidth * 2 >= 250)
-                        .padding(.horizontal, rowWidth)
-                    HStack(spacing: 0) {
-                        closeButton
-                        Spacer(minLength: 0)
-                        hintRow(density)
-                    }
-                }
-            } else {
-                VStack(spacing: 8) {
-                    HStack(spacing: 10) {
-                        closeButton
-                        titleBlock(showsPill: true)
-                            .frame(maxWidth: .infinity)
-                        // 右边补一块和关闭按钮一样宽的空位，名字才是真的居中
-                        Color.clear.frame(width: 24, height: 24)
-                    }
-                    HStack(spacing: 0) {
-                        Spacer(minLength: 0)
-                        hintRow(density)
-                    }
-                }
+        VStack(spacing: 8) {
+            HStack(spacing: 10) {
+                closeButton
+                // 状态胶囊本身就不短（「待压缩 60%·HEIC·Q80」），窗口太窄时先把它收起来
+                titleBlock(showsPill: available >= 440)
+                    .frame(maxWidth: .infinity)
+                Color.clear.frame(width: 24, height: 24)
             }
+            hintRow
         }
         .padding(.bottom, 12)
-        .onPreferenceChange(PreviewHintWidthKey.self) { hintRowWidth = $0 }
     }
 
     private var closeButton: some View {
@@ -225,49 +201,216 @@ struct PreviewOverlay: View {
 
     /// 提示从右下角搬到顶部，而且**本身就是按钮** ——
     /// 既能看快捷键，也能直接点着用。
-    /// 窗口变窄只**整体缩小**（字号 / 内边距 / 间距），文字一个字都不删。
-    private func hintRow(_ density: HintDensity) -> some View {
+    /// `ViewThatFits` 从 normal → compact → tiny 挑第一档装得下的，**文字一个字都不删**；
+    /// 和照片页那条快捷键条用同一个 `ShortcutKeyButton`、同一套字号。
+    private var hintRow: some View {
+        ViewThatFits(in: .horizontal) {
+            hintButtons(.normal)
+            hintButtons(.compact)
+            hintButtons(.tiny)
+        }
+        .frame(maxWidth: .infinity, alignment: .center)
+    }
+
+    private func hintButtons(_ density: HintDensity) -> some View {
         HStack(spacing: density.spacing) {
             hintButton("空格", "关闭", density) { store.closePreview() }
             hintButton("← →", "下一张", density) { store.stepPreview(1) }
-            // 已标记回收 / 已标待压缩的项不许再选中：它们已经在名单里了
-            hintButton("⏎", isSelected ? "取消选中" : "选中", density,
-                       enabled: !isPending && !isCompressionQueued) { store.togglePreviewSelection() }
-            hintButton("⌫", isPending ? "取消标记" : "标记回收", density) {
+            // 已标记回收 / 待压缩的项也能选中（2026-11 用户改的：选中和标记分开）
+            hintButton("⏎", isSelected ? "取消选中" : "选中", density) { store.togglePreviewSelection() }
+            hintButton("⌫", isPending ? "取消删除" : "标记回收", density) {
                 if isPending { store.unmarkCurrentPreview() }
                 else { store.trashCurrentPreview() }
             }
-            // 「-」= 标记压缩（和 ⌫ 互斥；已是待压缩时变「取消压缩」）
-            hintButton("-", isCompressionQueued ? "取消压缩" : "标记压缩", density) {
+            // 2026-11 用户定：**压缩用 Y**（不再用 `-`），和 ⌫ 互斥、再按一次取消
+            hintButton("Y", isCompressionQueued ? "取消压缩" : "标记压缩", density) {
                 store.compressionMarkCurrentPreview()
             }
-            // 「♥」= 收藏 / 取消收藏（只暂存，到修改站写回）
-            hintButton("♥", isFavorite ? "取消收藏" : "收藏", density) {
+            // 2026-11 用户定：**收藏用 L**（不再拿 ♥ 当键帽），只暂存，到修改站写回
+            hintButton("L", isFavorite ? "取消收藏" : "收藏", density) {
                 if let asset { store.toggleFavorite([asset]) }
             }
-        }
-        // 这一排**永远按自然宽度**排：量出来的宽度就是它的真实宽度，
-        // 居中 / 分行的判断才稳（一旦被压缩，宽度就跟着变，会来回抖）。
-        .fixedSize(horizontal: true, vertical: false)
-        .layoutPriority(1)
-        .background(
-            GeometryReader { geo in
-                Color.clear.preference(key: PreviewHintWidthKey.self, value: geo.size.width)
+            // 移入相簿：点一下展开下面那一排相簿按钮（每本直接点）
+            hintButton("M", store.previewAlbumPicker ? "收起相簿" : "移入相簿", density) {
+                store.previewAlbumPicker.toggle()
             }
-        )
+        }
+        // 这一排按自然宽度排：`ViewThatFits` 量到的就是真实宽度，选中状态变文字时也不会抖。
+        .fixedSize(horizontal: true, vertical: false)
     }
 
-    /// 当前这一项的状态胶囊：选中 / 已标记回收
+    // MARK: - 移入相簿（M）
+
+    /// 按 M / 点顶栏「移入相簿」后展开的这一排：
+    /// **每本相簿（包括还没写回的新相簿）都是一颗按钮，点一下直接暂存当前这张**。
+    /// 顺序和照片页快捷面共用 `store.albumShortcutChoices`（拖过顺序后，键帽和视觉顺序一致）。
+    private var albumPicker: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 8) {
+                Image(systemName: "rectangle.stack")
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundStyle(.secondary)
+                Text("移到相簿")
+                    .font(.system(size: 12, weight: .semibold))
+                Text("按右边的键直接移入")
+                    .font(.system(size: 10))
+                    .foregroundStyle(.tertiary)
+                if let from = fromAlbumTitle {
+                    Text("会从「\(from)」移出")
+                        .font(.system(size: 10.5))
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                } else {
+                    Text("只加入相簿，不从别处移出")
+                        .font(.system(size: 10.5))
+                        .foregroundStyle(.tertiary)
+                        .lineLimit(1)
+                }
+                Spacer(minLength: 8)
+                if store.albumFilter != nil {
+                    Button("只从当前相簿移出") {
+                        store.stageRemoveCurrentPreviewFromAlbum()
+                        store.previewAlbumPicker = false
+                    }
+                    .controlSize(.small)
+                }
+                // 已经暂存过移动的，给一条撤回路（和底栏的「取消移入」同一个口径）
+                if stagedAlbum != nil {
+                    Button("取消移入") {
+                        if let asset { store.unmarkMoves([asset.id]) }
+                    }
+                    .controlSize(.small)
+                }
+                Button(showNewAlbumField ? "取消新建" : "新建相簿…") {
+                    showNewAlbumField.toggle()
+                    if !showNewAlbumField { newAlbumTitle = "" }
+                }
+                .controlSize(.small)
+                Button {
+                    store.previewAlbumPicker = false
+                } label: {
+                    Image(systemName: "chevron.up")
+                        .font(.system(size: 10, weight: .bold))
+                }
+                .buttonStyle(.plain)
+                .help("收起（M）")
+            }
+
+            if showNewAlbumField {
+                HStack(spacing: 8) {
+                    TextField("新相簿名", text: $newAlbumTitle)
+                        .textFieldStyle(.roundedBorder)
+                        .frame(maxWidth: 260)
+                        .onSubmit { createAlbumAndMove() }
+                    Button("新建并移入") { createAlbumAndMove() }
+                        .controlSize(.small)
+                        .disabled(newAlbumTitle.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                    Spacer()
+                }
+            }
+
+            ScrollView {
+                LazyVGrid(columns: [GridItem(.adaptive(minimum: 150), spacing: 6)],
+                          alignment: .leading, spacing: 6) {
+                    ForEach(store.albumShortcutChoices) { choice in
+                        albumChip(choice)
+                    }
+                }
+                .padding(.vertical, 1)
+            }
+            .frame(maxHeight: 150)
+        }
+        .padding(10)
+        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+        .padding(.bottom, 10)
+    }
+
+    private var fromAlbumTitle: String? {
+        guard let id = store.albumFilter else { return nil }
+        return store.libraryAlbums.first { $0.id == id }?.title
+    }
+
+    private var stagedAlbum: PhotoEditQueue.AlbumRef? {
+        guard let asset else { return nil }
+        return store.edits.moveTarget(for: asset.id)
+    }
+
+    private func albumChip(_ choice: AlbumChoice) -> some View {
+        let isTarget = stagedAlbum?.id == choice.id
+        let shortcut = store.albumShortcutKey(for: choice.id)
+        return Button {
+            store.stageMoveCurrentPreview(to: choice)
+            // 移完就收起面板：一次动作一个结果，不留在原地
+            store.previewAlbumPicker = false
+        } label: {
+            HStack(spacing: 6) {
+                Image(systemName: isTarget
+                      ? "checkmark.circle.fill"
+                      : (choice.isNew ? "rectangle.stack.badge.plus" : "rectangle.stack"))
+                    .font(.system(size: 10, weight: .semibold))
+                    .foregroundStyle(isTarget ? AnyShapeStyle(Color.pink) : AnyShapeStyle(.secondary))
+                Text(choice.title)
+                    .font(.system(size: 11.5, weight: .medium))
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                // 面板打开时按这颗键就直接移入（不再二次确认）
+                if let shortcut {
+                    AlbumShortcutKeyCap(key: shortcut)
+                }
+                Spacer(minLength: 4)
+                Text(choice.isNew
+                     ? (choice.count > 0 ? "待新建 · \(choice.count)" : "待新建")
+                     : "\(choice.count)")
+                    .font(.system(size: 9.5).monospacedDigit())
+                    .foregroundStyle(.tertiary)
+                    .fixedSize()
+            }
+            .padding(.horizontal, 8)
+            .padding(.vertical, 5)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(
+                RoundedRectangle(cornerRadius: 7, style: .continuous)
+                    .fill(isTarget ? Color.pink.opacity(0.20) : Color.secondary.opacity(0.10))
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 7, style: .continuous)
+                    .strokeBorder(isTarget ? Color.pink.opacity(0.75) : Color.clear, lineWidth: 1)
+            )
+            .contentShape(RoundedRectangle(cornerRadius: 7, style: .continuous))
+        }
+        .buttonStyle(.plain)
+        .help(isTarget
+              ? "这一张已经暂存到「\(choice.title)」"
+              : (shortcut.map { "把这一张暂存到「\(choice.title)」（面板打开时按 \($0) 直接移入；写回手机才生效）" }
+                 ?? "把这一张暂存到「\(choice.title)」（写回手机才生效）"))
+    }
+
+    private func createAlbumAndMove() {
+        let title = newAlbumTitle.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !title.isEmpty else { return }
+        store.stageNewAlbumForCurrentPreview(title: title)
+        newAlbumTitle = ""
+        showNewAlbumField = false
+        store.previewAlbumPicker = false
+    }
+
+    /// 当前这一项的状态胶囊。**标记和选中可以同时存在**（2026-11 用户改的）：
+    /// 左边是标记（回收 / 待压缩 / 已暂存相簿），右边是「已选中」，两颗一起显示。
     @ViewBuilder
     private var statePill: some View {
-        if isPending {
-            pill("已标记回收", symbol: "trash.fill", tint: .orange)
-        } else if isCompressionQueued {
-            // 带上这张会怎么压：和格子上的角标同一套口径
-            pill(compressionProfile.map { "待压缩 \($0.label)" } ?? "待压缩",
-                 symbol: "arrow.down.right.and.arrow.up.left", tint: .brown)
-        } else if isSelected {
-            pill("已选中", symbol: "checkmark.circle.fill", tint: .accentColor)
+        HStack(spacing: 4) {
+            if isPending {
+                pill("已标记回收", symbol: "trash.fill", tint: .orange)
+            } else if isCompressionQueued {
+                // 带上这张会怎么压：和格子上的角标同一套口径
+                pill(compressionProfile.map { "待压缩 \($0.label)" } ?? "待压缩",
+                     symbol: "arrow.down.right.and.arrow.up.left", tint: .brown)
+            } else if let stagedAlbum {
+                pill("→ \(stagedAlbum.title)", symbol: "rectangle.stack.fill", tint: .pink)
+            }
+            if isSelected {
+                pill("已选中", symbol: "checkmark.circle.fill", tint: .accentColor)
+            }
         }
     }
 
@@ -283,41 +426,12 @@ struct PreviewOverlay: View {
 
     /// 键帽 + 文字，整个是一颗按钮：键帽告诉你快捷键，点它直接执行。
     /// 三档只差字号和内边距 —— **文字永远在**（用户定的）。
+    /// 样式统一走 `ShortcutKeyButton`（照片页那条快捷键条用的是同一个组件）
     private func hintButton(_ key: String,
                             _ label: String,
                             _ density: HintDensity,
-                            enabled: Bool = true,
                             action: @escaping () -> Void) -> some View {
-        Button(action: action) {
-            HStack(spacing: density.keyToLabel) {
-                Text(key)
-                    .font(.system(size: density.keyFont, weight: .semibold, design: .rounded))
-                    .lineLimit(1)
-                    .fixedSize()
-                    .frame(minWidth: density.keyMinWidth)
-                    .padding(.horizontal, density.keyPadding)
-                    .padding(.vertical, density.keyPaddingV)
-                    .background(
-                        RoundedRectangle(cornerRadius: 5, style: .continuous)
-                            .fill(.quaternary)
-                    )
-                Text(label)
-                    .font(.system(size: density.labelFont, weight: .medium))
-                    .lineLimit(1)
-                    .fixedSize()
-            }
-            .padding(.horizontal, density.buttonPadding)
-            .padding(.vertical, density.buttonPaddingV)
-            .background(
-                RoundedRectangle(cornerRadius: 8, style: .continuous)
-                    .fill(Color.secondary.opacity(enabled ? 0.10 : 0.04))
-            )
-            .contentShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
-        }
-        .buttonStyle(.plain)
-        .disabled(!enabled)
-        .opacity(enabled ? 1 : 0.45)
-        .help(enabled ? "\(key) · \(label)" : "已标记回收的项不能选中")
+        ShortcutKeyButton(key: key, label: label, density: density, action: action)
     }
 
     private var indexText: String {
@@ -464,6 +578,7 @@ struct PreviewOverlay: View {
     private var stateBorderColor: Color {
         if isPending { return .orange }
         if isSelected { return .accentColor }
+        if stagedAlbum != nil { return .pink.opacity(0.9) }
         return .clear
     }
 
@@ -621,22 +736,15 @@ struct PreviewOverlay: View {
 }
 
 
-/// 预览顶栏那排键帽的**密度**：窗口越窄字号和内边距越小，但文字一个都不删。
+/// 键帽的**密度**（预览顶栏 / 照片页快捷键条共用）：越窄字号和内边距越小，但文字一个都不删。
 ///
-/// 2026-11 用户定的：窄窗口里不许把「关闭 / 下一张 / 选中 / 标记回收 / 标记压缩」收起来，
+/// 2026-11 用户定的：窄窗口里不许把「关闭 / 下一张 / 选中 / 标记回收 / 标记压缩 / 收藏 / 移入相簿」收起来，
 /// 只许整体缩小 —— 键帽本身是按钮，缩了还能点，删了等于把功能藏起来。
-/// 三档的宽度大致是 449 / 354 / 310pt（5 颗按钮 + 间距，中文标签那版）。
+/// 三档的宽度大致是 **680 / 583 / 497pt**（7 颗按钮 + 间距，中文标签那版）。
+/// 挑哪一档由 `ViewThatFits` 按真实宽度决定（normal → compact → tiny），不写死窗口阈值，
+/// 所以预览和缩略图页在同一宽度下拿到的是同一个字号。
 enum HintDensity {
     case normal, compact, tiny
-
-    /// 分档要跟「能不能单行居中」对齐：单行大约需要 `这一排宽度 × 2 + 名字 150`。
-    /// 449×2+150≈1048 / 354×2+150≈858 / 310×2+150≈770，所以取 1100 / 860 两个门槛，
-    /// 免得出现「明明缩小一档就能单行，却因为还挂着大一档而换行」的台阶。
-    static func forWidth(_ available: CGFloat) -> HintDensity {
-        if available >= 1100 { return .normal }
-        if available >= 860 { return .compact }
-        return .tiny
-    }
 
     var keyFont: CGFloat {
         switch self {
@@ -710,14 +818,6 @@ enum HintDensity {
         case .compact: return 5
         case .tiny: return 4
         }
-    }
-}
-
-/// 顶栏键帽那一排的实测宽度：顶栏靠它算「名字两侧要不要对称留白」。
-private struct PreviewHintWidthKey: PreferenceKey {
-    static var defaultValue: CGFloat = 0
-    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
-        value = max(value, nextValue())
     }
 }
 

@@ -61,6 +61,8 @@ struct PhotoRow: View {
     private var compressionProfile: ConversionProfile? { store.compressionProfile(for: asset.id) }
     private var compression: CompressionDisplay? { store.compressionDisplay(for: asset) }
     private var isCompressedCopy: Bool { compression?.role == .copy }
+    /// 暂存要移到哪本相簿（还没写回手机）
+    private var stagedAlbum: PhotoEditQueue.AlbumRef? { store.edits.moveTarget(for: asset.id) }
     private var hasThumbnail: Bool { store.thumbnails[asset.id] != nil }
 
     var body: some View {
@@ -83,7 +85,7 @@ struct PhotoRow: View {
                     .foregroundStyle(.orange)
             }
             if isPending {
-                // 取消标记 = 再点一次这一行（`toggle` 里先撤标记），不再单独放按钮
+                // 2026-11 用户改的：已标记的行也能选中；取消标记走底栏 / 右键的「取消删除」
                 Label("已标记", systemImage: "trash.fill")
                     .font(.caption2.weight(.medium))
                     .foregroundStyle(.orange)
@@ -111,6 +113,19 @@ struct PhotoRow: View {
                     .background(Capsule().fill(Color.yellow.opacity(0.95)))
                     .fixedSize()
                     .transition(.badge)
+            }
+
+            // 暂存「移到相簿」：和格子左下那枚角标同一套粉色，列表里也要看得见
+            if let stagedAlbum {
+                // 和格子上的胶囊一个口径：文字多宽就多宽，长名字取 10 个字
+                Label("→ \(String(stagedAlbum.title.prefix(10)))", systemImage: "rectangle.stack.fill")
+                    .font(.caption2.weight(.semibold))
+                    .labelStyle(.titleAndIcon)
+                    .foregroundStyle(.pink)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+                    .transition(.badge)
+                    .help("本机暂存：移到「\(stagedAlbum.title)」（还没写回手机）")
             }
 
             Spacer(minLength: 8)
@@ -155,14 +170,23 @@ struct PhotoRow: View {
             Button(store.displayedFavorite(asset) ? "取消收藏" : "收藏") {
                 store.toggleFavorite(store.prepareContext(asset))
             }
-            Button("移动到相簿…") {
-                store.prepareContext(asset)
-                store.moveSheetPresented = true
+            // 已暂存 / 已标记的项，右键菜单也翻成「取消…」
+            if store.edits.hasMove(asset.id) {
+                Button("取消移入相簿") { store.unmarkMoves([asset.id]) }
+            } else {
+                Button("移动到相簿…") {
+                    store.prepareContext(asset)
+                    store.albumPanelOpen = true
+                }
             }
             Divider()
-            Button("标记回收") {
-                store.prepareContext(asset)
-                store.markSelectedForRecycle()
+            if store.isPending(asset.id) {
+                Button("取消删除") { store.unmark([asset.id]) }
+            } else {
+                Button("标记回收") {
+                    store.prepareContext(asset)
+                    store.markSelectedForRecycle()
+                }
             }
             Button("空格预览") {
                 store.prepareContext(asset)

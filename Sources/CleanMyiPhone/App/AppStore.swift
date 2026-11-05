@@ -68,6 +68,7 @@ final class AppStore {
 
     func select(_ item: SidebarItem) {
         guard item != sidebarItem else { return }
+        albumPanelOpen = false
         sidebarItem = item
         if case .albums = item { ensureAlbumSelection() }
         clearSelection()
@@ -127,11 +128,17 @@ final class AppStore {
     var editReport: EditReport?
     /// 提交时正赶上压缩/删除：记下来，等它们跑完自动写（用户定的）
     var editSubmitAfterCompression = false
-    /// 两个小面板
-    var moveSheetPresented = false
-    var newAlbumSheetPresented = false
-    /// 上一次用的压缩参数。预览里按「-」没有面板可选，就用它（默认 60% · HEIC · Q80）
-    /// 预览里按「-」标记压缩时用的参数。启动时从**上次存下的那份**读（`CompressionPrefs`），
+    /// 照片页的「移到相簿」快捷面：按 M 展开，展开后每本相簿右上的键帽才是快捷键。
+    /// **不再有全局的数字直连** —— 必须先 M 打开这一面，避免误触；也不需要二次确认。
+    var albumPanelOpen = false
+    /// 用户在快捷面里拖出来的相簿顺序（只存 albumID）。**只在内存里、不落盘**；
+    /// 退出即清空，回到默认顺序（张数降序 → 标题升序）。
+    /// 第一个位置就是快捷键 `1`。
+    var albumShortcutOrder: [Int] = []
+    /// 预览里的「移入相簿」快捷面：按 M 展开，展开后每本相簿一颗可直接点的按钮 + 键帽。
+    var previewAlbumPicker = false
+    /// 上一次用的压缩参数。预览里按「Y」没有面板可选，就用它（默认 60% · HEIC · Q80）
+    /// 预览里按「Y」标记压缩时用的参数。启动时从**上次存下的那份**读（`CompressionPrefs`），
     /// 不是永远回到 60%/HEIC/Q80 —— 用户要求「每次新设置的都记住保留」。
     var lastCompressionProfile = CompressionPrefs.load().profile
     /// 清空回收站 / 彻底删除中的二次确认弹窗
@@ -785,6 +792,29 @@ final class AppStore {
 
     func editMoveTarget(for id: Asset.ID) -> PhotoEditQueue.AlbumRef? { edits.moveTarget(for: id) }
 
+    /// 相簿选择列表：**已经暂存、还没写回的新相簿排在最前面**。
+    ///
+    /// 2026-11 用户报的 bug：新建一本相簿、把照片移进去之后，再选照片想移进同一本，
+    /// 面板里却找不到它（那时它只存在于 `edits.newAlbums`，还没写进设备上的 `Photos.sqlite`）。
+    /// 现在把两份合起来，新建的那本带「新建」标记，照样能直接点。
+    var albumChoices: [AlbumChoice] {
+        // 一次扫完暂存区，别在每本新相簿上各扫一遍（和「性能红线」同一条规矩）
+        var stagedCounts: [Int: Int] = [:]
+        for entry in edits.entries {
+            if let id = entry.moveTo?.id { stagedCounts[id, default: 0] += 1 }
+        }
+        let pending = edits.newAlbums.map { album in
+            AlbumChoice(id: album.id,
+                        title: album.title,
+                        count: stagedCounts[album.id] ?? 0,
+                        isNew: true)
+        }
+        let existing = libraryAlbums.map {
+            AlbumChoice(id: $0.id, title: $0.title, count: $0.count, isNew: false)
+        }
+        return pending + existing
+    }
+
     /// 收藏 / 取消收藏：**只暂存，不动设备**（和「标记压缩」同一套）。
     func toggleFavorite(_ assets: [Asset]) {
         guard !assets.isEmpty else { return }
@@ -808,6 +838,8 @@ final class AppStore {
 
     /// 移到相簿。`from` = 当前所在相簿（在「全部照片」里是 nil，等于「只加入」）；
     /// `to` = nil 表示只从相簿里移出，不加入任何相簿。
+    /// **移完自动取消选中**（2026-11 用户定的）：移进相簿是一次完成动作，
+    /// 留着勾会让用户以为还要再点一次；想反悔就重新选中，底栏会翻成「取消移入」。
     func stageMove(_ assets: [Asset], from: Int?, to: PhotoEditQueue.AlbumRef?) {
         guard !assets.isEmpty else { return }
         edits.move(assets, from: from, to: to)
@@ -825,17 +857,225 @@ final class AppStore {
         stageMove(selectedAssets, from: albumFilter, to: target)
     }
 
+    /// 快捷面里点一本相簿：目标口径和按数字键完全一致 ——
+    /// 有选中就整批，没选中就退成光标那一张。
+    func stageMoveShortcutSelection(to target: PhotoEditQueue.AlbumRef?) {
+        if let target, albumFilter == target.id {
+            flash("这一批已经在「\(target.title)」里了")
+            return
+        }
+        let targets: [Asset]
+        if !selection.isEmpty {
+            targets = selectedAssets
+        } else if let id = cursorAssetID,
+                  let asset = visibleAssets.first(where: { $0.id == id }) {
+            targets = [asset]
+        } else {
+            flash("先在缩略图里点一张照片")
+            return
+        }
+        guard !targets.isEmpty else { return }
+        stageMove(targets, from: albumFilter, to: target)
+    }
+
     /// 在移动面板里新建一本相簿，并把这批放进去（同一批只建一次库）。
-    func stageNewAlbumAndMove(title: String) {
-        guard !selectedAssets.isEmpty else { return }
+    /// - Parameter assets: 不传 = 底栏那批选中项；预览里传当前这一张。
+    func stageNewAlbumAndMove(title: String, assets: [Asset]? = nil) {
+        let list = assets ?? selectedAssets
+        guard !list.isEmpty else { return }
         let ref = edits.createAlbum(title: title)
-        stageMoveSelection(to: ref)
+        stageMove(list, from: albumFilter, to: ref)
+    }
+
+    /// 预览里点一本相簿：**只暂存当前这一张**，不改勾选集合、不跳页。
+    /// 「从哪本移出」还是当前正在看的相簿（不在相簿页就是「只加入」）。
+    func stageMoveCurrentPreview(to choice: AlbumChoice) {
+        guard let asset = previewAsset else { return }
+        // 已经在当前这本里：不用暂存一个「原地移动」，直接说清楚
+        if albumFilter == choice.id {
+            flash("这一张已经在「\(choice.title)」里了")
+            return
+        }
+        stageMove([asset], from: albumFilter,
+                  to: PhotoEditQueue.AlbumRef(id: choice.id, title: choice.title))
+    }
+
+    /// 预览里「只从当前相簿移出」
+    func stageRemoveCurrentPreviewFromAlbum() {
+        guard let asset = previewAsset, albumFilter != nil else { return }
+        stageMove([asset], from: albumFilter, to: nil)
+    }
+
+    /// 预览里新建一本相簿并把当前这一张放进去（只暂存）
+    func stageNewAlbumForCurrentPreview(title: String) {
+        guard let asset = previewAsset else { return }
+        stageNewAlbumAndMove(title: title, assets: [asset])
+    }
+
+    // MARK: - 相簿快捷键（2026-11 用户要求）
+
+    /// 前 10 本用 `1–9 / 0`，第 11 本起用 `⌥1–⌥0`，最多 20 本。
+    /// 再多的相簿没有快捷键（还能从 M / 「移到相簿」面板里点），别让快捷键无限膨胀。
+    static let albumShortcutLimit = 20
+
+    static func albumShortcutKey(slot: Int) -> String {
+        if slot < 10 { return slot == 9 ? "0" : "\(slot + 1)" }
+        let n = slot - 9
+        return "⌥\(n == 10 ? "0" : "\(n)")"
+    }
+
+    /// 相簿栏的显示顺序：张数降序 → 标题升序。
+    /// 相簿栏和快捷键分配**必须共用这一份**，否则「看到的键」和「按下的键」会错位。
+    var albumsByDisplayOrder: [PhotoLibraryIndex.Album] {
+        libraryAlbums.sorted { lhs, rhs in
+            if lhs.count != rhs.count { return lhs.count > rhs.count }
+            return lhs.title.localizedStandardCompare(rhs.title) == .orderedAscending
+        }
+    }
+
+    /// 快捷面的显示顺序 = 用户拖出来的顺序（`albumShortcutOrder`）→ 默认顺序补齐。
+    /// 默认：设备上的相簿按张数降序 / 标题升序，再接还没写回的新相簿。
+    /// **第一个位置就是快捷键 1**；拖到哪里，键就跟着重新编号。
+    var albumShortcutChoices: [AlbumChoice] {
+        let all = albumChoices
+        let byID = Dictionary(uniqueKeysWithValues: all.map { ($0.id, $0) })
+        var seen = Set<Int>()
+        var ordered: [AlbumChoice] = []
+        for id in albumShortcutOrder {
+            guard let choice = byID[id], seen.insert(id).inserted else { continue }
+            ordered.append(choice)
+        }
+        let defaults = albumsByDisplayOrder.map(\.id) + edits.newAlbums.map(\.id)
+        for id in defaults {
+            guard let choice = byID[id], seen.insert(id).inserted else { continue }
+            ordered.append(choice)
+        }
+        for choice in all {
+            if seen.insert(choice.id).inserted { ordered.append(choice) }
+        }
+        return ordered
+    }
+
+    /// 快捷键分配：按快捷面的顺序，前 10 个 `1–9 / 0`，第 11 个起 `⌥1–⌥0`。
+    var albumShortcutItems: [AlbumShortcutItem] {
+        albumShortcutChoices.prefix(AppStore.albumShortcutLimit).enumerated().map { offset, choice in
+            AlbumShortcutItem(albumID: choice.id,
+                              title: choice.title,
+                              key: AppStore.albumShortcutKey(slot: offset))
+        }
+    }
+
+    /// 拖动换位置：把 `sourceID` 插到 `targetID` 前面；如果 target 本来是最后一个，
+    /// 就放到最后（这样拖到最后一格也能移到底）。
+    /// **拖到第一个位置就是快捷键 1**；顺序只在本机内存里（零痕迹），不落盘。
+    func moveAlbumShortcut(sourceID: Int, to targetID: Int) {
+        guard sourceID != targetID else { return }
+        let order = albumShortcutChoices.map(\.id)
+        guard let from = order.firstIndex(of: sourceID),
+              let targetIndex = order.firstIndex(of: targetID) else { return }
+        let targetWasLast = targetIndex == order.count - 1
+        var result = order
+        let moved = result.remove(at: from)
+        guard let newTargetIndex = result.firstIndex(of: targetID) else { return }
+        let insert = targetWasLast ? result.count : newTargetIndex
+        result.insert(moved, at: insert)
+        albumShortcutOrder = result
+    }
+
+    /// 恢复默认顺序（只动快捷面，不改相簿浏览栏；也只在本次运行有效）。
+    func resetAlbumShortcutOrder() {
+        albumShortcutOrder = []
+    }
+
+    /// 快捷面里那颗键帽。
+    func albumShortcutKey(for albumID: Int) -> String? {
+        albumShortcutItems.first { $0.albumID == albumID }?.key
+    }
+
+    /// 数字键位 → 槽位（主键盘 + 小键盘都认）。⌥数字是第二排，给第 11–20 本。
+    private static let albumShortcutKeyCodes: [UInt16: Int] = [
+        18: 1, 19: 2, 20: 3, 21: 4, 23: 5, 22: 6, 26: 7, 28: 8, 25: 9, 29: 0,
+        83: 1, 84: 2, 85: 3, 86: 4, 87: 5, 88: 6, 89: 7, 91: 8, 92: 9, 82: 0
+    ]
+
+    private func albumShortcutSlot(for event: NSEvent) -> Int? {
+        guard let digit = Self.albumShortcutKeyCodes[event.keyCode] else { return nil }
+        let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+        // ⌘ / ⌃ / ⇧ 都不是相簿键；⌥ 是第二排
+        guard !flags.contains(.command),
+              !flags.contains(.control),
+              !flags.contains(.shift) else { return nil }
+        if flags.contains(.option) {
+            return digit == 0 ? 19 : 9 + digit
+        }
+        return digit == 0 ? 9 : digit - 1
+    }
+
+    /// 照片页「移到相簿」快捷面：M 展开 / 收起。
+    /// 展开后数字键才生效，**按一次就移，不再二次确认**。
+    func toggleAlbumPanel() {
+        if albumPanelOpen {
+            albumPanelOpen = false
+            return
+        }
+        guard ensureShortcutSelection() else { return }
+        albumPanelOpen = true
+    }
+
+    /// 快捷面打开时，把一次数字键翻译成「移入哪本」；没打开就完全不吃数字键
+    /// （2026-11 用户要求：M 之后的键才算快捷键，避免全局误触）。
+    /// 预览里对当前这一张，照片页对选中集合（没选中就退成光标那一张）。
+    @discardableResult
+    func handleAlbumShortcutEvent(_ event: NSEvent) -> Bool {
+        guard previewAlbumPicker || albumPanelOpen else { return false }
+        // 库门禁 / 暂停 / 未连接时不许移：这时相簿列表和资产都可能还是上一份
+        guard !needsLibraryGate, !needsConnection, !dataPaused else { return false }
+        guard let slot = albumShortcutSlot(for: event) else { return false }
+        // 按住不放时系统会连发 keyDown：只认第一次
+        guard !event.isARepeat else { return true }
+
+        let items = albumShortcutItems
+        guard items.indices.contains(slot) else { return false }
+        let item = items[slot]
+        let target = PhotoEditQueue.AlbumRef(id: item.albumID, title: item.title)
+
+        if previewID != nil {
+            guard previewAlbumPicker, let asset = previewAsset else { return false }
+            if albumFilter == item.albumID {
+                flash("这一张已经在「\(item.title)」里了")
+                return true
+            }
+            stageMove([asset], from: albumFilter, to: target)
+            previewAlbumPicker = false
+            return true
+        }
+
+        guard albumPanelOpen, isPhotoPage else { return false }
+        if albumFilter == item.albumID {
+            flash("这一批已经在「\(item.title)」里了")
+            return true
+        }
+        let targets: [Asset]
+        if !selection.isEmpty {
+            targets = selectedAssets
+        } else if let id = cursorAssetID,
+                  let asset = visibleAssets.first(where: { $0.id == id }) {
+            targets = [asset]
+        } else {
+            flash("先在缩略图里点一张照片")
+            return true
+        }
+        guard !targets.isEmpty else { return true }
+        stageMove(targets, from: albumFilter, to: target)
+        albumPanelOpen = false
+        return true
     }
 
     /// 把暂存的一批写回手机。**整批一次写库**（297 MB 下 + 上 + 重启相册服务，约 40–60 秒）。
     /// - Parameter redirect: 压缩刚生成的新副本映射（原 PK → 新 PK）。
     ///   压缩后暂存的收藏/相簿要落到**新那张**上，老的那份照旧进「已压缩待删除」。
-    func submitEdits(redirect: [Int: Int] = [:]) async {
+    /// - Parameter fromCompression: 压缩跑完后的自动提交（这时先压后移的顺序已经保证对）。
+    func submitEdits(redirect: [Int: Int] = [:], fromCompression: Bool = false) async {
         guard edits.hasWork, !editSubmitting, !isPurging else { return }
         // 库还没读好就没有 Z_PK 可映射：这时候写出去会把整批改动悄悄丢掉
         guard libraryIndex != nil else {
@@ -847,6 +1087,15 @@ final class AppStore {
             editSubmitAfterCompression = true
             flash("正在压缩，等它跑完自动写回")
             return
+        }
+        // 这批里还有待压缩的：先压再写回。反过来（先写回移动、再压缩）的话，
+        // 压缩生成的新副本不会带上相簿/收藏 —— 改动落到了马上要进回收站的原图上。
+        if !fromCompression {
+            let queued = edits.ids.intersection(compression.ids)
+            if !queued.isEmpty {
+                flash("这批里 \(queued.count) 张还在压缩站：先去压缩站压完，移动/收藏会自动落到新副本上")
+                return
+            }
         }
         let operations = edits.operations { [self] asset in
             guard let pk = meta(asset)?.pk else { return nil }
@@ -924,7 +1173,7 @@ final class AppStore {
     /// 参数一起存进条目（同一张再标一次就是改参数）。
     func markForCompression(profile: ConversionProfile) {
         lastCompressionProfile = profile
-        // 参数存盘：下次打开面板、以及预览里按「-」，都从这里取（用户要求记住）
+        // 参数存盘：下次打开面板、以及预览里按「Y」，都从这里取（用户要求记住）
         CompressionPrefs(profile: profile).save()
         // 视频暂不支持压缩；其余的只要被选中就能标（已经标了回收的会被切过来）
         let chosen = selectedAssets.filter { $0.kind == .photo }
@@ -935,9 +1184,11 @@ final class AppStore {
         }
         // **同一项只能带一个标记**：这批里已经标了回收的，直接撤销回收标记。
         // 不然会出现「既在回收站、又在压缩站」，两边都以为自己会处理它。
-        let switched = chosen.filter { trash.ids.contains($0.id) }.count
+        let switched = chosen.filter { trash.contains($0.id) }.count
         trash.remove(ids: chosen.map(\.id))
         compression.add(chosen, profile: profile, deviceID: device?.id ?? "unknown")
+        // 标完清空选中（2026-11 用户定的）：底栏回到常态，不会立刻出现「取消压缩」。
+        // 想取消就**人工重新选中**这几张，底栏那时才翻成「取消压缩」。
         clearSelection()
         var message = "已标记 \(chosen.count) 张待压缩（这一步不动设备）· 去「压缩站」确认后才会真压"
         if switched > 0 { message += "；其中 \(switched) 张已从回收站移出" }
@@ -1015,7 +1266,7 @@ final class AppStore {
                 redirect[record.originalPK] = record.newPK
             }
             editSubmitAfterCompression = false
-            await submitEdits(redirect: redirect)
+            await submitEdits(redirect: redirect, fromCompression: true)
         }
 
         if combined.failures.isEmpty, !combined.records.isEmpty {
@@ -1083,6 +1334,8 @@ final class AppStore {
     }
 
     func startScan() async {
+        // 重新读库 = 相簿列表和资产都可能换一份，快捷面先收起来
+        albumPanelOpen = false
         // 手动清空过 = 暂停态：不重扫、不重读、不重建缩略图。
         // 想恢复只能点「重新读取」（或走 `refreshDevice`，它先解除暂停）。
         guard !dataPaused else { return }
@@ -1490,6 +1743,7 @@ final class AppStore {
     /// 「门禁一直盖着、又变回锁屏提示」，而不是先掉回正常界面
     /// —— 用户报的「点了重新读取，样式就变了（进去了）」就是这里漏的这一步。
     func retryLibraryNow() async {
+        albumPanelOpen = false
         guard !libraryRetryInFlight else { return }
         libraryFailureCount = 0
         libraryAutoRetryStopped = false
@@ -2156,6 +2410,121 @@ final class AppStore {
     var selectedBytes: Int64 { selectedAssets.reduce(0) { $0 + totalBytes(of: $1) } }
     var pendingDeletions: Set<Asset.ID> { trash.ids }
 
+    // MARK: - 选中集合的「全是某种状态」（底栏按钮翻转用）
+
+    /// 2026-11 用户定的新交互：**选中和标记分开**。点已标记的格子 = 选中它，
+    /// 底栏原来那几颗按钮翻成反向操作：
+    /// - 全选中都标了回收 → 「取消删除」
+    /// - 全选中都待压缩 → 「取消压缩」
+    /// - 全选中都暂存了移动 → 「取消移入」
+    /// 混着选的时候保持正向操作（把没标的也标上），要撤销就只选已标的那几张。
+    var selectionAllPending: Bool {
+        !selection.isEmpty && selection.allSatisfy { trash.contains($0) }
+    }
+    var selectionAllQueuedForCompression: Bool {
+        !selection.isEmpty && selection.allSatisfy { compression.contains($0) }
+    }
+    var selectionAllMoved: Bool {
+        !selection.isEmpty && selection.allSatisfy { edits.hasMove($0) }
+    }
+    /// 这批是不是全部已经收藏（快捷键条 / 底栏翻成「取消收藏」）
+    var selectionAllFavorite: Bool {
+        let list = selectedAssets
+        return !list.isEmpty && list.allSatisfy { displayedFavorite($0) }
+    }
+
+    // MARK: - 快捷键条 / 键盘（照片页、相簿页）
+
+    /// 照片页（含相簿页）才吃这一套快捷键；回收站 / 压缩站 / 修改站各有自己的底栏。
+    var isPhotoPage: Bool { section == .photos || section == .albums }
+
+    /// 快捷键条和 ⏎ 认的「光标那一张」：鼠标悬停的那格 > 锚点 > 列表第一张
+    var cursorAssetID: Asset.ID? {
+        let list = visibleAssets
+        if let hoveredID, list.contains(where: { $0.id == hoveredID }) { return hoveredID }
+        if let anchorID, list.contains(where: { $0.id == anchorID }) { return anchorID }
+        return list.first?.id
+    }
+
+    var isCursorSelected: Bool {
+        guard let id = cursorAssetID else { return false }
+        return selection.contains(id)
+    }
+
+    /// 快捷键条 / 键盘动作的目标：有选中就用选中集合，没选中就退成光标那一张。
+    /// 这样「悬停一张直接按 L / ⌫ / Y / M」和「先选一批再按」都是同一个动作。
+    private var shortcutTargetIDs: Set<Asset.ID> {
+        if !selection.isEmpty { return selection }
+        if let id = cursorAssetID { return [id] }
+        return []
+    }
+
+    private var shortcutTargetAssets: [Asset] {
+        let ids = shortcutTargetIDs
+        guard !ids.isEmpty else { return [] }
+        return visibleAssets.filter { ids.contains($0.id) }
+    }
+
+    /// 快捷键条上的按钮要显示成「取消…」还是正向操作 —— 判据要和动作的目标一致
+    /// （光看 selection 的话，悬停在一张已标记的照片上时标签会写错）。
+    var shortcutAllPending: Bool {
+        let ids = shortcutTargetIDs
+        return !ids.isEmpty && ids.allSatisfy { trash.contains($0) }
+    }
+    var shortcutAllQueuedForCompression: Bool {
+        let ids = shortcutTargetIDs
+        return !ids.isEmpty && ids.allSatisfy { compression.contains($0) }
+    }
+    var shortcutAllFavorite: Bool {
+        let list = shortcutTargetAssets
+        return !list.isEmpty && list.allSatisfy { displayedFavorite($0) }
+    }
+    /// ⏎ / 快捷键条的「选中」：切光标那一张的选中状态（和预览里的 ⏎ 一个口径）
+    func toggleSelectionAtCursor() {
+        let list = visibleAssets
+        guard let id = cursorAssetID,
+              let asset = list.first(where: { $0.id == id }) else { return }
+        toggle(asset)
+    }
+
+    /// 点快捷键条 / 按快捷键时，如果一张都没选，就把光标那一张选上再执行。
+    /// 这样「悬停一张 → 按 L / ⌫ / Y / M」也能直接生效，不用先点一下。
+    @discardableResult
+    func ensureShortcutSelection() -> Bool {
+        if !selection.isEmpty { return true }
+        guard let id = cursorAssetID,
+              let asset = visibleAssets.first(where: { $0.id == id }) else {
+            flash("先在缩略图里点一张照片")
+            return false
+        }
+        selectSingle(asset)
+        return true
+    }
+
+    /// 快捷键条 / 键盘 ⌫：已全标删除 → 取消删除；否则标记回收
+    func shortcutRecycle() {
+        guard ensureShortcutSelection() else { return }
+        if selectionAllPending { unmark(selection) }
+        else { markSelectedForRecycle() }
+    }
+
+    /// 快捷键条 / 键盘 Y：已全待压缩 → 取消压缩；否则按上次参数标记压缩
+    func shortcutCompression() {
+        guard ensureShortcutSelection() else { return }
+        if selectionAllQueuedForCompression { unmarkCompression(selection) }
+        else { markForCompression(profile: lastCompressionProfile) }
+    }
+
+    /// 快捷键条 / 键盘 L：整批收藏 ↔ 取消收藏
+    func shortcutFavorite() {
+        guard ensureShortcutSelection() else { return }
+        toggleFavoriteSelection()
+    }
+
+    /// 快捷键条 / 键盘 M：展开 / 收起「移到相簿」快捷面。
+    /// 展开后数字键才生效，按一次直接移入，不再二次确认。
+    func shortcutMove() { toggleAlbumPanel() }
+
     // MARK: - 标记项自己的前后对比（底栏用）
 
     /// 压缩站里这批标记项：`before` 是它们现在的体积，`after` 是按**各自参数**估的压缩后体积。
@@ -2195,18 +2564,9 @@ final class AppStore {
     }
 
     func toggle(_ asset: Asset) {
-        // 已标记 → 先**撤销标记**回到正常；再点一下才是选中（2026-11 用户定的节奏）。
-        // 所以取消标记不再需要单独一颗按钮：再点一次就是取消。
-        if pendingDeletions.contains(asset.id) {
-            unmark([asset.id])
-            return
-        }
-        // 待压缩同理（2026-11 用户要求）：单击已带黄标的格子 = 取消压缩标记，
-        // 和回收站那套完全一致 —— 两者都不需要"再找一颗取消按钮"。
-        if compression.contains(asset.id) {
-            unmarkCompression([asset.id])
-            return
-        }
+        // 2026-11 用户改的口径：**点击永远是选中 / 取消选中**，
+        // 已标记回收 / 待压缩的项也一样 —— 不再「点一下撤销标记」。
+        // 要去掉标记：选中它们，底栏会变成「取消删除 / 取消压缩」（预览里仍可用 ⌫ / Y）。
         if selection.contains(asset.id) {
             selection.remove(asset.id)
         } else {
@@ -2225,13 +2585,13 @@ final class AppStore {
             return
         }
         let range = start <= end ? start...end : end...start
-        // 已标记的项不进选中集合（和 toggle / selectAll 保持同一口径）
-        selection = Set(list[range].map(\.id)).subtracting(pendingDeletions).subtracting(compression.ids)
+        // 已标记的项也可以被选中了（2026-11 用户改的）：撤销标记改由底栏的「取消…」做
+        selection = Set(list[range].map(\.id))
     }
 
-    /// 全选：跳过已标记回收的（它们已经在待删名单里了）
+    /// 全选：已标记回收 / 待压缩的项也一起选上（撤销标记靠底栏的「取消…」）
     func selectAll() {
-        selection = Set(visibleAssets.map(\.id)).subtracting(pendingDeletions).subtracting(compression.ids)
+        selection = Set(visibleAssets.map(\.id))
     }
 
     func clearSelection() {
@@ -2297,7 +2657,7 @@ final class AppStore {
     /// 就地改状态，画面留在原地 —— 顶栏的状态胶囊会立刻变成「已标记回收」，
     /// 反馈已经够了；自动跳走反而让人不知道刚才那一下动的是哪张。
     /// 想换下一张就 ← → 或点顶栏的「下一张」。
-    /// 预览里按「-」：标记压缩 ↔ 取消标记（和 ⌫ 的「标记回收」互斥，后按的那个说了算）
+    /// 预览里按「Y」：标记压缩 ↔ 取消标记（和 ⌫ 的「标记回收」互斥，后按的那个说了算）
     func compressionMarkCurrentPreview() {
         guard let id = previewID, let asset = assets.first(where: { $0.id == id }) else { return }
         if compression.ids.contains(id) {
@@ -2312,6 +2672,7 @@ final class AppStore {
         let wasPending = pendingDeletions.contains(id)
         trash.remove(ids: [id])
         compression.add([asset], profile: lastCompressionProfile, deviceID: device?.id ?? "unknown")
+        // 标记和选中是两件事：标完把当前这张从选中集合里拿掉（2026-11 用户定的）
         selection.remove(id)
         flash(wasPending
               ? "已改为标记压缩（原回收标记已撤销）· 不动手机，去「压缩站」确认"
@@ -2323,16 +2684,15 @@ final class AppStore {
         // 同一项只能带一个标记：切到「待删」就把压缩站里那条撤掉
         compression.remove(ids: [id])
         trash.add([asset], deviceID: device?.id ?? "unknown")
+        // 标完把当前这张移出选中集合，底栏不会立刻出现「取消删除」
         selection.remove(id)
     }
 
     /// 预览里切换「当前这一项」的选中状态。
-    /// **已经标记回收 / 已标待压缩的不许再选中** —— 它们已经在名单里了，再打勾只会自相矛盾。
+    /// 2026-11 用户改了口径：**已标记回收 / 已标待压缩的项也可以选中**，
+    /// 选中和标记不再互斥（撤销标记走底栏 / 预览里的 ⌫・Y）。
     func togglePreviewSelection() {
-        guard let id = previewID,
-              !pendingDeletions.contains(id),
-              !compression.contains(id)
-        else { return }
+        guard let id = previewID else { return }
         if selection.contains(id) {
             selection.remove(id)
         } else {
@@ -2347,18 +2707,35 @@ final class AppStore {
         trash.remove(ids: [id])
     }
 
-    /// 框选落到已选 / 已标记的块上：反过来把标记撤掉
-    func unmark(_ ids: Set<Asset.ID>) {
-        guard !ids.isEmpty else { return }
-        trash.remove(ids: ids)
+    /// 取消删除标记（底栏「取消删除」/ 右键「取消删除」用；不是待删的会被忽略）
+    func unmark(_ ids: some Sequence<Asset.ID>) {
+        let set = Set(ids)
+        guard !set.isEmpty else { return }
+        let before = trash.count
+        trash.remove(ids: set)
+        let removed = before - trash.count
+        if removed > 0 { flash("已取消删除标记 \(removed) 项") }
     }
 
-    /// 取消压缩标记（回到普通项）。单击已带黄标的格子 / 预览里的 `-` 都走这里。
+    /// 取消压缩标记（回到普通项）。底栏的「取消压缩」、预览里的 `Y` 都走这里。
     func unmarkCompression(_ ids: some Sequence<Asset.ID>) {
         let set = Set(ids)
         guard !set.isEmpty else { return }
         compression.remove(ids: set)
         flash("已取消压缩标记 \(set.count) 张")
+    }
+
+    /// 取消这批的「移入相簿」暂存（只撤销本机，不动手机）
+    func unmarkMoves(_ ids: some Sequence<Asset.ID>) {
+        let set = Set(ids)
+        guard !set.isEmpty, set.contains(where: { edits.hasMove($0) }) else { return }
+        edits.clearMoves(set)
+        flash("已取消 \(set.count) 项的相簿移动（只撤销本机暂存）")
+    }
+
+    /// 底栏「取消移入」：撤销整个选中集合的移动暂存
+    func unmarkSelectedMoves() {
+        unmarkMoves(selection)
     }
 
     // MARK: - 网格/列表的每格查询（O(1)，别在 body 里现拼 Set）
@@ -2373,15 +2750,13 @@ final class AppStore {
     }
 
     /// 框选结果怎么落到状态里（模式在拖拽开始时按"按住的那一格"定好）。
-    /// **框选不再能取消标记**（2026-11 用户定的）：取消标记只能人工点格子右上角的叉，
-    /// 或者预览里按 ⌫。框到已标记的项就当没框到 —— 已标记的不进选中集合。
+    /// 2026-11 用户改了口径：**选中和标记彻底分开** —— 标了回收 / 压缩的项也能被框选，
+    /// 取消标记走底栏的「取消删除 / 取消压缩」。
     func marqueeApply(_ hits: Set<Asset.ID>, mode: MarqueeMode) {
         guard !hits.isEmpty else { return }
         switch mode {
         case .select:
-            let addable = hits.subtracting(pendingDeletions).subtracting(compression.ids)
-            guard !addable.isEmpty else { return }
-            mergeSelection(addable)
+            mergeSelection(hits)
         case .deselect:
             selection.subtract(hits)
         }
@@ -2395,9 +2770,10 @@ final class AppStore {
         guard !chosen.isEmpty else { return }
         // **同一项只能带一个标记**（2026-11 用户定的）：后标的一方生效，
         // 原来在压缩站里的这批直接移出，别让人以为它还会被压缩。
-        let switched = chosen.filter { compression.ids.contains($0.id) }.count
+        let switched = chosen.filter { compression.contains($0.id) }.count
         trash.add(chosen, deviceID: device?.id ?? "unknown")
         compression.remove(ids: chosen.map(\.id))
+        // 标完清空选中（2026-11 用户定的）：底栏回到常态；重新选中这几张才出现「取消删除」
         clearSelection()
         flash(switched > 0
               ? "已标记 \(chosen.count) 项到回收站（其中 \(switched) 项已从压缩站移出）"
@@ -2470,6 +2846,9 @@ final class AppStore {
         convertedAssets.removeAll { removed.contains($0.id) }
         compression.remove(ids: removed)
         edits.remove(removed)
+        // 删掉的项可能还在选中集合里（2026-11 起标记项也能选中）：
+        // 不摘掉的话底栏会一直显示「已选 N 项」，N 里却有已经不存在的
+        selection.subtract(removed)
         invalidateCounts()
         thumbnails = thumbnails.filter { !removed.contains($0.key) }
 
@@ -2525,6 +2904,7 @@ final class AppStore {
     }
 
     func openPreview() {
+        albumPanelOpen = false
         // 库索引没好之前不给预览：那个阶段取原文件只能走 IC 的单流下载，
         // 大视频会等到超时，体验很差。先让用户看到索引进度。
         guard !dataPaused else { return }
@@ -2563,6 +2943,7 @@ final class AppStore {
         closeTask = nil
         isClosingPreview = false
         previewID = nil
+        previewAlbumPicker = false
         previewImage = nil
         previewVideoURL = nil
         previewLoading = false
@@ -3253,6 +3634,16 @@ final class AppStore {
             return false
         }
 
+        // 快捷面打开时：Esc 先收起面板（不关预览、不清选中）
+        if albumPanelOpen, event.keyCode == 53 {
+            albumPanelOpen = false
+            return true
+        }
+
+        // 相簿快捷键只在快捷面打开时生效（M 之后）：按一次直接移入，不再二次确认。
+        // 没打开时这里返回 false，数字键归输入框 / 其它逻辑。
+        if handleAlbumShortcutEvent(event) { return true }
+
         // 预览开着：只认预览那几个键，别的都不管
         if previewID != nil {
             switch event.keyCode {
@@ -3263,9 +3654,6 @@ final class AppStore {
                     trashCurrentPreview()
                 }
                 return true
-            case 27:                            // -：标记压缩 ↔ 取消标记（和 ⌫ 互斥）
-                compressionMarkCurrentPreview()
-                return true
             case 36, 76:                        // ⏎：选中 ↔ 取消选中
                 togglePreviewSelection()
                 return true
@@ -3274,13 +3662,49 @@ final class AppStore {
                 return true
             case 123: stepPreview(-1); return true
             case 124: stepPreview(1); return true
-            case 53:                            // Esc
-                closePreview()
+            case 53:                            // Esc：先收起相簿面板，没有再关预览
+                if previewAlbumPicker {
+                    previewAlbumPicker = false
+                } else {
+                    closePreview()
+                }
                 return true
             default: break
             }
-            if chars == "s" { togglePreviewSelection(); return true }
-            return false
+            // 字母键一律按「字符」认，不按 keyCode：Y 是 2026-11 用户定的压缩键
+            // （以前的 `-` 已经不用了），L = 收藏，M = 打开/收起「移入相簿」那排按钮。
+            switch chars {
+            case "s":
+                togglePreviewSelection()
+                return true
+            case "l":
+                if let current = previewAsset { toggleFavorite([current]) }
+                return true
+            case "y":
+                compressionMarkCurrentPreview()
+                return true
+            case "m":
+                previewAlbumPicker.toggle()
+                return true
+            default:
+                return false
+            }
+        }
+
+        // 照片页 / 相簿页：⌫ Y L M 就是缩略图上方那条快捷键（和预览同一套动作，
+        // 都是「全标了 → 取消，否则 → 标记」；没选中就把光标那一张先选上）。
+        if isPhotoPage {
+            switch event.keyCode {
+            case 51, 117: shortcutRecycle(); return true
+            default: break
+            }
+            switch chars {
+            case "y": shortcutCompression(); return true
+            case "l": shortcutFavorite(); return true
+            case "m": shortcutMove(); return true
+            case "s": toggleSelectionAtCursor(); return true
+            default: break
+            }
         }
 
         switch event.keyCode {
@@ -3288,7 +3712,11 @@ final class AppStore {
         case 124: move(dx: 1, extend: shift); return true
         case 126: move(dy: -1, extend: shift); return true
         case 125: move(dy: 1, extend: shift); return true
-        case 49, 36, 76: openPreview(); return true
+        case 49: openPreview(); return true
+        case 36, 76:
+            // 2026-11：照片页的 ⏎ 和预览里一样是「选中 / 取消选中」；别的页面保持原来的「打开预览」
+            if isPhotoPage { toggleSelectionAtCursor() } else { openPreview() }
+            return true
         case 53: clearSelection(); return true
         default: return false
         }
@@ -3358,8 +3786,25 @@ extension AppStore {
     }
 }
 
-/// 一次「写回手机」的结果：改了多少、花多久、有没有失败。
-/// 弹一次就够，不逐条列（改库是一整批成功/失败，不像删除那样一条条回来）。
+/// 「移到相簿」面板 / 预览里的相簿按钮用的一行数据。
+/// `isNew` = 这一本还只在暂存区里（写回手机时才真的建）。
+/// `id` 对已存在的相簿是库里的真 PK，对新建的是负的临时 ID（见 `PhotoEditQueue.AlbumRef`）。
+struct AlbumChoice: Identifiable, Hashable {
+    let id: Int
+    let title: String
+    let count: Int
+    let isNew: Bool
+}
+
+/// 相簿 → 快捷键的分配结果。照片页快捷面和预览面板上的键帽都读它，
+/// 保证「看到哪个键」和「按哪个键」是同一份映射。
+struct AlbumShortcutItem: Identifiable, Hashable {
+    let albumID: Int
+    let title: String
+    let key: String
+    var id: Int { albumID }
+}
+
 struct EditReport: Identifiable, Equatable {
     let id = UUID()
     let createdAlbums: Int
